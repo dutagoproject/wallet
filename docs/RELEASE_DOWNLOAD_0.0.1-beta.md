@@ -1,6 +1,7 @@
 # dutawalletd 0.0.1-beta
 
 This is the first public beta release of the DUTA wallet daemon.
+It is for people who want to run the wallet service themselves and keep control of the storage and RPC surface.
 
 ## Highlights
 
@@ -47,6 +48,6 @@ If a checksum file is attached to the release, verify it before using the binari
 
 ## Notes for this beta
 
-This release is intended for operators and early integrators. GUI packaging is outside the scope of this release line.
+This release is for operators and early integrators. GUI packaging is outside the scope of this release line.
 
 For operator guidance, CLI notes, and build instructions, see the repository documentation.

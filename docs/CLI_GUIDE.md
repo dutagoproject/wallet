@@ -1,6 +1,6 @@
 # dutawalletd CLI Guide
 
-This guide is for people who want to use the DUTA wallet daemon and wallet CLI without guessing the command flow.
+This guide is for people who want to use the DUTA wallet daemon and CLI without having to guess the flow.
 
 ## Binaries in this repo
 
@@ -9,12 +9,12 @@ This guide is for people who want to use the DUTA wallet daemon and wallet CLI w
 - `duta-wallet-cli`
   A simple command-line client for wallet RPC.
 
-## The simple mental model
+## The basic idea
 
 - `dutawalletd` runs the wallet service
 - `duta-wallet-cli` talks to that wallet service
 
-You normally start the wallet daemon first, then use the CLI or your own RPC client.
+In normal use, start the wallet daemon first, then talk to it from the CLI or your own RPC client.
 
 ## Start the wallet daemon
 
@@ -36,7 +36,7 @@ Testnet:
 ./dutawalletd --testnet --datadir /srv/duta/wallet/testnet
 ```
 
-## Where to look after startup
+## What to check after startup
 
 Inside the selected data directory:
 
@@ -96,16 +96,16 @@ If your wallet RPC uses a non-default port:
 ./duta-wallet-cli --rpc 127.0.0.1:19084 balance
 ```
 
-## Operational rules
+## Good habits
 
 - keep wallet RPC private
 - keep wallet daemon and node on the same network
 - keep mainnet and testnet wallets in separate folders
 - use DB-backed wallet files only
 
-## Common beginner mistakes
+## Common mistakes
 
-### The wallet daemon is not running
+### The daemon is not running
 
 If the CLI returns connection errors, start `dutawalletd` first.
 
@@ -113,16 +113,16 @@ If the CLI returns connection errors, start `dutawalletd` first.
 
 A mainnet wallet daemon cannot manage a testnet wallet correctly, and the reverse is also true.
 
-### The wallet file path is inconsistent
+### The wallet path keeps changing
 
-Choose a clear folder layout and keep using it.
+Pick one folder layout and stick to it.
 
 Good example:
 
 - `/srv/duta/wallet/mainnet/alice.db`
 - `/srv/duta/wallet/testnet/alice.db`
 
-## Recommended first-run checklist
+## First run checklist
 
 1. Start `dutawalletd`
 2. Confirm the wallet RPC is listening

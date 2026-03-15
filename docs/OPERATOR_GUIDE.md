@@ -1,6 +1,6 @@
 # dutawalletd Operator Guide
 
-This guide covers the public operator-facing behavior of the DUTA wallet daemon.
+This guide covers how to run `dutawalletd` in a clean and predictable way.
 
 ## Default ports
 
@@ -66,9 +66,9 @@ Common wallet RPC endpoints include:
 - `POST /lock`
 - `POST /change_passphrase`
 
-Treat the wallet RPC as private operator surface. Do not expose it directly to the public internet.
+Treat wallet RPC as private operator surface. Do not expose it directly to the public internet.
 
-## Operational rules
+## Operating rules
 
 - keep wallet RPC bound to loopback unless you have a strong reason not to
 - keep wallet and node on the same network
@@ -76,7 +76,7 @@ Treat the wallet RPC as private operator surface. Do not expose it directly to t
 - back up wallet database files before major upgrades or migrations
 - protect passphrases outside shell history and public scripts
 
-## Backup expectations
+## What to back up
 
 Back up:
 
@@ -84,18 +84,18 @@ Back up:
 - any deployment-specific configuration
 - any operational notes required to identify which wallet belongs to which environment
 
-If you run multiple wallets, keep naming and folder layout consistent so restores are obvious.
+If you run more than one wallet, keep the naming and folder layout consistent so restores are easy to follow.
 
 ## Common mistakes
 
-### Wallet RPC points to the wrong network
+### Wallet RPC is pointed at the wrong network
 
-If the daemon is running on testnet but the wallet is still pointed at mainnet ports, wallet open and send operations will fail or return misleading results.
+If the daemon is running on testnet but the wallet is still using mainnet ports, open and send operations will fail or look inconsistent.
 
 ### Wallet RPC is exposed publicly
 
 This daemon is not meant to be a public internet-facing wallet API. Put a controlled service layer in front of it if remote access is required.
 
-### Mainnet and testnet wallets share one directory
+### Mainnet and testnet share one directory
 
-Keep network-specific wallet storage separate. Mixing environments makes recovery and operator troubleshooting much harder.
+Keep network-specific wallet storage separate. Mixing environments makes recovery and troubleshooting harder than it needs to be.

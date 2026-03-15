@@ -74,6 +74,10 @@ fn print_wallet_startup_guidance(rpc_addr: &str) {
     println!();
 }
 
+fn print_wallet_startup_warning(message: impl AsRef<str>) {
+    console_line("WARN", ANSI_YELLOW, message);
+}
+
 fn build_http_request(method: &str, addr: &str, path: &str, body: &[u8]) -> String {
     let content_type = if method.eq_ignore_ascii_case("POST") {
         "Content-Type: application/json\r\n"
@@ -977,6 +981,19 @@ fn normalize_wallet_loopback_bind(bind: &str, default_port: u16) -> Option<Strin
     None
 }
 
+fn wallet_rpc_bind_warning(net: Network, conf: &duta_core::netparams::Conf) -> Option<String> {
+    let raw = conf
+        .get_last("walletrpcbind")
+        .or_else(|| conf.get_last("rpcbind"))?;
+    if normalize_wallet_loopback_bind(&raw, net.default_wallet_rpc_port()).is_some() {
+        return None;
+    }
+    Some(format!(
+        "ignoring non-loopback wallet rpc bind override '{}' and keeping loopback-only policy",
+        raw.trim()
+    ))
+}
+
 fn wallet_rpc_settings(net: Network, conf: &duta_core::netparams::Conf) -> (String, u16, String) {
     let (mut rpc_addr, mut daemon_rpc_port, net_s) = match net {
         Network::Mainnet => (
@@ -1131,6 +1148,7 @@ fn main() {
     }
 
     let (rpc_addr, daemon_rpc_port, net_s) = wallet_rpc_settings(net, &conf);
+    let startup_bind_warning = wallet_rpc_bind_warning(net, &conf);
 
     if matches!(args.command, Some(Cmd::Stop)) {
         if args.daemon || args.foreground {
@@ -1241,6 +1259,10 @@ fn main() {
     }
 
     print_wallet_startup_banner(net, &data_dir, &rpc_addr, daemon_rpc_port);
+    if let Some(msg) = startup_bind_warning.as_deref() {
+        print_wallet_startup_warning(msg);
+        wwlog!("wallet_rpc: CONFIG_WARN {}", msg);
+    }
     print_wallet_startup_guidance(&rpc_addr);
 
     if let Err(e) = start_wallet_rpc(rpc_addr, daemon_rpc_port, net_s) {
@@ -1254,8 +1276,9 @@ fn main() {
 mod tests {
     use super::{
         build_http_request, clear_wallet_sensitive_state, load_wallet_db_to_state, read_pid_file,
-        remove_pid_file_if_matches, save_wallet_sync_state, save_wallet_utxos, Args, Cmd,
-        validate_wallet_state_addresses, wallet_rpc_settings, PidFileGuard, Utxo, WalletState,
+        remove_pid_file_if_matches, save_wallet_sync_state, save_wallet_utxos, wallet_rpc_bind_warning,
+        Args, Cmd, validate_wallet_state_addresses, wallet_rpc_settings, PidFileGuard, Utxo,
+        WalletState,
     };
     use clap::Parser;
     use duta_core::address::{pkh_from_pubkey, pkh_to_address_for_network};
@@ -1434,6 +1457,13 @@ mod tests {
         let (rpc_addr, daemon_rpc_port, _) = wallet_rpc_settings(Network::Testnet, &conf);
         assert_eq!(rpc_addr, "127.0.0.1:18084");
         assert_eq!(daemon_rpc_port, 18083);
+        assert_eq!(
+            wallet_rpc_bind_warning(Network::Testnet, &conf),
+            Some(
+                "ignoring non-loopback wallet rpc bind override '0.0.0.0:18084' and keeping loopback-only policy"
+                    .to_string()
+            )
+        );
     }
 
     #[test]
@@ -1443,6 +1473,7 @@ mod tests {
         assert_eq!(rpc_addr, "127.0.0.1:28084");
         assert_eq!(daemon_rpc_port, 28083);
         assert_eq!(net_s, "testnet");
+        assert_eq!(wallet_rpc_bind_warning(Network::Testnet, &conf), None);
     }
 
     #[test]

@@ -1175,17 +1175,35 @@ pub(crate) fn handle_request(
                 respond_method_not_allowed(request);
             } else {
                 let g = super::wallet_lock_or_recover();
-                super::respond_json(
-                    request,
-                    tiny_http::StatusCode(200),
-                    json!({
-                        "net": net,
-                        "wallet_rpc": format!("http://{}", rpc_addr),
-                        "version": env!("CARGO_PKG_VERSION"),
-                        "wallet_open": g.is_some(),
-                    })
-                    .to_string(),
-                );
+                let wallet_open = g.is_some();
+                drop(g);
+
+                let mut body = json!({
+                    "net": net,
+                    "wallet_rpc": format!("http://{}", rpc_addr),
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "wallet_open": wallet_open,
+                });
+
+                if wallet_open {
+                    match wallet_balance_snapshot(daemon_rpc_port) {
+                        Ok((balance, spendable, immature, height, utxos_n)) => {
+                            body["balance"] = json!(balance);
+                            body["spendable"] = json!(spendable);
+                            body["immature"] = json!(immature);
+                            body["height"] = json!(height);
+                            body["utxos"] = json!(utxos_n);
+                            body["unit"] = json!("DUTA");
+                        }
+                        Err(e) => {
+                            body["wallet_state_refresh_error"] =
+                                json!(wallet_refresh_error_code(&e));
+                            body["wallet_state_refresh_detail"] = json!(e);
+                        }
+                    }
+                }
+
+                super::respond_json(request, tiny_http::StatusCode(200), body.to_string());
             }
         }
 
@@ -2944,114 +2962,19 @@ pub(crate) fn handle_request(
                 respond_method_not_allowed(request);
                 return;
             }
-
-            // Snapshot wallet state (avoid holding lock during daemon RPC).
-            let (wallet_path, addrs, is_db, mut utxos, last_sync_height) = {
-                let g = super::wallet_lock_or_recover();
-                let ws = match g.as_ref() {
-                    Some(w) => w,
-                    None => {
-                        respond_wallet_not_open(request);
+            let (balance, spendable, _immature, cur_h, utxos_n) =
+                match wallet_balance_snapshot(daemon_rpc_port) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        respond_http_error_detail(
+                            request,
+                            tiny_http::StatusCode(502),
+                            wallet_refresh_error_code(&e),
+                            e,
+                        );
                         return;
                     }
                 };
-                (
-                    ws.wallet_path.clone(),
-                    if !ws.pubkeys.is_empty() {
-                        ws.pubkeys.keys().cloned().collect::<Vec<String>>()
-                    } else {
-                        ws.keys.keys().cloned().collect::<Vec<String>>()
-                    },
-                    ws.is_db,
-                    ws.utxos.clone(),
-                    ws.last_sync_height,
-                )
-            };
-
-            let tip_body = match super::http_get_local("127.0.0.1", daemon_rpc_port, "/tip") {
-                Ok(b) => b,
-                Err(e) => {
-                    wwlog!("wallet_rpc: balance_tip_failed err={}", e);
-                    respond_http_error_detail(
-                        request,
-                        tiny_http::StatusCode(502),
-                        "daemon_unreachable",
-                        e,
-                    );
-                    return;
-                }
-            };
-
-            let tip_v: serde_json::Value = match serde_json::from_str(&tip_body) {
-                Ok(v) => v,
-                Err(e) => {
-                    let d = format!("tip_invalid_json: {}", e);
-                    wwlog!("wallet_rpc: balance_tip_invalid_json detail={}", d);
-                    super::respond_json(
-                        request,
-                        tiny_http::StatusCode(502),
-                        json!({"error":"daemon_bad_response","detail":d}).to_string(),
-                    );
-                    return;
-                }
-            };
-
-            let cur_h = tip_v.get("height").and_then(|x| x.as_i64()).unwrap_or(0);
-
-            // Auto-sync: if wallet has no UTXOs but chain moved, rebuild from daemon blocks.
-            if !addrs.is_empty() && cur_h > 0 && (utxos.is_empty() || cur_h > last_sync_height) {
-                match rebuild_wallet_utxos_via_blocks_from(&addrs, daemon_rpc_port) {
-                    Ok((_h, new_utxos)) => {
-                        utxos = new_utxos;
-
-                        let mut g = super::wallet_lock_or_recover();
-                        if let Some(ws) = g.as_mut() {
-                            ws.utxos = utxos.clone();
-                            ws.last_sync_height = cur_h;
-                        }
-
-                        if let Err(e) = super::save_wallet_sync_state(&wallet_path, &utxos, cur_h) {
-                            let mode = if is_db { "db" } else { "legacy" };
-                            wwlog!(
-                                "wallet_rpc: balance_state_persist_failed wallet={} mode={} err={}",
-                                wallet_public_name(&wallet_path),
-                                mode,
-                                e
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        wwlog!(
-                            "wallet_rpc: balance_rebuild_failed wallet={} err={}",
-                            wallet_public_name(&wallet_path),
-                            e
-                        );
-                        super::respond_json(
-                            request,
-                            tiny_http::StatusCode(502),
-                            json!({"error":"wallet_state_refresh_failed","detail":e}).to_string(),
-                        );
-                        return;
-                    }
-                }
-            }
-
-            const COINBASE_MATURITY: i64 = 60;
-            let mut balance: i64 = 0;
-            let mut spendable: i64 = 0;
-
-            for u in utxos.iter() {
-                let v = u.value;
-                balance += v;
-
-                if u.coinbase {
-                    if (cur_h - u.height) >= COINBASE_MATURITY {
-                        spendable += v;
-                    }
-                } else {
-                    spendable += v;
-                }
-            }
 
             super::respond_json(
                 request,
@@ -3060,7 +2983,7 @@ pub(crate) fn handle_request(
                     "balance": balance,
                     "spendable": spendable,
                     "unit": "DUTA",
-                    "utxos": utxos.len(),
+                    "utxos": utxos_n,
                     "height": cur_h
                 })
                 .to_string(),

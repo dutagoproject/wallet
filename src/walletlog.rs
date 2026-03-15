@@ -1,4 +1,4 @@
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::sync::{Mutex, OnceLock};
 use time::{format_description, OffsetDateTime, UtcOffset};
@@ -8,8 +8,9 @@ static ERRORLOG: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
 
 pub fn init(data_dir: &str) -> io::Result<()> {
     let data_dir = data_dir.trim_end_matches('/');
-    let debug_path = format!("{}/debug.log", data_dir);
-    let error_path = format!("{}/error.log", data_dir);
+    fs::create_dir_all(data_dir)?;
+    let debug_path = format!("{}/dutawalletd.stdout.log", data_dir);
+    let error_path = format!("{}/dutawalletd.stderr.log", data_dir);
     let debug_f = OpenOptions::new()
         .create(true)
         .append(true)
@@ -40,11 +41,13 @@ fn ts_prefix() -> String {
 
 fn write_line(target: &OnceLock<Mutex<std::fs::File>>, args: &std::fmt::Arguments) -> bool {
     if let Some(m) = target.get() {
-        if let Ok(mut f) = m.lock() {
-            let _ = writeln!(f, "{} {}", ts_prefix(), args);
-            let _ = f.flush();
-            return true;
-        }
+        let mut f = match m.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let _ = writeln!(f, "{} {}", ts_prefix(), args);
+        let _ = f.flush();
+        return true;
     }
     false
 }

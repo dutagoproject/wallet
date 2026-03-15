@@ -14,11 +14,14 @@ fn status_for_body_err(detail: &str) -> tiny_http::StatusCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        db_wallet_path, decode_seed_hex_for_migration, require_non_empty_passphrase,
-        resolve_owned_input, OwnedInput, WalletSigner,
+        blocks_from_pruned_error, db_wallet_path, decode_seed_hex_for_migration, net_from_name,
+        net_from_wallet_path, query_param, require_non_empty_passphrase, resolve_owned_input,
+        status_for_body_err, wallet_public_name, wallet_refresh_error_code, wallet_state_network,
+        OwnedInput, WalletSigner,
     };
+    use duta_core::netparams::Network;
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     #[test]
     fn db_wallet_path_only_accepts_encrypted_wallet_extensions() {
@@ -84,6 +87,141 @@ mod tests {
         let OwnedInput { utxo: got_utxo, signer: got_signer } = owned.expect("owned input");
         assert_eq!(got_utxo.txid, "abcd");
         assert_eq!(got_signer.addr, signer.addr);
+    }
+
+    #[test]
+    fn pruned_blocks_from_error_includes_prune_boundary() {
+        assert_eq!(
+            blocks_from_pruned_error(0, Some(512)),
+            "daemon_pruned_wallet_rescan_incomplete: from=0 prune_below=512"
+        );
+    }
+
+    #[test]
+    fn pruned_blocks_from_error_without_boundary_still_fails_closed() {
+        assert_eq!(
+            blocks_from_pruned_error(1024, None),
+            "daemon_pruned_wallet_rescan_incomplete: from=1024"
+        );
+    }
+
+    #[test]
+    fn status_for_body_err_maps_oversized_payloads_to_413() {
+        assert_eq!(status_for_body_err("body_too_large: 1048577"), tiny_http::StatusCode(413));
+        assert_eq!(status_for_body_err("invalid_json"), tiny_http::StatusCode(400));
+    }
+
+    #[test]
+    fn wallet_refresh_error_code_distinguishes_transport_from_state_failures() {
+        assert_eq!(
+            wallet_refresh_error_code("connect_failed: connection refused"),
+            "daemon_unreachable"
+        );
+        assert_eq!(
+            wallet_refresh_error_code("read_failed: timed out"),
+            "daemon_unreachable"
+        );
+        assert_eq!(
+            wallet_refresh_error_code("daemon_pruned_wallet_rescan_incomplete: from=0"),
+            "wallet_state_refresh_failed"
+        );
+        assert_eq!(
+            wallet_refresh_error_code("blocks_from_invalid_json: expected value"),
+            "wallet_state_refresh_failed"
+        );
+    }
+
+    #[test]
+    fn net_from_name_accepts_known_networks_and_defaults_to_mainnet() {
+        assert_eq!(net_from_name("mainnet"), Network::Mainnet);
+        assert_eq!(net_from_name("testnet"), Network::Testnet);
+        assert_eq!(net_from_name("stagenet"), Network::Stagenet);
+        assert_eq!(net_from_name("unknown"), Network::Mainnet);
+    }
+
+    #[test]
+    fn net_from_wallet_path_detects_network_from_path_segments() {
+        assert_eq!(net_from_wallet_path("C:/wallets/testnet/dev.db"), Network::Testnet);
+        assert_eq!(net_from_wallet_path("C:/wallets/stagenet/dev.db"), Network::Stagenet);
+        assert_eq!(net_from_wallet_path("C:/wallets/main/dev.db"), Network::Mainnet);
+    }
+
+    #[test]
+    fn wallet_public_name_keeps_filename_only() {
+        assert_eq!(wallet_public_name("C:/wallets/testnet/dev.db"), "dev.db");
+        assert_eq!(wallet_public_name("/root/wallets/primary.dat"), "primary.dat");
+    }
+
+    #[test]
+    fn query_param_extracts_expected_values() {
+        assert_eq!(
+            query_param("/send?address=dut123&amount=50", "address"),
+            Some("dut123".to_string())
+        );
+        assert_eq!(
+            query_param("/send?address=dut123&amount=50", "amount"),
+            Some("50".to_string())
+        );
+        assert_eq!(query_param("/send?address=dut123", "missing"), None);
+    }
+
+    #[test]
+    fn wallet_state_network_prefers_primary_address() {
+        let ws = super::super::WalletState {
+            wallet_path: "C:/wallets/testnet/dev.db".to_string(),
+            primary_address: "dut111111111111111111111111111111111111111111".to_string(),
+            keys: BTreeMap::new(),
+            pubkeys: BTreeMap::new(),
+            utxos: Vec::new(),
+            last_sync_height: 0,
+            seed_hex: None,
+            next_index: 0,
+            is_db: true,
+            locked: false,
+            db_passphrase: None,
+        };
+        assert_eq!(wallet_state_network(&ws), Network::Mainnet);
+    }
+
+    #[test]
+    fn wallet_state_network_falls_back_to_known_address_map() {
+        let mut pubkeys = BTreeMap::new();
+        pubkeys.insert(
+            "test1111111111111111111111111111111111111111".to_string(),
+            "22".repeat(32),
+        );
+        let ws = super::super::WalletState {
+            wallet_path: "C:/wallets/main/dev.db".to_string(),
+            primary_address: String::new(),
+            keys: BTreeMap::new(),
+            pubkeys,
+            utxos: Vec::new(),
+            last_sync_height: 0,
+            seed_hex: None,
+            next_index: 0,
+            is_db: true,
+            locked: false,
+            db_passphrase: None,
+        };
+        assert_eq!(wallet_state_network(&ws), Network::Testnet);
+    }
+
+    #[test]
+    fn wallet_state_network_falls_back_to_wallet_path() {
+        let ws = super::super::WalletState {
+            wallet_path: "C:/wallets/stagenet/dev.db".to_string(),
+            primary_address: String::new(),
+            keys: BTreeMap::new(),
+            pubkeys: BTreeMap::new(),
+            utxos: Vec::new(),
+            last_sync_height: 0,
+            seed_hex: None,
+            next_index: 0,
+            is_db: true,
+            locked: false,
+            db_passphrase: None,
+        };
+        assert_eq!(wallet_state_network(&ws), Network::Stagenet);
     }
 }
 
@@ -212,6 +350,28 @@ fn query_param(url: &str, key: &str) -> Option<String> {
     None
 }
 
+fn blocks_from_pruned_error(from: i64, prune_below: Option<i64>) -> String {
+    match prune_below {
+        Some(pb) => format!(
+            "daemon_pruned_wallet_rescan_incomplete: from={} prune_below={}",
+            from, pb
+        ),
+        None => format!("daemon_pruned_wallet_rescan_incomplete: from={}", from),
+    }
+}
+
+fn wallet_refresh_error_code(detail: &str) -> &'static str {
+    if detail.starts_with("connect_failed:")
+        || detail.starts_with("write_failed:")
+        || detail.starts_with("read_failed:")
+        || detail.starts_with("http_invalid:")
+    {
+        "daemon_unreachable"
+    } else {
+        "wallet_state_refresh_failed"
+    }
+}
+
 fn rebuild_wallet_utxos_via_blocks_from(
     addrs: &[String],
     daemon_rpc_port: u16,
@@ -242,17 +402,11 @@ fn rebuild_wallet_utxos_via_blocks_from(
             if v.get("error").and_then(|x| x.as_str()) == Some("chain_unavailable") {
                 break;
             }
-            // If the node is pruned and we requested below prune_below, daemon returns:
-            // {"error":"pruned","prune_below":N}. In that case, jump forward to N.
             if v.get("error").and_then(|x| x.as_str()) == Some("pruned") {
-                if let Some(pb) = v.get("prune_below").and_then(|x| x.as_i64()) {
-                    if from < pb {
-                        from = pb;
-                        continue;
-                    }
-                }
-                // If response is pruned but no prune_below or from already >= prune_below, stop.
-                break;
+                return Err(blocks_from_pruned_error(
+                    from,
+                    v.get("prune_below").and_then(|x| x.as_i64()),
+                ));
             }
         }
 
@@ -371,13 +525,10 @@ fn scan_wallet_txs_via_blocks_from(
                 break;
             }
             if v.get("error").and_then(|x| x.as_str()) == Some("pruned") {
-                if let Some(pb) = v.get("prune_below").and_then(|x| x.as_i64()) {
-                    if from < pb {
-                        from = pb;
-                        continue;
-                    }
-                }
-                break;
+                return Err(blocks_from_pruned_error(
+                    from,
+                    v.get("prune_below").and_then(|x| x.as_i64()),
+                ));
             }
         }
 
@@ -904,17 +1055,31 @@ fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<(i64, i64, i64, i64, 
                 }
             }));
     if needs_rebuild {
-        if let Ok((_h, new_utxos)) = rebuild_wallet_utxos_via_blocks_from(&addrs, daemon_rpc_port) {
-            utxos = new_utxos;
+        match rebuild_wallet_utxos_via_blocks_from(&addrs, daemon_rpc_port) {
+            Ok((_h, new_utxos)) => {
+                utxos = new_utxos;
 
-            let mut g = super::wallet_lock_or_recover();
-            if let Some(ws) = g.as_mut() {
-                ws.utxos = utxos.clone();
-                ws.last_sync_height = cur_h;
+                let mut g = super::wallet_lock_or_recover();
+                if let Some(ws) = g.as_mut() {
+                    ws.utxos = utxos.clone();
+                    ws.last_sync_height = cur_h;
+                }
+
+                if let Err(e) = super::save_wallet_sync_state(&wallet_path, &utxos, cur_h) {
+                    wwlog!(
+                        "wallet_rpc: balance_sync_persist_failed wallet={} err={}",
+                        wallet_public_name(&wallet_path),
+                        e
+                    );
+                }
             }
-
-            if let Err(e) = super::save_wallet_sync_state(&wallet_path, &utxos, cur_h) {
-                wwlog!("wallet_rpc: balance_sync_persist_failed wallet={} err={}", wallet_public_name(&wallet_path), e);
+            Err(e) => {
+                wwlog!(
+                    "wallet_rpc: balance_rebuild_failed wallet={} err={}",
+                    wallet_public_name(&wallet_path),
+                    e
+                );
+                return Err(e);
             }
         }
     }
@@ -2835,25 +3000,38 @@ pub(crate) fn handle_request(
 
             // Auto-sync: if wallet has no UTXOs but chain moved, rebuild from daemon blocks.
             if !addrs.is_empty() && cur_h > 0 && (utxos.is_empty() || cur_h > last_sync_height) {
-                if let Ok((_h, new_utxos)) =
-                    rebuild_wallet_utxos_via_blocks_from(&addrs, daemon_rpc_port)
-                {
-                    utxos = new_utxos;
+                match rebuild_wallet_utxos_via_blocks_from(&addrs, daemon_rpc_port) {
+                    Ok((_h, new_utxos)) => {
+                        utxos = new_utxos;
 
-                    let mut g = super::wallet_lock_or_recover();
-                    if let Some(ws) = g.as_mut() {
-                        ws.utxos = utxos.clone();
-                        ws.last_sync_height = cur_h;
+                        let mut g = super::wallet_lock_or_recover();
+                        if let Some(ws) = g.as_mut() {
+                            ws.utxos = utxos.clone();
+                            ws.last_sync_height = cur_h;
+                        }
+
+                        if let Err(e) = super::save_wallet_sync_state(&wallet_path, &utxos, cur_h) {
+                            let mode = if is_db { "db" } else { "legacy" };
+                            wwlog!(
+                                "wallet_rpc: balance_state_persist_failed wallet={} mode={} err={}",
+                                wallet_public_name(&wallet_path),
+                                mode,
+                                e
+                            );
+                        }
                     }
-
-                    if let Err(e) = super::save_wallet_sync_state(&wallet_path, &utxos, cur_h) {
-                        let mode = if is_db { "db" } else { "legacy" };
+                    Err(e) => {
                         wwlog!(
-                            "wallet_rpc: balance_state_persist_failed wallet={} mode={} err={}",
+                            "wallet_rpc: balance_rebuild_failed wallet={} err={}",
                             wallet_public_name(&wallet_path),
-                            mode,
                             e
                         );
+                        super::respond_json(
+                            request,
+                            tiny_http::StatusCode(502),
+                            json!({"error":"wallet_state_refresh_failed","detail":e}).to_string(),
+                        );
+                        return;
                     }
                 }
             }
@@ -2952,7 +3130,7 @@ pub(crate) fn handle_request(
                         respond_http_error_detail(
                             request,
                             tiny_http::StatusCode(502),
-                            "daemon_unreachable",
+                            wallet_refresh_error_code(&e),
                             e,
                         );
                         return;
@@ -3031,7 +3209,7 @@ pub(crate) fn handle_request(
                     respond_http_error_detail(
                         request,
                         tiny_http::StatusCode(502),
-                        "daemon_unreachable",
+                        wallet_refresh_error_code(&e),
                         e,
                     );
                     return;
@@ -3815,24 +3993,37 @@ pub(crate) fn handle_request(
             let cur_h = tip_v.get("height").and_then(|x| x.as_i64()).unwrap_or(0);
 
             if !addrs.is_empty() && cur_h > 0 {
-                if let Ok((_h, new_utxos)) =
-                    rebuild_wallet_utxos_via_blocks_from(&addrs, daemon_rpc_port)
-                {
-                    utxos = new_utxos;
+                match rebuild_wallet_utxos_via_blocks_from(&addrs, daemon_rpc_port) {
+                    Ok((_h, new_utxos)) => {
+                        utxos = new_utxos;
 
-                    {
-                        let mut g = super::wallet_lock_or_recover();
-                        if let Some(ws) = g.as_mut() {
-                            ws.utxos = utxos.clone();
+                        {
+                            let mut g = super::wallet_lock_or_recover();
+                            if let Some(ws) = g.as_mut() {
+                                ws.utxos = utxos.clone();
+                            }
+                        }
+
+                        if let Err(e) = super::save_wallet_utxos(&wallet_path, &utxos) {
+                            wwlog!(
+                                "wallet_rpc: send_rebuild_persist_failed wallet={} err={}",
+                                wallet_public_name(&wallet_path),
+                                e
+                            );
                         }
                     }
-
-                    if let Err(e) = super::save_wallet_utxos(&wallet_path, &utxos) {
+                    Err(e) => {
                         wwlog!(
-                            "wallet_rpc: send_rebuild_persist_failed wallet={} err={}",
+                            "wallet_rpc: send_rebuild_failed wallet={} err={}",
                             wallet_public_name(&wallet_path),
                             e
                         );
+                        super::respond_json(
+                            request,
+                            tiny_http::StatusCode(502),
+                            json!({"error":"wallet_state_refresh_failed","detail":e}).to_string(),
+                        );
+                        return;
                     }
                 }
             }

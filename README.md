@@ -4,7 +4,7 @@
 
 It contains encrypted wallet storage, wallet RPC, mnemonic and recovery handling, passphrase management, and wallet-side send and sync logic.
 
-Current release line: `0.0.1-beta`
+Current release line: `1.0.0`
 
 Website: https://dutago.xyz
 

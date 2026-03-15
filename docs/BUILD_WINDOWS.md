@@ -1,6 +1,6 @@
 # Build dutawalletd on Windows
 
-This guide is for producing the Windows wallet daemon binary for packaging and deployment.
+This guide is for producing the Windows wallet daemon binary without using PowerShell.
 
 ## Requirements
 
@@ -11,8 +11,8 @@ This guide is for producing the Windows wallet daemon binary for packaging and d
 
 From the repository root:
 
-```powershell
-cargo build --release
+```bat
+scripts\build-windows.cmd
 ```
 
 ## Output
@@ -27,8 +27,14 @@ target\release\dutawalletd.exe
 
 Check the available flags before packaging or deploying:
 
-```powershell
-.\target\release\dutawalletd.exe --help
+```bat
+target\release\dutawalletd.exe --help
+```
+
+## Run
+
+```bat
+scripts\run-walletd.cmd .\data\mainnet
 ```
 
 ## Next step

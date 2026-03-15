@@ -12,7 +12,7 @@ This guide is for producing the Linux wallet daemon binary for packaging and dep
 From the repository root:
 
 ```bash
-cargo build --release
+./scripts/build-linux.sh
 ```
 
 ## Output
@@ -29,6 +29,12 @@ Check the available flags before packaging or deploying:
 
 ```bash
 ./target/release/dutawalletd --help
+```
+
+## Run
+
+```bash
+./scripts/run-walletd.sh ./data/mainnet
 ```
 
 ## Next step

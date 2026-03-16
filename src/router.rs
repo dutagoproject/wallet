@@ -1107,6 +1107,13 @@ fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<(i64, i64, i64, i64, 
     Ok((balance, spendable, immature, cur_h, utxos.len()))
 }
 
+fn daemon_tip_height(daemon_rpc_port: u16) -> Result<i64, String> {
+    let tip_body = super::http_get_local("127.0.0.1", daemon_rpc_port, "/tip")?;
+    let tip_v: serde_json::Value =
+        serde_json::from_str(&tip_body).map_err(|e| format!("tip_invalid_json: {}", e))?;
+    Ok(tip_v.get("height").and_then(|x| x.as_i64()).unwrap_or(0))
+}
+
 pub(crate) fn handle_request(
     mut request: tiny_http::Request,
     rpc_addr: &str,
@@ -2288,8 +2295,20 @@ pub(crate) fn handle_request(
                         });
                     }
 
+                    let cur_h = match daemon_tip_height(daemon_rpc_port) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            super::respond_json(
+                                request,
+                                tiny_http::StatusCode(502),
+                                json!({"error":"wallet_state_refresh_failed","detail":e}).to_string(),
+                            );
+                            return;
+                        }
+                    };
+
                     // Persist to disk and update in-memory.
-                    if let Err(e) = super::save_wallet_utxos(&wallet_path, &new_utxos) {
+                    if let Err(e) = super::save_wallet_sync_state(&wallet_path, &new_utxos, cur_h) {
                         super::respond_json(
                             request,
                             tiny_http::StatusCode(500),
@@ -2302,6 +2321,7 @@ pub(crate) fn handle_request(
                         let mut g = super::wallet_lock_or_recover();
                         if let Some(ws) = g.as_mut() {
                             ws.utxos = new_utxos;
+                            ws.last_sync_height = cur_h;
                         }
                     }
 
@@ -4230,8 +4250,20 @@ pub(crate) fn handle_request(
                 });
             }
 
+            let cur_h = match daemon_tip_height(daemon_rpc_port) {
+                Ok(h) => h,
+                Err(e) => {
+                    super::respond_json(
+                        request,
+                        tiny_http::StatusCode(502),
+                        json!({"error":"wallet_state_refresh_failed","detail":e}).to_string(),
+                    );
+                    return;
+                }
+            };
+
             // Persist to disk and update in-memory.
-            if let Err(e) = super::save_wallet_utxos(&wallet_path, &new_utxos) {
+            if let Err(e) = super::save_wallet_sync_state(&wallet_path, &new_utxos, cur_h) {
                 super::respond_json(
                     request,
                     tiny_http::StatusCode(500),
@@ -4244,6 +4276,7 @@ pub(crate) fn handle_request(
                 let mut g = super::wallet_lock_or_recover();
                 if let Some(ws) = g.as_mut() {
                     ws.utxos = new_utxos;
+                    ws.last_sync_height = cur_h;
                 }
             }
 

@@ -16,8 +16,9 @@ mod tests {
     use super::{
         blocks_from_pruned_error, db_wallet_path, decode_seed_hex_for_migration, net_from_name,
         net_from_wallet_path, query_param, require_non_empty_passphrase, resolve_owned_input,
-        send_success_body, status_for_body_err, wallet_public_name, wallet_refresh_error_code,
-        wallet_state_network, OwnedInput, WalletSigner,
+        send_success_body, should_probe_daemon_utxo_presence, status_for_body_err,
+        wallet_public_name, wallet_refresh_error_code, wallet_state_network, OwnedInput,
+        WalletSigner,
     };
     use duta_core::netparams::Network;
     use serde_json::json;
@@ -237,6 +238,32 @@ mod tests {
             Some("disk_full")
         );
     }
+
+    #[test]
+    fn daemon_utxo_probe_skips_unconfirmed_wallet_change() {
+        let utxo = super::super::Utxo {
+            value: 9,
+            height: 0,
+            coinbase: false,
+            address: "dut1change".to_string(),
+            txid: "ab".repeat(32),
+            vout: 1,
+        };
+        assert!(!should_probe_daemon_utxo_presence(&utxo, 100));
+    }
+
+    #[test]
+    fn daemon_utxo_probe_keeps_confirmed_outputs_eligible() {
+        let utxo = super::super::Utxo {
+            value: 9,
+            height: 55,
+            coinbase: false,
+            address: "dut1confirmed".to_string(),
+            txid: "cd".repeat(32),
+            vout: 0,
+        };
+        assert!(should_probe_daemon_utxo_presence(&utxo, 100));
+    }
 }
 
 fn net_from_name(net: &str) -> duta_core::netparams::Network {
@@ -449,6 +476,16 @@ fn send_success_body(
         body["wallet_state_persist_error"] = json!(e);
     }
     body
+}
+
+fn should_probe_daemon_utxo_presence(u: &super::Utxo, cur_h: i64) -> bool {
+    if u.txid.is_empty() {
+        return false;
+    }
+    if u.height <= 0 {
+        return false;
+    }
+    u.height <= cur_h
 }
 
 fn rebuild_wallet_utxos_via_blocks_from(
@@ -1140,7 +1177,7 @@ fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<(i64, i64, i64, i64, 
             || utxos.is_empty()
             || utxos.iter().any(|u| u.height > cur_h)
             || utxos.iter().any(|u| {
-                if u.txid.is_empty() {
+                if !should_probe_daemon_utxo_presence(u, cur_h) {
                     return false;
                 }
                 let path = format!("/utxo?txid={}&vout={}", u.txid, u.vout);

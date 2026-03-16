@@ -1206,10 +1206,6 @@ fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<(i64, i64, i64, i64, 
     Ok((balance, spendable, immature, cur_h, utxos.len()))
 }
 
-fn daemon_tip_height(daemon_rpc_port: u16) -> Result<i64, String> {
-    daemon_tip_height_with_retry(daemon_rpc_port, 0)
-}
-
 pub(crate) fn handle_request(
     mut request: tiny_http::Request,
     rpc_addr: &str,
@@ -2377,49 +2373,54 @@ pub(crate) fn handle_request(
                         });
                     }
 
-                    let cur_h = match daemon_tip_height(daemon_rpc_port) {
+                    let cur_h = match daemon_tip_height_with_retry(daemon_rpc_port, cur_h) {
                         Ok(h) => h,
                         Err(e) => {
-                            super::respond_json(
-                                request,
-                                tiny_http::StatusCode(502),
-                                json!({"error":"wallet_state_refresh_failed","detail":e}).to_string(),
+                            wwlog!(
+                                "wallet_rpc: send_tip_refresh_failed wallet={} txid={} fallback_height={} err={}",
+                                wallet_public_name(&wallet_path),
+                                txid,
+                                cur_h,
+                                e
                             );
-                            return;
+                            cur_h
                         }
                     };
 
                     // Persist to disk and update in-memory.
-                    if let Err(e) = super::save_wallet_sync_state(&wallet_path, &new_utxos, cur_h) {
-                        super::respond_json(
-                            request,
-                            tiny_http::StatusCode(500),
-                            json!({"error":"wallet_persist_failed","detail":e}).to_string(),
-                        );
-                        return;
-                    }
+                    let persist_result =
+                        super::save_wallet_sync_state(&wallet_path, &new_utxos, cur_h);
 
                     {
                         let mut g = super::wallet_lock_or_recover();
                         if let Some(ws) = g.as_mut() {
-                            ws.utxos = new_utxos;
+                            ws.utxos = new_utxos.clone();
                             ws.last_sync_height = cur_h;
                         }
                     }
 
-                    super::respond_json(
-                        request,
-                        tiny_http::StatusCode(200),
-                        json!({
-                            "ok": true,
-                            "txid": txid,
-                            "amount": req.amount,
-                            "fee": final_fee,
-                            "change": final_change,
-                            "inputs": selected.len()
-                        })
-                        .to_string(),
+                    let body = send_success_body(
+                        &txid,
+                        req.amount,
+                        final_fee,
+                        final_change,
+                        selected.len(),
+                        cur_h,
+                        persist_result,
                     );
+                    if let Some(e) = body
+                        .get("wallet_state_persist_error")
+                        .and_then(|x| x.as_str())
+                    {
+                        wwlog!(
+                            "wallet_rpc: send_state_persist_failed wallet={} txid={} err={}",
+                            wallet_public_name(&wallet_path),
+                            body.get("txid").and_then(|x| x.as_str()).unwrap_or("-"),
+                            e
+                        );
+                    }
+
+                    super::respond_json(request, tiny_http::StatusCode(200), body.to_string());
 
                     // Success path above responded with plain JSON.
                     // Convert to JSON-RPC response wrapper is non-trivial without refactor;

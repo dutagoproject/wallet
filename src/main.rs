@@ -820,8 +820,7 @@ pub(crate) fn save_wallet_sync_state(path: &str, utxos: &[Utxo], last_sync_heigh
         return Err("legacy_plaintext_wallet_disabled_use_db_wallet".to_string());
     }
     let db = walletdb::WalletDb::open(path)?;
-    db.update_utxos(utxos)?;
-    db.update_last_sync_height(last_sync_height)
+    db.update_sync_state(utxos, last_sync_height)
 }
 
 fn start_wallet_rpc(rpc_addr: String, daemon_rpc_port: u16, net: String) -> Result<(), String> {

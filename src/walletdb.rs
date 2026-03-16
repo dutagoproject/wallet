@@ -497,13 +497,39 @@ impl WalletDb {
         }
     }
 
-    pub(crate) fn update_last_sync_height(&self, height: i64) -> Result<(), String> {
+    pub(crate) fn update_sync_state(
+        &self,
+        utxos: &[crate::Utxo],
+        last_sync_height: i64,
+    ) -> Result<(), String> {
+        let body = serde_json::to_vec(utxos).map_err(|e| format!("db_utxos_encode_failed: {e}"))?;
         self.conn
-            .execute(
-                "INSERT OR REPLACE INTO meta(k,v) VALUES('last_sync_height', ?1)",
-                params![height],
-            )
-            .map_err(|e| format!("db_meta_write_failed: {e}"))?;
+            .execute("BEGIN IMMEDIATE TRANSACTION", [])
+            .map_err(|e| format!("db_tx_begin_failed: {e}"))?;
+
+        let result: Result<(), String> = (|| {
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO meta(k,v) VALUES('utxos_json', ?1)",
+                    params![body],
+                )
+                .map_err(|e| format!("db_meta_write_failed: {e}"))?;
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO meta(k,v) VALUES('last_sync_height', ?1)",
+                    params![last_sync_height],
+                )
+                .map_err(|e| format!("db_meta_write_failed: {e}"))?;
+            self.conn
+                .execute("COMMIT", [])
+                .map_err(|e| format!("db_tx_commit_failed: {e}"))?;
+            Ok(())
+        })();
+
+        if let Err(e) = result {
+            let _ = self.conn.execute("ROLLBACK", []);
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -598,5 +624,28 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].0, "dut1test");
         assert_eq!(keys[0].2, sk);
+    }
+
+    #[test]
+    fn update_sync_state_writes_utxos_and_height_together() {
+        let path = temp_wallet_path("sync-state");
+        let db = WalletDb::create_new(&path, "strong-pass-123", &[5u8; 32], 1).unwrap();
+        let utxos = vec![crate::Utxo {
+            value: 11,
+            height: 22,
+            coinbase: false,
+            address: "dut1sync".to_string(),
+            txid: "ab".repeat(32),
+            vout: 1,
+        }];
+
+        db.update_sync_state(&utxos, 44).unwrap();
+
+        let reopened = WalletDb::open(&path).unwrap();
+        assert_eq!(reopened.read_last_sync_height().unwrap(), 44);
+        let got = reopened.read_utxos().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].txid, "ab".repeat(32));
+        assert_eq!(got[0].value, 11);
     }
 }

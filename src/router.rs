@@ -692,12 +692,28 @@ fn prune_confirmed_pending_txs(
     before != pending.len()
 }
 
+const PENDING_MEMPOOL_GRACE_SECS: i64 = 120;
+
+fn pending_tx_is_recent(pending: &super::PendingTx, now_secs: i64) -> bool {
+    pending.timestamp > 0 && now_secs.saturating_sub(pending.timestamp) <= PENDING_MEMPOOL_GRACE_SECS
+}
+
 fn pending_reserved_outpoints(pending: &[super::PendingTx]) -> HashSet<(String, u32)> {
     pending
         .iter()
         .flat_map(|p| p.spent_inputs.iter())
         .filter(|i| !i.txid.is_empty())
         .map(|i| (i.txid.clone(), i.vout))
+        .collect()
+}
+
+fn collect_mempool_txids(v: &serde_json::Value) -> HashSet<String> {
+    v.get("txids")
+        .and_then(|x| x.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .map(|s| s.to_string())
         .collect()
 }
 
@@ -721,12 +737,29 @@ fn collect_mempool_spent_outpoints(v: &serde_json::Value) -> HashSet<(String, u3
     out
 }
 
-fn daemon_mempool_spent_outpoints(daemon_rpc_port: u16) -> Result<HashSet<(String, u32)>, String> {
+fn daemon_mempool_state(
+    daemon_rpc_port: u16,
+) -> Result<(HashSet<String>, HashSet<(String, u32)>), String> {
     let body = super::http_get_local("127.0.0.1", daemon_rpc_port, "/mempool")
         .map_err(|e| format!("mempool_fetch_failed:{e}"))?;
     let v: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| format!("mempool_invalid_json:{e}"))?;
-    Ok(collect_mempool_spent_outpoints(&v))
+    Ok((collect_mempool_txids(&v), collect_mempool_spent_outpoints(&v)))
+}
+
+fn prune_inactive_pending_txs(
+    pending: &mut Vec<super::PendingTx>,
+    mempool_txids: &HashSet<String>,
+    now_secs: i64,
+) -> bool {
+    let before = pending.len();
+    pending.retain(|p| {
+        if p.txid.is_empty() {
+            return false;
+        }
+        mempool_txids.contains(&p.txid) || pending_tx_is_recent(p, now_secs)
+    });
+    before != pending.len()
 }
 
 fn refresh_wallet_utxos_after_submit_conflict(
@@ -746,6 +779,35 @@ fn refresh_wallet_utxos_after_submit_conflict(
         }
     }
     super::save_wallet_sync_state(wallet_path, &utxos, cur_h)
+}
+
+fn sync_pending_txs_with_chain_and_mempool(
+    wallet_path: &str,
+    pending_txs: &mut Vec<super::PendingTx>,
+    confirmed: &[(String, i64, i64, String, i64, bool, Vec<serde_json::Value>)],
+    daemon_rpc_port: u16,
+) {
+    let mut changed = prune_confirmed_pending_txs(pending_txs, confirmed);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    if let Ok((mempool_txids, _)) = daemon_mempool_state(daemon_rpc_port) {
+        if prune_inactive_pending_txs(pending_txs, &mempool_txids, now_secs) {
+            changed = true;
+        }
+    }
+    if changed {
+        {
+            let mut g = super::wallet_lock_or_recover();
+            if let Some(ws) = g.as_mut() {
+                ws.pending_txs = pending_txs.clone();
+            }
+        }
+        if let Err(e) = super::save_wallet_pending_txs(wallet_path, pending_txs) {
+            wwlog!("wallet_rpc: pending_txs_prune_persist_failed wallet={} err={}", wallet_public_name(wallet_path), e);
+        }
+    }
 }
 
 fn record_pending_send(
@@ -1467,9 +1529,32 @@ fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<(i64, i64, i64, i64, 
     };
 
     let cur_h = daemon_tip_height_with_retry(daemon_rpc_port, last_sync_height)?;
-    let mut reserved_outpoints = pending_reserved_outpoints(&pending_txs);
-    match daemon_mempool_spent_outpoints(daemon_rpc_port) {
-        Ok(mempool_reserved) => reserved_outpoints.extend(mempool_reserved),
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let mut active_pending = pending_txs.clone();
+    let mut reserved_outpoints = pending_reserved_outpoints(&active_pending);
+    match daemon_mempool_state(daemon_rpc_port) {
+        Ok((mempool_txids, mempool_reserved)) => {
+            if prune_inactive_pending_txs(&mut active_pending, &mempool_txids, now_secs) {
+                {
+                    let mut g = super::wallet_lock_or_recover();
+                    if let Some(ws) = g.as_mut() {
+                        ws.pending_txs = active_pending.clone();
+                    }
+                }
+                if let Err(e) = super::save_wallet_pending_txs(&wallet_path, &active_pending) {
+                    wwlog!(
+                        "wallet_rpc: pending_txs_mempool_prune_persist_failed wallet={} err={}",
+                        wallet_public_name(&wallet_path),
+                        e
+                    );
+                }
+            }
+            reserved_outpoints = pending_reserved_outpoints(&active_pending);
+            reserved_outpoints.extend(mempool_reserved);
+        }
         Err(e) => {
             wwlog!(
                 "wallet_rpc: mempool_reservation_probe_failed wallet={} err={}",
@@ -1989,7 +2074,7 @@ pub(crate) fn handle_request(
                                 return;
                             }
                         };
-                    let (cur_h, utxos) = {
+                    let (wallet_path, cur_h, utxos, pending_txs) = {
                         let g = super::wallet_lock_or_recover();
                         let ws = match g.as_ref() {
                             Some(w) => w,
@@ -2002,8 +2087,42 @@ pub(crate) fn handle_request(
                                 return;
                             }
                         };
-                        (height, ws.utxos.clone())
+                        (ws.wallet_path.clone(), height, ws.utxos.clone(), ws.pending_txs.clone())
                     };
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    let mut active_pending = pending_txs;
+                    let mut reserved_outpoints = pending_reserved_outpoints(&active_pending);
+                    match daemon_mempool_state(daemon_rpc_port) {
+                        Ok((mempool_txids, mempool_reserved)) => {
+                            if prune_inactive_pending_txs(&mut active_pending, &mempool_txids, now_secs) {
+                                {
+                                    let mut g = super::wallet_lock_or_recover();
+                                    if let Some(ws) = g.as_mut() {
+                                        ws.pending_txs = active_pending.clone();
+                                    }
+                                }
+                                if let Err(e) = super::save_wallet_pending_txs(&wallet_path, &active_pending) {
+                                    wwlog!(
+                                        "wallet_rpc: pending_txs_mempool_prune_persist_failed wallet={} err={}",
+                                        wallet_public_name(&wallet_path),
+                                        e
+                                    );
+                                }
+                            }
+                            reserved_outpoints = pending_reserved_outpoints(&active_pending);
+                            reserved_outpoints.extend(mempool_reserved);
+                        }
+                        Err(e) => {
+                            wwlog!(
+                                "wallet_rpc: mempool_reservation_probe_failed wallet={} err={}",
+                                wallet_public_name(&wallet_path),
+                                e
+                            );
+                        }
+                    }
 
                     let mut out: Vec<serde_json::Value> = Vec::new();
                     for u in utxos.iter() {
@@ -2021,7 +2140,7 @@ pub(crate) fn handle_request(
                             "address": u.address,
                             "amount": u.value,
                             "confirmations": conf,
-                            "spendable": !(u.coinbase && conf < 60),
+                            "spendable": !(u.coinbase && conf < 60) && !reserved_outpoints.contains(&(u.txid.clone(), u.vout)),
                             "coinbase": u.coinbase
                         }));
                     }
@@ -2048,7 +2167,7 @@ pub(crate) fn handle_request(
                         (skip_in as usize).min(1_000_000)
                     };
 
-                    let (addrs, pending_txs) = {
+                    let (wallet_path, addrs, pending_txs) = {
                         let g = super::wallet_lock_or_recover();
                         let ws = match g.as_ref() {
                             Some(w) => w,
@@ -2074,7 +2193,7 @@ pub(crate) fn handle_request(
                             );
                             return;
                         }
-                        (addrs, ws.pending_txs.clone())
+                        (ws.wallet_path.clone(), addrs, ws.pending_txs.clone())
                     };
 
                     let (cur_h, txs) =
@@ -2090,18 +2209,12 @@ pub(crate) fn handle_request(
                             }
                         };
                     let mut pending_txs = pending_txs;
-                    if prune_confirmed_pending_txs(&mut pending_txs, &txs) {
-                        let mut g = super::wallet_lock_or_recover();
-                        if let Some(ws) = g.as_mut() {
-                            ws.pending_txs = pending_txs.clone();
-                        }
-                        if let Err(e) = super::save_wallet_pending_txs(&{
-                            let g = super::wallet_lock_or_recover();
-                            g.as_ref().map(|ws| ws.wallet_path.clone()).unwrap_or_default()
-                        }, &pending_txs) {
-                            wwlog!("wallet_rpc: pending_txs_prune_persist_failed err={}", e);
-                        }
-                    }
+                    sync_pending_txs_with_chain_and_mempool(
+                        &wallet_path,
+                        &mut pending_txs,
+                        &txs,
+                        daemon_rpc_port,
+                    );
                     let txs = merge_pending_wallet_txs(txs, &pending_txs);
 
                     let mut out: Vec<serde_json::Value> = Vec::new();
@@ -2153,7 +2266,7 @@ pub(crate) fn handle_request(
                         }
                     };
 
-                    let (addrs, pending_txs) = {
+                    let (wallet_path, addrs, pending_txs) = {
                         let g = super::wallet_lock_or_recover();
                         let ws = match g.as_ref() {
                             Some(w) => w,
@@ -2179,7 +2292,7 @@ pub(crate) fn handle_request(
                             );
                             return;
                         }
-                        (addrs, ws.pending_txs.clone())
+                        (ws.wallet_path.clone(), addrs, ws.pending_txs.clone())
                     };
 
                     let (cur_h, txs) =
@@ -2195,18 +2308,12 @@ pub(crate) fn handle_request(
                             }
                         };
                     let mut pending_txs = pending_txs;
-                    if prune_confirmed_pending_txs(&mut pending_txs, &txs) {
-                        let mut g = super::wallet_lock_or_recover();
-                        if let Some(ws) = g.as_mut() {
-                            ws.pending_txs = pending_txs.clone();
-                        }
-                        if let Err(e) = super::save_wallet_pending_txs(&{
-                            let g = super::wallet_lock_or_recover();
-                            g.as_ref().map(|ws| ws.wallet_path.clone()).unwrap_or_default()
-                        }, &pending_txs) {
-                            wwlog!("wallet_rpc: pending_txs_prune_persist_failed err={}", e);
-                        }
-                    }
+                    sync_pending_txs_with_chain_and_mempool(
+                        &wallet_path,
+                        &mut pending_txs,
+                        &txs,
+                        daemon_rpc_port,
+                    );
                     let txs = merge_pending_wallet_txs(txs, &pending_txs);
 
                     let mut found: Option<(i64, i64, String, i64, bool, Vec<serde_json::Value>)> =
@@ -2503,9 +2610,30 @@ pub(crate) fn handle_request(
                             return;
                         }
                     };
-                    let mut reserved_outpoints = pending_reserved_outpoints(&pending_txs);
-                    match daemon_mempool_spent_outpoints(daemon_rpc_port) {
-                        Ok(mempool_reserved) => reserved_outpoints.extend(mempool_reserved),
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    let mut active_pending = pending_txs.clone();
+                    let mut reserved_outpoints = pending_reserved_outpoints(&active_pending);
+                    match daemon_mempool_state(daemon_rpc_port) {
+                        Ok((mempool_txids, mempool_reserved)) => {
+                            if prune_inactive_pending_txs(&mut active_pending, &mempool_txids, now_secs) {
+                                let mut g = super::wallet_lock_or_recover();
+                                if let Some(ws) = g.as_mut() {
+                                    ws.pending_txs = active_pending.clone();
+                                }
+                                if let Err(e) = super::save_wallet_pending_txs(&wallet_path, &active_pending) {
+                                    wwlog!(
+                                        "wallet_rpc: pending_txs_mempool_prune_persist_failed wallet={} err={}",
+                                        wallet_public_name(&wallet_path),
+                                        e
+                                    );
+                                }
+                            }
+                            reserved_outpoints = pending_reserved_outpoints(&active_pending);
+                            reserved_outpoints.extend(mempool_reserved);
+                        }
                         Err(e) => {
                             wwlog!(
                                 "wallet_rpc: mempool_reservation_probe_failed wallet={} err={}",
@@ -4522,9 +4650,30 @@ pub(crate) fn handle_request(
                     return;
                 }
             };
-            let mut reserved_outpoints = pending_reserved_outpoints(&pending_txs);
-            match daemon_mempool_spent_outpoints(daemon_rpc_port) {
-                Ok(mempool_reserved) => reserved_outpoints.extend(mempool_reserved),
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            let mut active_pending = pending_txs.clone();
+            let mut reserved_outpoints = pending_reserved_outpoints(&active_pending);
+            match daemon_mempool_state(daemon_rpc_port) {
+                Ok((mempool_txids, mempool_reserved)) => {
+                    if prune_inactive_pending_txs(&mut active_pending, &mempool_txids, now_secs) {
+                        let mut g = super::wallet_lock_or_recover();
+                        if let Some(ws) = g.as_mut() {
+                            ws.pending_txs = active_pending.clone();
+                        }
+                        if let Err(e) = super::save_wallet_pending_txs(&wallet_path, &active_pending) {
+                            wwlog!(
+                                "wallet_rpc: pending_txs_mempool_prune_persist_failed wallet={} err={}",
+                                wallet_public_name(&wallet_path),
+                                e
+                            );
+                        }
+                    }
+                    reserved_outpoints = pending_reserved_outpoints(&active_pending);
+                    reserved_outpoints.extend(mempool_reserved);
+                }
                 Err(e) => {
                     wwlog!(
                         "wallet_rpc: mempool_reservation_probe_failed wallet={} err={}",

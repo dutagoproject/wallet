@@ -17,8 +17,8 @@ mod tests {
         blocks_from_pruned_error, db_wallet_path, decode_seed_hex_for_migration, net_from_name,
         net_from_wallet_path, query_param, require_non_empty_passphrase, resolve_owned_input,
         send_success_body, should_probe_daemon_utxo_presence, status_for_body_err,
-        wallet_public_name, wallet_refresh_error_code, wallet_state_network, OwnedInput,
-        WalletSigner,
+        tx_output_address, wallet_public_name, wallet_refresh_error_code, wallet_state_network,
+        OwnedInput, WalletSigner,
     };
     use duta_core::netparams::Network;
     use serde_json::json;
@@ -264,6 +264,19 @@ mod tests {
         };
         assert!(should_probe_daemon_utxo_presence(&utxo, 100));
     }
+
+    #[test]
+    fn tx_output_address_accepts_newer_address_key() {
+        assert_eq!(
+            tx_output_address(&json!({"address":"dut1new","value":1})),
+            "dut1new"
+        );
+    }
+
+    #[test]
+    fn tx_output_address_falls_back_to_legacy_addr_key() {
+        assert_eq!(tx_output_address(&json!({"addr":"dut1old","value":1})), "dut1old");
+    }
 }
 
 fn net_from_name(net: &str) -> duta_core::netparams::Network {
@@ -488,6 +501,13 @@ fn should_probe_daemon_utxo_presence(u: &super::Utxo, cur_h: i64) -> bool {
     u.height <= cur_h
 }
 
+fn tx_output_address(ov: &serde_json::Value) -> &str {
+    ov.get("address")
+        .and_then(|x| x.as_str())
+        .or_else(|| ov.get("addr").and_then(|x| x.as_str()))
+        .unwrap_or("")
+}
+
 fn rebuild_wallet_utxos_via_blocks_from(
     addrs: &[String],
     daemon_rpc_port: u16,
@@ -571,7 +591,7 @@ fn rebuild_wallet_utxos_via_blocks_from(
                             .is_empty());
 
                 for (i, ov) in vout.iter().enumerate() {
-                    let oaddr = ov.get("addr").and_then(|x| x.as_str()).unwrap_or("");
+                    let oaddr = tx_output_address(ov);
                     if !addr_set.contains(oaddr) {
                         continue;
                     }
@@ -676,7 +696,7 @@ fn scan_wallet_txs_via_blocks_from(
                 let mut external_total: i64 = 0;
                 let mut send_details: Vec<serde_json::Value> = Vec::new();
                 for ov in vout.iter() {
-                    let oaddr = ov.get("addr").and_then(|x| x.as_str()).unwrap_or("");
+                    let oaddr = tx_output_address(ov);
                     let val = ov.get("value").and_then(|x| x.as_i64()).unwrap_or(0);
                     if val <= 0 {
                         continue;

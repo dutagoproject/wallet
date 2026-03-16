@@ -16,8 +16,8 @@ mod tests {
     use super::{
         blocks_from_pruned_error, db_wallet_path, decode_seed_hex_for_migration, net_from_name,
         net_from_wallet_path, query_param, require_non_empty_passphrase, resolve_owned_input,
-        status_for_body_err, wallet_public_name, wallet_refresh_error_code, wallet_state_network,
-        OwnedInput, WalletSigner,
+        send_success_body, status_for_body_err, wallet_public_name, wallet_refresh_error_code,
+        wallet_state_network, OwnedInput, WalletSigner,
     };
     use duta_core::netparams::Network;
     use serde_json::json;
@@ -223,6 +223,20 @@ mod tests {
         };
         assert_eq!(wallet_state_network(&ws), Network::Stagenet);
     }
+
+    #[test]
+    fn send_success_body_stays_ok_when_persist_fails() {
+        let body = send_success_body("tx123", 50, 1, 9, 2, 123, Err("disk_full".to_string()));
+        assert_eq!(body.get("ok").and_then(|x| x.as_bool()), Some(true));
+        assert_eq!(
+            body.get("wallet_state_persisted").and_then(|x| x.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            body.get("wallet_state_persist_error").and_then(|x| x.as_str()),
+            Some("disk_full")
+        );
+    }
 }
 
 fn net_from_name(net: &str) -> duta_core::netparams::Network {
@@ -410,6 +424,31 @@ fn wallet_refresh_error_code(detail: &str) -> &'static str {
     } else {
         "wallet_state_refresh_failed"
     }
+}
+
+fn send_success_body(
+    txid: &str,
+    amount: i64,
+    fee: i64,
+    change: i64,
+    inputs: usize,
+    height: i64,
+    persist_result: Result<(), String>,
+) -> serde_json::Value {
+    let mut body = json!({
+        "ok": true,
+        "txid": txid,
+        "amount": amount,
+        "fee": fee,
+        "change": change,
+        "inputs": inputs,
+        "height": height,
+        "wallet_state_persisted": persist_result.is_ok()
+    });
+    if let Err(e) = persist_result {
+        body["wallet_state_persist_error"] = json!(e);
+    }
+    body
 }
 
 fn rebuild_wallet_utxos_via_blocks_from(
@@ -4304,24 +4343,25 @@ pub(crate) fn handle_request(
                 }
             }
 
-            let mut body = json!({
-                "ok": true,
-                "txid": txid,
-                "amount": req.amount,
-                "fee": final_fee,
-                "change": final_change,
-                "inputs": selected.len(),
-                "height": cur_h,
-                "wallet_state_persisted": persist_result.is_ok()
-            });
-            if let Err(e) = persist_result {
+            let body = send_success_body(
+                &txid,
+                req.amount,
+                final_fee,
+                final_change,
+                selected.len(),
+                cur_h,
+                persist_result,
+            );
+            if let Some(e) = body
+                .get("wallet_state_persist_error")
+                .and_then(|x| x.as_str())
+            {
                 wwlog!(
                     "wallet_rpc: send_state_persist_failed wallet={} txid={} err={}",
                     wallet_public_name(&wallet_path),
                     body.get("txid").and_then(|x| x.as_str()).unwrap_or("-"),
                     e
                 );
-                body["wallet_state_persist_error"] = json!(e);
             }
 
             super::respond_json(request, tiny_http::StatusCode(200), body.to_string());

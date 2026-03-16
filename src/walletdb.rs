@@ -547,6 +547,7 @@ impl WalletDb {
 #[cfg(test)]
 mod tests {
     use super::WalletDb;
+    use hex;
 
     fn temp_wallet_path(tag: &str) -> String {
         let mut p = std::env::temp_dir();
@@ -573,5 +574,29 @@ mod tests {
             .change_passphrase("strong-pass-123", "short-pass")
             .unwrap_err();
         assert_eq!(err, "new_passphrase_too_short");
+    }
+
+    #[test]
+    fn change_passphrase_preserves_seed_and_rejects_old_passphrase() {
+        let path = temp_wallet_path("preserve-seed");
+        let db = WalletDb::create_new(&path, "strong-pass-123", &[7u8; 32], 1).unwrap();
+        let sk = [9u8; 32];
+        db.insert_key_encrypted("dut1test", &hex::encode([3u8; 32]), &sk, "strong-pass-123")
+            .unwrap();
+
+        db.change_passphrase("strong-pass-123", "new-strong-pass-456")
+            .unwrap();
+
+        let err = db.decrypt_seed("strong-pass-123").unwrap_err();
+        assert_eq!(err, "decrypt_failed");
+        assert_eq!(
+            db.decrypt_seed("new-strong-pass-456").unwrap(),
+            vec![7u8; 32]
+        );
+
+        let keys = db.decrypt_all_keys("new-strong-pass-456").unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].0, "dut1test");
+        assert_eq!(keys[0].2, sk);
     }
 }

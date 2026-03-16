@@ -15,10 +15,11 @@ fn status_for_body_err(detail: &str) -> tiny_http::StatusCode {
 mod tests {
     use super::{
         blocks_from_pruned_error, db_wallet_path, decode_seed_hex_for_migration, net_from_name,
-        net_from_wallet_path, query_param, require_non_empty_passphrase, resolve_owned_input,
-        send_success_body, should_probe_daemon_utxo_presence, status_for_body_err,
-        tx_output_address, wallet_public_name, wallet_refresh_error_code, wallet_state_network,
-        OwnedInput, WalletSigner,
+        merge_pending_wallet_txs, net_from_wallet_path, query_param,
+        require_non_empty_passphrase, resolve_owned_input, send_success_body,
+        should_probe_daemon_utxo_presence, status_for_body_err, tx_output_address,
+        wallet_public_name, wallet_refresh_error_code, wallet_state_network, OwnedInput,
+        WalletSigner,
     };
     use duta_core::netparams::Network;
     use serde_json::json;
@@ -174,6 +175,7 @@ mod tests {
             keys: BTreeMap::new(),
             pubkeys: BTreeMap::new(),
             utxos: Vec::new(),
+            pending_txs: Vec::new(),
             last_sync_height: 0,
             seed_hex: None,
             next_index: 0,
@@ -197,6 +199,7 @@ mod tests {
             keys: BTreeMap::new(),
             pubkeys,
             utxos: Vec::new(),
+            pending_txs: Vec::new(),
             last_sync_height: 0,
             seed_hex: None,
             next_index: 0,
@@ -215,6 +218,7 @@ mod tests {
             keys: BTreeMap::new(),
             pubkeys: BTreeMap::new(),
             utxos: Vec::new(),
+            pending_txs: Vec::new(),
             last_sync_height: 0,
             seed_hex: None,
             next_index: 0,
@@ -276,6 +280,59 @@ mod tests {
     #[test]
     fn tx_output_address_falls_back_to_legacy_addr_key() {
         assert_eq!(tx_output_address(&json!({"addr":"dut1old","value":1})), "dut1old");
+    }
+
+    #[test]
+    fn pending_wallet_txs_are_appended_when_unconfirmed() {
+        let merged = merge_pending_wallet_txs(
+            vec![(
+                "confirmed".to_string(),
+                12,
+                100,
+                "receive".to_string(),
+                5,
+                false,
+                Vec::new(),
+            )],
+            &[super::super::PendingTx {
+                txid: "pending".to_string(),
+                category: "send".to_string(),
+                amount: -7,
+                fee: 1,
+                change: 2,
+                timestamp: 200,
+                details: vec![json!({"category":"send","address":"dut1dest","amount":-6})],
+            }],
+        );
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().any(|(txid, h, _, category, amount, _, _)| {
+            txid == "pending" && *h == 0 && category == "send" && *amount == -7
+        }));
+    }
+
+    #[test]
+    fn pending_wallet_txs_are_hidden_after_confirmation() {
+        let merged = merge_pending_wallet_txs(
+            vec![(
+                "same-txid".to_string(),
+                12,
+                100,
+                "send".to_string(),
+                -7,
+                false,
+                Vec::new(),
+            )],
+            &[super::super::PendingTx {
+                txid: "same-txid".to_string(),
+                category: "send".to_string(),
+                amount: -7,
+                fee: 1,
+                change: 2,
+                timestamp: 200,
+                details: Vec::new(),
+            }],
+        );
+        assert_eq!(merged.len(), 1);
     }
 }
 
@@ -506,6 +563,66 @@ fn tx_output_address(ov: &serde_json::Value) -> &str {
         .and_then(|x| x.as_str())
         .or_else(|| ov.get("addr").and_then(|x| x.as_str()))
         .unwrap_or("")
+}
+
+fn merge_pending_wallet_txs(
+    mut confirmed: Vec<(String, i64, i64, String, i64, bool, Vec<serde_json::Value>)>,
+    pending: &[super::PendingTx],
+) -> Vec<(String, i64, i64, String, i64, bool, Vec<serde_json::Value>)> {
+    let confirmed_ids: HashSet<String> = confirmed
+        .iter()
+        .map(|(txid, _, _, _, _, _, _)| txid.clone())
+        .collect();
+    for p in pending.iter() {
+        if p.txid.is_empty() || confirmed_ids.contains(&p.txid) {
+            continue;
+        }
+        confirmed.push((
+            p.txid.clone(),
+            0,
+            p.timestamp,
+            p.category.clone(),
+            p.amount,
+            false,
+            p.details.clone(),
+        ));
+    }
+    confirmed.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    confirmed
+}
+
+fn record_pending_send(
+    pending_txs: &mut Vec<super::PendingTx>,
+    txid: &str,
+    to_addr: &str,
+    amount: i64,
+    fee: i64,
+    change: i64,
+) {
+    if txid.is_empty() {
+        return;
+    }
+    pending_txs.retain(|p| p.txid != txid);
+    let mut details = vec![json!({"category":"send","address":to_addr,"amount":-amount})];
+    if change > 0 {
+        details.push(json!({"category":"receive","address":"change","amount":change}));
+    }
+    pending_txs.push(super::PendingTx {
+        txid: txid.to_string(),
+        category: "send".to_string(),
+        amount: -(amount.saturating_add(fee)),
+        fee,
+        change,
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+        details,
+    });
 }
 
 fn rebuild_wallet_utxos_via_blocks_from(
@@ -1753,7 +1870,7 @@ pub(crate) fn handle_request(
                         (skip_in as usize).min(1_000_000)
                     };
 
-                    let addrs = {
+                    let (addrs, pending_txs) = {
                         let g = super::wallet_lock_or_recover();
                         let ws = match g.as_ref() {
                             Some(w) => w,
@@ -1779,7 +1896,7 @@ pub(crate) fn handle_request(
                             );
                             return;
                         }
-                        addrs
+                        (addrs, ws.pending_txs.clone())
                     };
 
                     let (cur_h, txs) =
@@ -1794,6 +1911,7 @@ pub(crate) fn handle_request(
                                 return;
                             }
                         };
+                    let txs = merge_pending_wallet_txs(txs, &pending_txs);
 
                     let mut out: Vec<serde_json::Value> = Vec::new();
                     for (i, (txid, h, block_time, category, amt, coinbase, details)) in
@@ -1844,7 +1962,7 @@ pub(crate) fn handle_request(
                         }
                     };
 
-                    let addrs = {
+                    let (addrs, pending_txs) = {
                         let g = super::wallet_lock_or_recover();
                         let ws = match g.as_ref() {
                             Some(w) => w,
@@ -1870,7 +1988,7 @@ pub(crate) fn handle_request(
                             );
                             return;
                         }
-                        addrs
+                        (addrs, ws.pending_txs.clone())
                     };
 
                     let (cur_h, txs) =
@@ -1885,6 +2003,7 @@ pub(crate) fn handle_request(
                                 return;
                             }
                         };
+                    let txs = merge_pending_wallet_txs(txs, &pending_txs);
 
                     let mut found: Option<(i64, i64, String, i64, bool, Vec<serde_json::Value>)> =
                         None;
@@ -2447,6 +2566,22 @@ pub(crate) fn handle_request(
                     // Persist to disk and update in-memory.
                     let persist_result =
                         super::save_wallet_sync_state(&wallet_path, &new_utxos, cur_h);
+                    let pending_persist_result = {
+                        let mut g = super::wallet_lock_or_recover();
+                        if let Some(ws) = g.as_mut() {
+                            record_pending_send(
+                                &mut ws.pending_txs,
+                                &txid,
+                                &to_addr,
+                                req.amount,
+                                final_fee,
+                                final_change,
+                            );
+                            super::save_wallet_pending_txs(&wallet_path, &ws.pending_txs)
+                        } else {
+                            Ok(())
+                        }
+                    };
 
                     {
                         let mut g = super::wallet_lock_or_recover();
@@ -2471,6 +2606,14 @@ pub(crate) fn handle_request(
                     {
                         wwlog!(
                             "wallet_rpc: send_state_persist_failed wallet={} txid={} err={}",
+                            wallet_public_name(&wallet_path),
+                            body.get("txid").and_then(|x| x.as_str()).unwrap_or("-"),
+                            e
+                        );
+                    }
+                    if let Err(e) = pending_persist_result {
+                        wwlog!(
+                            "wallet_rpc: send_pending_persist_failed wallet={} txid={} err={}",
                             wallet_public_name(&wallet_path),
                             body.get("txid").and_then(|x| x.as_str()).unwrap_or("-"),
                             e
@@ -2965,6 +3108,7 @@ pub(crate) fn handle_request(
                         m
                     },
                     utxos: Vec::new(),
+                    pending_txs: Vec::new(),
                     last_sync_height: 0,
                     seed_hex: None,
                     next_index: 1,
@@ -4392,6 +4536,22 @@ pub(crate) fn handle_request(
 
             // Persist to disk and update in-memory.
             let persist_result = super::save_wallet_sync_state(&wallet_path, &new_utxos, cur_h);
+            let pending_persist_result = {
+                let mut g = super::wallet_lock_or_recover();
+                if let Some(ws) = g.as_mut() {
+                    record_pending_send(
+                        &mut ws.pending_txs,
+                        &txid,
+                        &to_addr,
+                        req.amount,
+                        final_fee,
+                        final_change,
+                    );
+                    super::save_wallet_pending_txs(&wallet_path, &ws.pending_txs)
+                } else {
+                    Ok(())
+                }
+            };
 
             {
                 let mut g = super::wallet_lock_or_recover();
@@ -4416,6 +4576,14 @@ pub(crate) fn handle_request(
             {
                 wwlog!(
                     "wallet_rpc: send_state_persist_failed wallet={} txid={} err={}",
+                    wallet_public_name(&wallet_path),
+                    body.get("txid").and_then(|x| x.as_str()).unwrap_or("-"),
+                    e
+                );
+            }
+            if let Err(e) = pending_persist_result {
+                wwlog!(
+                    "wallet_rpc: send_pending_persist_failed wallet={} txid={} err={}",
                     wallet_public_name(&wallet_path),
                     body.get("txid").and_then(|x| x.as_str()).unwrap_or("-"),
                     e

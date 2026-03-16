@@ -188,6 +188,7 @@ pub(crate) struct WalletState {
     pub(crate) keys: BTreeMap<String, String>,
     pub(crate) pubkeys: BTreeMap<String, String>,
     pub(crate) utxos: Vec<Utxo>,
+    pub(crate) pending_txs: Vec<PendingTx>,
     pub(crate) last_sync_height: i64,
     pub(crate) seed_hex: Option<String>,
     pub(crate) next_index: u32,
@@ -212,6 +213,24 @@ pub(crate) struct Utxo {
     pub(crate) txid: String,
     #[serde(default)]
     pub(crate) vout: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct PendingTx {
+    #[serde(default)]
+    pub(crate) txid: String,
+    #[serde(default)]
+    pub(crate) category: String,
+    #[serde(default)]
+    pub(crate) amount: i64,
+    #[serde(default)]
+    pub(crate) fee: i64,
+    #[serde(default)]
+    pub(crate) change: i64,
+    #[serde(default)]
+    pub(crate) timestamp: i64,
+    #[serde(default)]
+    pub(crate) details: Vec<serde_json::Value>,
 }
 
 static WALLET: OnceLock<Mutex<Option<WalletState>>> = OnceLock::new();
@@ -681,6 +700,7 @@ pub(crate) fn load_wallet_db_to_state(path: &str) -> Result<WalletState, String>
     let rows = db.list_keys()?;
     let next_index = db.read_next_index()?.max(0) as u32;
     let utxos = db.read_utxos()?;
+    let pending_txs = db.read_pending_txs()?;
     let last_sync_height = db.read_last_sync_height()?;
     let mut primary_address = db.read_primary_address()?;
     if primary_address.is_empty() {
@@ -696,6 +716,7 @@ pub(crate) fn load_wallet_db_to_state(path: &str) -> Result<WalletState, String>
         keys: BTreeMap::new(), // locked by default
         pubkeys,
         utxos,
+        pending_txs,
         last_sync_height,
         seed_hex: None,
         next_index,
@@ -821,6 +842,14 @@ pub(crate) fn save_wallet_sync_state(path: &str, utxos: &[Utxo], last_sync_heigh
     }
     let db = walletdb::WalletDb::open(path)?;
     db.update_sync_state(utxos, last_sync_height)
+}
+
+pub(crate) fn save_wallet_pending_txs(path: &str, pending_txs: &[PendingTx]) -> Result<(), String> {
+    if !(path.ends_with(".db") || path.ends_with(".dat")) {
+        return Err("legacy_plaintext_wallet_disabled_use_db_wallet".to_string());
+    }
+    let db = walletdb::WalletDb::open(path)?;
+    db.update_pending_txs(pending_txs)
 }
 
 fn start_wallet_rpc(rpc_addr: String, daemon_rpc_port: u16, net: String) -> Result<(), String> {
@@ -1310,6 +1339,7 @@ mod tests {
                 txid: "tx".to_string(),
                 vout: 0,
             }],
+            pending_txs: Vec::new(),
             last_sync_height: 1,
             seed_hex: Some("deadbeef".to_string()),
             next_index: 1,

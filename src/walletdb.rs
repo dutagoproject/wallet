@@ -155,6 +155,11 @@ impl WalletDb {
         )
         .map_err(|e| format!("db_meta_write_failed: {e}"))?;
         tx.execute(
+            "INSERT OR REPLACE INTO meta(k,v) VALUES('pending_txs_json', ?1)",
+            params![b"[]".to_vec()],
+        )
+        .map_err(|e| format!("db_meta_write_failed: {e}"))?;
+        tx.execute(
             "INSERT OR REPLACE INTO meta(k,v) VALUES('last_sync_height', ?1)",
             params![0i64],
         )
@@ -558,11 +563,36 @@ impl WalletDb {
         serde_json::from_slice(&raw).map_err(|e| format!("db_utxos_invalid: {e}"))
     }
 
+    pub(crate) fn read_pending_txs(&self) -> Result<Vec<crate::PendingTx>, String> {
+        let raw: Vec<u8> = match self.conn.query_row(
+            "SELECT v FROM meta WHERE k='pending_txs_json'",
+            [],
+            |r| r.get(0),
+        ) {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(Vec::new()),
+            Err(e) => return Err(format!("db_meta_read_failed: {e}")),
+        };
+        serde_json::from_slice(&raw).map_err(|e| format!("db_pending_txs_invalid: {e}"))
+    }
+
     pub(crate) fn update_utxos(&self, utxos: &[crate::Utxo]) -> Result<(), String> {
         let body = serde_json::to_vec(utxos).map_err(|e| format!("db_utxos_encode_failed: {e}"))?;
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO meta(k,v) VALUES('utxos_json', ?1)",
+                params![body],
+            )
+            .map_err(|e| format!("db_meta_write_failed: {e}"))?;
+        Ok(())
+    }
+
+    pub(crate) fn update_pending_txs(&self, pending_txs: &[crate::PendingTx]) -> Result<(), String> {
+        let body = serde_json::to_vec(pending_txs)
+            .map_err(|e| format!("db_pending_txs_encode_failed: {e}"))?;
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO meta(k,v) VALUES('pending_txs_json', ?1)",
                 params![body],
             )
             .map_err(|e| format!("db_meta_write_failed: {e}"))?;
@@ -647,5 +677,29 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].txid, "ab".repeat(32));
         assert_eq!(got[0].value, 11);
+    }
+
+    #[test]
+    fn pending_txs_round_trip_through_db_meta() {
+        let path = temp_wallet_path("pending-txs");
+        let db = WalletDb::create_new(&path, "strong-pass-123", &[6u8; 32], 1).unwrap();
+        let pending = vec![crate::PendingTx {
+            txid: "ef".repeat(32),
+            category: "send".to_string(),
+            amount: -9,
+            fee: 1,
+            change: 2,
+            timestamp: 123,
+            details: vec![serde_json::json!({"category":"send","address":"dut1dest","amount":-8})],
+        }];
+
+        db.update_pending_txs(&pending).unwrap();
+
+        let reopened = WalletDb::open(&path).unwrap();
+        let got = reopened.read_pending_txs().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].txid, "ef".repeat(32));
+        assert_eq!(got[0].category, "send");
+        assert_eq!(got[0].amount, -9);
     }
 }

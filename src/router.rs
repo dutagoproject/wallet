@@ -15,7 +15,7 @@ fn status_for_body_err(detail: &str) -> tiny_http::StatusCode {
 mod tests {
     use super::{
         blocks_from_pruned_error, db_wallet_path, decode_seed_hex_for_migration, net_from_name,
-        merge_pending_wallet_txs, net_from_wallet_path, query_param,
+        merge_pending_wallet_txs, net_from_wallet_path, prune_confirmed_pending_txs, query_param,
         require_non_empty_passphrase, resolve_owned_input, send_success_body,
         should_probe_daemon_utxo_presence, status_for_body_err, tx_output_address,
         wallet_public_name, wallet_refresh_error_code, wallet_state_network, OwnedInput,
@@ -334,6 +334,45 @@ mod tests {
         );
         assert_eq!(merged.len(), 1);
     }
+
+    #[test]
+    fn prune_confirmed_pending_txs_removes_confirmed_entries() {
+        let mut pending = vec![
+            super::super::PendingTx {
+                txid: "confirmed".to_string(),
+                category: "send".to_string(),
+                amount: -7,
+                fee: 1,
+                change: 2,
+                timestamp: 1,
+                details: Vec::new(),
+            },
+            super::super::PendingTx {
+                txid: "pending".to_string(),
+                category: "send".to_string(),
+                amount: -3,
+                fee: 1,
+                change: 0,
+                timestamp: 2,
+                details: Vec::new(),
+            },
+        ];
+        let changed = prune_confirmed_pending_txs(
+            &mut pending,
+            &[(
+                "confirmed".to_string(),
+                10,
+                100,
+                "send".to_string(),
+                -7,
+                false,
+                Vec::new(),
+            )],
+        );
+        assert!(changed);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].txid, "pending");
+    }
 }
 
 fn net_from_name(net: &str) -> duta_core::netparams::Network {
@@ -595,6 +634,16 @@ fn merge_pending_wallet_txs(
     confirmed
 }
 
+fn prune_confirmed_pending_txs(
+    pending: &mut Vec<super::PendingTx>,
+    confirmed: &[(String, i64, i64, String, i64, bool, Vec<serde_json::Value>)],
+) -> bool {
+    let confirmed_ids: HashSet<&str> = confirmed.iter().map(|(txid, _, _, _, _, _, _)| txid.as_str()).collect();
+    let before = pending.len();
+    pending.retain(|p| p.txid.is_empty() || !confirmed_ids.contains(p.txid.as_str()));
+    before != pending.len()
+}
+
 fn record_pending_send(
     pending_txs: &mut Vec<super::PendingTx>,
     txid: &str,
@@ -606,6 +655,7 @@ fn record_pending_send(
     if txid.is_empty() {
         return;
     }
+    const MAX_PENDING_TXS: usize = 256;
     pending_txs.retain(|p| p.txid != txid);
     let mut details = vec![json!({"category":"send","address":to_addr,"amount":-amount})];
     if change > 0 {
@@ -623,6 +673,10 @@ fn record_pending_send(
             .as_secs() as i64,
         details,
     });
+    if pending_txs.len() > MAX_PENDING_TXS {
+        let drop_n = pending_txs.len().saturating_sub(MAX_PENDING_TXS);
+        pending_txs.drain(0..drop_n);
+    }
 }
 
 fn rebuild_wallet_utxos_via_blocks_from(
@@ -1911,6 +1965,19 @@ pub(crate) fn handle_request(
                                 return;
                             }
                         };
+                    let mut pending_txs = pending_txs;
+                    if prune_confirmed_pending_txs(&mut pending_txs, &txs) {
+                        let mut g = super::wallet_lock_or_recover();
+                        if let Some(ws) = g.as_mut() {
+                            ws.pending_txs = pending_txs.clone();
+                        }
+                        if let Err(e) = super::save_wallet_pending_txs(&{
+                            let g = super::wallet_lock_or_recover();
+                            g.as_ref().map(|ws| ws.wallet_path.clone()).unwrap_or_default()
+                        }, &pending_txs) {
+                            wwlog!("wallet_rpc: pending_txs_prune_persist_failed err={}", e);
+                        }
+                    }
                     let txs = merge_pending_wallet_txs(txs, &pending_txs);
 
                     let mut out: Vec<serde_json::Value> = Vec::new();
@@ -2003,6 +2070,19 @@ pub(crate) fn handle_request(
                                 return;
                             }
                         };
+                    let mut pending_txs = pending_txs;
+                    if prune_confirmed_pending_txs(&mut pending_txs, &txs) {
+                        let mut g = super::wallet_lock_or_recover();
+                        if let Some(ws) = g.as_mut() {
+                            ws.pending_txs = pending_txs.clone();
+                        }
+                        if let Err(e) = super::save_wallet_pending_txs(&{
+                            let g = super::wallet_lock_or_recover();
+                            g.as_ref().map(|ws| ws.wallet_path.clone()).unwrap_or_default()
+                        }, &pending_txs) {
+                            wwlog!("wallet_rpc: pending_txs_prune_persist_failed err={}", e);
+                        }
+                    }
                     let txs = merge_pending_wallet_txs(txs, &pending_txs);
 
                     let mut found: Option<(i64, i64, String, i64, bool, Vec<serde_json::Value>)> =

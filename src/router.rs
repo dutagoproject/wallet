@@ -1012,6 +1012,49 @@ fn derive_next_address_for_wallet(
 }
 
 /// Snapshot + (optional) auto-sync wallet UTXOs if empty by scanning daemon /blocks_from.
+fn daemon_tip_height_with_retry(daemon_rpc_port: u16, fallback_height: i64) -> Result<i64, String> {
+    for attempt in 0..3 {
+        let tip_body = super::http_get_local("127.0.0.1", daemon_rpc_port, "/tip")?;
+        let tip_v: serde_json::Value =
+            serde_json::from_str(&tip_body).map_err(|e| format!("tip_invalid_json: {}", e))?;
+
+        if let Some(height) = tip_v.get("height").and_then(|x| x.as_i64()) {
+            return Ok(height);
+        }
+
+        let is_rate_limited =
+            tip_v.get("error").and_then(|x| x.as_str()) == Some("rate_limited");
+        if is_rate_limited {
+            let retry_secs = tip_v
+                .get("retry_after_secs")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(1)
+                .min(2);
+            wwlog!(
+                "wallet_rpc: daemon_tip_rate_limited port={} retry_after_secs={} attempt={}",
+                daemon_rpc_port,
+                retry_secs,
+                attempt + 1
+            );
+            std::thread::sleep(std::time::Duration::from_secs(retry_secs));
+            continue;
+        }
+
+        return Err(format!("tip_missing_height: {}", tip_body));
+    }
+
+    if fallback_height > 0 {
+        wwlog!(
+            "wallet_rpc: daemon_tip_fallback_using_cached_height port={} cached_height={}",
+            daemon_rpc_port,
+            fallback_height
+        );
+        return Ok(fallback_height);
+    }
+
+    Err("tip_height_unavailable".to_string())
+}
+
 fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<(i64, i64, i64, i64, usize), String> {
     // Snapshot wallet state (avoid holding lock during daemon RPC).
     let (wallet_path, addrs, mut utxos, last_sync_height) = {
@@ -1029,10 +1072,7 @@ fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<(i64, i64, i64, i64, 
         )
     };
 
-    let tip_body = super::http_get_local("127.0.0.1", daemon_rpc_port, "/tip")?;
-    let tip_v: serde_json::Value =
-        serde_json::from_str(&tip_body).map_err(|e| format!("tip_invalid_json: {}", e))?;
-    let cur_h = tip_v.get("height").and_then(|x| x.as_i64()).unwrap_or(0);
+    let cur_h = daemon_tip_height_with_retry(daemon_rpc_port, last_sync_height)?;
 
     // Auto-sync for correctness: rebuild when wallet is empty, when a tracked UTXO is
     // impossible at current tip, or when daemon no longer has one of the tracked outpoints.
@@ -1108,10 +1148,7 @@ fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<(i64, i64, i64, i64, 
 }
 
 fn daemon_tip_height(daemon_rpc_port: u16) -> Result<i64, String> {
-    let tip_body = super::http_get_local("127.0.0.1", daemon_rpc_port, "/tip")?;
-    let tip_v: serde_json::Value =
-        serde_json::from_str(&tip_body).map_err(|e| format!("tip_invalid_json: {}", e))?;
-    Ok(tip_v.get("height").and_then(|x| x.as_i64()).unwrap_or(0))
+    daemon_tip_height_with_retry(daemon_rpc_port, 0)
 }
 
 pub(crate) fn handle_request(
@@ -1986,9 +2023,8 @@ pub(crate) fn handle_request(
                         return;
                     }
                     // Need daemon height for maturity calculation.
-                    let tip_body = match super::http_get_local("127.0.0.1", daemon_rpc_port, "/tip")
-                    {
-                        Ok(b) => b,
+                    let cur_h = match daemon_tip_height_with_retry(daemon_rpc_port, 0) {
+                        Ok(h) => h,
                         Err(e) => {
                             super::respond_json(
                                 request,
@@ -1998,19 +2034,6 @@ pub(crate) fn handle_request(
                             return;
                         }
                     };
-                    let tip_v: serde_json::Value = match serde_json::from_str(&tip_body) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let d = format!("tip_invalid_json: {}", e);
-                            super::respond_json(
-                                request,
-                                tiny_http::StatusCode(502),
-                                json!({"error":"daemon_bad_response","detail":d}).to_string(),
-                            );
-                            return;
-                        }
-                    };
-                    let cur_h = tip_v.get("height").and_then(|x| x.as_i64()).unwrap_or(0);
 
                     // Select spendable inputs.
                     const COINBASE_MATURITY: i64 = 60;
@@ -2995,7 +3018,6 @@ pub(crate) fn handle_request(
                         return;
                     }
                 };
-
             super::respond_json(
                 request,
                 tiny_http::StatusCode(200),
@@ -3909,8 +3931,8 @@ pub(crate) fn handle_request(
                 return;
             }
             // Need daemon height for maturity calculation.
-            let tip_body = match super::http_get_local("127.0.0.1", daemon_rpc_port, "/tip") {
-                Ok(b) => b,
+            let cur_h = match daemon_tip_height_with_retry(daemon_rpc_port, 0) {
+                Ok(h) => h,
                 Err(e) => {
                     respond_http_error_detail(
                         request,
@@ -3921,19 +3943,6 @@ pub(crate) fn handle_request(
                     return;
                 }
             };
-            let tip_v: serde_json::Value = match serde_json::from_str(&tip_body) {
-                Ok(v) => v,
-                Err(e) => {
-                    let d = format!("tip_invalid_json: {}", e);
-                    super::respond_json(
-                        request,
-                        tiny_http::StatusCode(502),
-                        json!({"error":"daemon_bad_response","detail":d}).to_string(),
-                    );
-                    return;
-                }
-            };
-            let cur_h = tip_v.get("height").and_then(|x| x.as_i64()).unwrap_or(0);
 
             if !addrs.is_empty() && cur_h > 0 {
                 match rebuild_wallet_utxos_via_blocks_from(&addrs, daemon_rpc_port) {

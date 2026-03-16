@@ -376,19 +376,21 @@ impl WalletDb {
 
         let meta = self.read_meta()?;
         let mut old_key32 = kdf_key_from_pass(old_passphrase, &meta.salt)?;
-        let seed = decrypt_bytes(&old_key32, &meta.seed_nonce, &meta.seed_ct)
+        let mut seed = decrypt_bytes(&old_key32, &meta.seed_nonce, &meta.seed_ct)
             .map_err(|_| "old_passphrase_invalid".to_string())?;
 
         let rows = self.list_keys()?;
         let mut plain_keys: Vec<(String, String, [u8; 32])> = Vec::with_capacity(rows.len());
         for r in rows {
-            let sk_plain = decrypt_bytes(&old_key32, &r.sk_nonce, &r.sk_ct)
+            let mut sk_plain = decrypt_bytes(&old_key32, &r.sk_nonce, &r.sk_ct)
                 .map_err(|_| "old_passphrase_invalid".to_string())?;
             if sk_plain.len() != 32 {
+                seed.zeroize();
                 return Err("sk_len_invalid".to_string());
             }
             let mut ent = [0u8; 32];
             ent.copy_from_slice(&sk_plain);
+            sk_plain.zeroize();
             plain_keys.push((r.addr, r.pubkey_hex, ent));
         }
 
@@ -439,11 +441,19 @@ impl WalletDb {
 
         if let Err(e) = result {
             let _ = self.conn.execute("ROLLBACK", []);
+            seed.zeroize();
+            for (_, _, sk_bytes32) in plain_keys.iter_mut() {
+                sk_bytes32.zeroize();
+            }
             old_key32.zeroize();
             new_key32.zeroize();
             return Err(e);
         }
 
+        seed.zeroize();
+        for (_, _, sk_bytes32) in plain_keys.iter_mut() {
+            sk_bytes32.zeroize();
+        }
         old_key32.zeroize();
         new_key32.zeroize();
         Ok(())

@@ -360,6 +360,46 @@ fn blocks_from_pruned_error(from: i64, prune_below: Option<i64>) -> String {
     }
 }
 
+fn daemon_blocks_from_with_retry(
+    daemon_rpc_port: u16,
+    from: i64,
+    limit: i64,
+) -> Result<serde_json::Value, String> {
+    for attempt in 0..3 {
+        let path = format!("/blocks_from?from={}&limit={}", from, limit);
+        let body = super::http_get_local("127.0.0.1", daemon_rpc_port, &path)?;
+        let v: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| format!("blocks_from_invalid_json: {}", e))?;
+
+        let is_rate_limited =
+            v.get("error").and_then(|x| x.as_str()) == Some("rate_limited");
+        if is_rate_limited {
+            let retry_secs = v
+                .get("retry_after_secs")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(1)
+                .min(2);
+            wwlog!(
+                "wallet_rpc: blocks_from_rate_limited port={} from={} limit={} retry_after_secs={} attempt={}",
+                daemon_rpc_port,
+                from,
+                limit,
+                retry_secs,
+                attempt + 1
+            );
+            std::thread::sleep(std::time::Duration::from_secs(retry_secs));
+            continue;
+        }
+
+        return Ok(v);
+    }
+
+    Err(format!(
+        "blocks_from_unavailable_after_retries: from={} limit={}",
+        from, limit
+    ))
+}
+
 fn wallet_refresh_error_code(detail: &str) -> &'static str {
     if detail.starts_with("connect_failed:")
         || detail.starts_with("write_failed:")
@@ -377,10 +417,7 @@ fn rebuild_wallet_utxos_via_blocks_from(
     daemon_rpc_port: u16,
 ) -> Result<(i64, Vec<super::Utxo>), String> {
     // Current chain tip.
-    let tip_body = super::http_get_local("127.0.0.1", daemon_rpc_port, "/tip")?;
-    let tip_v: serde_json::Value =
-        serde_json::from_str(&tip_body).map_err(|e| format!("tip_invalid_json: {}", e))?;
-    let cur_h = tip_v.get("height").and_then(|x| x.as_i64()).unwrap_or(0);
+    let cur_h = daemon_tip_height_with_retry(daemon_rpc_port, 0)?;
 
     let addr_set: HashSet<&str> = addrs.iter().map(|s| s.as_str()).collect();
     if addr_set.is_empty() {
@@ -393,25 +430,18 @@ fn rebuild_wallet_utxos_via_blocks_from(
     let limit: i64 = 256;
 
     loop {
-        let path = format!("/blocks_from?from={}&limit={}", from, limit);
-        let body = super::http_get_local("127.0.0.1", daemon_rpc_port, &path)?;
-
+        let v = daemon_blocks_from_with_retry(daemon_rpc_port, from, limit)?;
         // Daemon may return {"error":"chain_unavailable"} when polling beyond tip.
         // Treat that as empty result (no more blocks).
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-            if v.get("error").and_then(|x| x.as_str()) == Some("chain_unavailable") {
-                break;
-            }
-            if v.get("error").and_then(|x| x.as_str()) == Some("pruned") {
-                return Err(blocks_from_pruned_error(
-                    from,
-                    v.get("prune_below").and_then(|x| x.as_i64()),
-                ));
-            }
+        if v.get("error").and_then(|x| x.as_str()) == Some("chain_unavailable") {
+            break;
         }
-
-        let v: serde_json::Value =
-            serde_json::from_str(&body).map_err(|e| format!("blocks_from_invalid_json: {}", e))?;
+        if v.get("error").and_then(|x| x.as_str()) == Some("pruned") {
+            return Err(blocks_from_pruned_error(
+                from,
+                v.get("prune_below").and_then(|x| x.as_i64()),
+            ));
+        }
 
         let blocks = v
             .as_array()
@@ -507,33 +537,23 @@ fn scan_wallet_txs_via_blocks_from(
     String,
 > {
     let addr_set: HashSet<&str> = addrs.iter().map(|s| s.as_str()).collect();
-    let tip_body = super::http_get_local("127.0.0.1", daemon_rpc_port, "/tip")?;
-    let tip_v: serde_json::Value =
-        serde_json::from_str(&tip_body).map_err(|e| format!("tip_invalid_json: {}", e))?;
-    let cur_h = tip_v.get("height").and_then(|x| x.as_i64()).unwrap_or(0);
+    let cur_h = daemon_tip_height_with_retry(daemon_rpc_port, 0)?;
 
     let mut out: Vec<(String, i64, i64, String, i64, bool, Vec<serde_json::Value>)> = Vec::new();
     let mut from: i64 = 0;
     let limit: i64 = 256;
 
     loop {
-        let path = format!("/blocks_from?from={}&limit={}", from, limit);
-        let body = super::http_get_local("127.0.0.1", daemon_rpc_port, &path)?;
-
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-            if v.get("error").and_then(|x| x.as_str()) == Some("chain_unavailable") {
-                break;
-            }
-            if v.get("error").and_then(|x| x.as_str()) == Some("pruned") {
-                return Err(blocks_from_pruned_error(
-                    from,
-                    v.get("prune_below").and_then(|x| x.as_i64()),
-                ));
-            }
+        let v = daemon_blocks_from_with_retry(daemon_rpc_port, from, limit)?;
+        if v.get("error").and_then(|x| x.as_str()) == Some("chain_unavailable") {
+            break;
         }
-
-        let v: serde_json::Value =
-            serde_json::from_str(&body).map_err(|e| format!("blocks_from_invalid_json: {}", e))?;
+        if v.get("error").and_then(|x| x.as_str()) == Some("pruned") {
+            return Err(blocks_from_pruned_error(
+                from,
+                v.get("prune_below").and_then(|x| x.as_i64()),
+            ));
+        }
 
         let blocks = v
             .as_array()

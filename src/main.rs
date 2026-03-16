@@ -231,6 +231,16 @@ pub(crate) struct PendingTx {
     pub(crate) timestamp: i64,
     #[serde(default)]
     pub(crate) details: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub(crate) spent_inputs: Vec<PendingInput>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct PendingInput {
+    #[serde(default)]
+    pub(crate) txid: String,
+    #[serde(default)]
+    pub(crate) vout: u32,
 }
 
 static WALLET: OnceLock<Mutex<Option<WalletState>>> = OnceLock::new();

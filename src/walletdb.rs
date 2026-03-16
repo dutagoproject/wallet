@@ -691,6 +691,10 @@ mod tests {
             change: 2,
             timestamp: 123,
             details: vec![serde_json::json!({"category":"send","address":"dut1dest","amount":-8})],
+            spent_inputs: vec![crate::PendingInput {
+                txid: "ab".repeat(32),
+                vout: 1,
+            }],
         }];
 
         db.update_pending_txs(&pending).unwrap();
@@ -701,5 +705,7 @@ mod tests {
         assert_eq!(got[0].txid, "ef".repeat(32));
         assert_eq!(got[0].category, "send");
         assert_eq!(got[0].amount, -9);
+        assert_eq!(got[0].spent_inputs.len(), 1);
+        assert_eq!(got[0].spent_inputs[0].txid, "ab".repeat(32));
     }
 }

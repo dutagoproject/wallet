@@ -136,7 +136,7 @@ pub(crate) const MAX_RPC_URL_BYTES: usize = 8 * 1024;
 #[command(
     name = "dutawalletd",
     about = "DUTA wallet rpc daemon (native)",
-    after_help = "Examples:\n  dutawalletd --daemon\n  dutawalletd status\n  dutawalletd stop\n  dutawalletd getwalletinfo"
+    after_help = "Examples:\n  dutawalletd --daemon\n  dutawalletd status\n  dutawalletd stop\n  dutawalletd get-wallet-info\n  duta-wallet-cli --rpc 127.0.0.1:19084 getwalletinfo"
 )]
 struct Args {
     #[arg(long)]
@@ -144,7 +144,7 @@ struct Args {
     #[arg(long)]
     stagenet: bool,
 
-    /// Data directory (default: ~/.duta/<network>). Overrides config datadir=
+    /// Data directory (default mainnet: ~/.duta, testnet: ~/.duta/testnet, stagenet: ~/.duta/stagenet). Overrides config datadir=
     #[arg(long)]
     datadir: Option<String>,
 

@@ -922,6 +922,9 @@ fn record_pending_send(
     const MAX_PENDING_TXS: usize = 256;
     pending_txs.retain(|p| p.txid != txid);
     let mut details = vec![json!({"category":"send","address":to_addr,"amount":-amount})];
+    if fee > 0 {
+        details.push(json!({"category":"fee","amount":-fee}));
+    }
     if change > 0 {
         details.push(json!({"category":"receive","address":"change","amount":change}));
     }
@@ -1160,6 +1163,9 @@ fn scan_wallet_txs_via_blocks_from(
                 let fee = txv.get("fee").and_then(|x| x.as_i64()).unwrap_or(0);
                 let (category, amount, fee_amount, details) = if wallet_input {
                     if external_total > 0 {
+                        if fee > 0 {
+                            send_details.push(json!({"category":"fee","amount":-fee}));
+                        }
                         ("send".to_string(), external_total, fee, send_details)
                     } else {
                         ("move".to_string(), 0, 0, Vec::new())

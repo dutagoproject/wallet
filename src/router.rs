@@ -230,17 +230,30 @@ mod tests {
     }
 
     #[test]
-    fn send_success_body_stays_ok_when_persist_fails() {
-        let body = send_success_body("tx123", 50, 1, 9, 2, 123, Err("disk_full".to_string()));
+    fn send_success_body_marks_persist_success() {
+        let body = send_success_body("tx123", 50, 1, 9, 2, 123, Ok(()));
         assert_eq!(body.get("ok").and_then(|x| x.as_bool()), Some(true));
         assert_eq!(
             body.get("wallet_state_persisted").and_then(|x| x.as_bool()),
-            Some(false)
+            Some(true)
         );
-        assert_eq!(
-            body.get("wallet_state_persist_error").and_then(|x| x.as_str()),
-            Some("disk_full")
-        );
+    }
+
+    #[test]
+    fn pending_mempool_visibility_only_required_when_pending_exists() {
+        let pending: Vec<super::super::PendingTx> = Vec::new();
+        assert!(!super::pending_mempool_visibility_required(&pending));
+        let pending = vec![super::super::PendingTx {
+            txid: "aa".repeat(32),
+            category: "send".to_string(),
+            amount: -2,
+            fee: 1,
+            change: 0,
+            timestamp: 1,
+            details: Vec::new(),
+            spent_inputs: Vec::new(),
+        }];
+        assert!(super::pending_mempool_visibility_required(&pending));
     }
 
     #[test]
@@ -291,6 +304,7 @@ mod tests {
                 100,
                 "receive".to_string(),
                 5,
+                0,
                 false,
                 Vec::new(),
             )],
@@ -306,9 +320,38 @@ mod tests {
             }],
         );
         assert_eq!(merged.len(), 2);
-        assert!(merged.iter().any(|(txid, h, _, category, amount, _, _)| {
-            txid == "pending" && *h == 0 && category == "send" && *amount == -7
+        assert!(merged.iter().any(|(txid, h, _, category, amount, fee, _, _)| {
+            txid == "pending" && *h == 0 && category == "send" && *amount == 6 && *fee == 1
         }));
+        assert_eq!(merged[0].0, "pending");
+    }
+
+    #[test]
+    fn pending_wallet_txs_are_sorted_before_confirmed_history() {
+        let merged = merge_pending_wallet_txs(
+            vec![(
+                "confirmed".to_string(),
+                120,
+                100,
+                "receive".to_string(),
+                46,
+                0,
+                false,
+                Vec::new(),
+            )],
+            &[super::super::PendingTx {
+                txid: "pending".to_string(),
+                category: "send".to_string(),
+                amount: -2,
+                fee: 1,
+                change: 44,
+                timestamp: 200,
+                details: vec![json!({"category":"send","address":"dut1dest","amount":-1})],
+                spent_inputs: Vec::new(),
+            }],
+        );
+        assert_eq!(merged[0].0, "pending");
+        assert_eq!(merged[1].0, "confirmed");
     }
 
     #[test]
@@ -319,7 +362,8 @@ mod tests {
                 12,
                 100,
                 "send".to_string(),
-                -7,
+                6,
+                1,
                 false,
                 Vec::new(),
             )],
@@ -368,7 +412,8 @@ mod tests {
                 10,
                 100,
                 "send".to_string(),
-                -7,
+                6,
+                1,
                 false,
                 Vec::new(),
             )],
@@ -662,13 +707,21 @@ fn tx_output_address(ov: &serde_json::Value) -> &str {
         .unwrap_or("")
 }
 
+fn normalized_history_amount(category: &str, amount: i64, fee: i64) -> i64 {
+    if category == "send" {
+        amount.abs().saturating_sub(fee.abs())
+    } else {
+        amount
+    }
+}
+
 fn merge_pending_wallet_txs(
-    mut confirmed: Vec<(String, i64, i64, String, i64, bool, Vec<serde_json::Value>)>,
+    mut confirmed: Vec<(String, i64, i64, String, i64, i64, bool, Vec<serde_json::Value>)>,
     pending: &[super::PendingTx],
-) -> Vec<(String, i64, i64, String, i64, bool, Vec<serde_json::Value>)> {
+) -> Vec<(String, i64, i64, String, i64, i64, bool, Vec<serde_json::Value>)> {
     let confirmed_ids: HashSet<String> = confirmed
         .iter()
-        .map(|(txid, _, _, _, _, _, _)| txid.clone())
+        .map(|(txid, _, _, _, _, _, _, _)| txid.clone())
         .collect();
     for p in pending.iter() {
         if p.txid.is_empty() || confirmed_ids.contains(&p.txid) {
@@ -679,13 +732,18 @@ fn merge_pending_wallet_txs(
             0,
             p.timestamp,
             p.category.clone(),
-            p.amount,
+            normalized_history_amount(&p.category, p.amount, p.fee),
+            p.fee,
             false,
             p.details.clone(),
         ));
     }
     confirmed.sort_by(|a, b| {
-        b.1.cmp(&a.1)
+        let a_pending = a.1 <= 0;
+        let b_pending = b.1 <= 0;
+        b_pending
+            .cmp(&a_pending)
+            .then_with(|| b.1.cmp(&a.1))
             .then_with(|| b.2.cmp(&a.2))
             .then_with(|| a.0.cmp(&b.0))
     });
@@ -694,9 +752,12 @@ fn merge_pending_wallet_txs(
 
 fn prune_confirmed_pending_txs(
     pending: &mut Vec<super::PendingTx>,
-    confirmed: &[(String, i64, i64, String, i64, bool, Vec<serde_json::Value>)],
+    confirmed: &[(String, i64, i64, String, i64, i64, bool, Vec<serde_json::Value>)],
 ) -> bool {
-    let confirmed_ids: HashSet<&str> = confirmed.iter().map(|(txid, _, _, _, _, _, _)| txid.as_str()).collect();
+    let confirmed_ids: HashSet<&str> = confirmed
+        .iter()
+        .map(|(txid, _, _, _, _, _, _, _)| txid.as_str())
+        .collect();
     let before = pending.len();
     pending.retain(|p| p.txid.is_empty() || !confirmed_ids.contains(p.txid.as_str()));
     before != pending.len()
@@ -794,7 +855,7 @@ fn refresh_wallet_utxos_after_submit_conflict(
 fn sync_pending_txs_with_chain_and_mempool(
     wallet_path: &str,
     pending_txs: &mut Vec<super::PendingTx>,
-    confirmed: &[(String, i64, i64, String, i64, bool, Vec<serde_json::Value>)],
+    confirmed: &[(String, i64, i64, String, i64, i64, bool, Vec<serde_json::Value>)],
     daemon_rpc_port: u16,
 ) {
     let mut changed = prune_confirmed_pending_txs(pending_txs, confirmed);
@@ -818,6 +879,32 @@ fn sync_pending_txs_with_chain_and_mempool(
             wwlog!("wallet_rpc: pending_txs_prune_persist_failed wallet={} err={}", wallet_public_name(wallet_path), e);
         }
     }
+}
+
+fn pending_mempool_state_or_err(
+    wallet_path: &str,
+    pending_txs: &[super::PendingTx],
+    daemon_rpc_port: u16,
+) -> Result<Option<(HashSet<String>, HashSet<(String, u32)>)>, String> {
+    match daemon_mempool_state(daemon_rpc_port) {
+        Ok(state) => Ok(Some(state)),
+        Err(e) => {
+            wwlog!(
+                "wallet_rpc: mempool_reservation_probe_failed wallet={} err={}",
+                wallet_public_name(wallet_path),
+                e
+            );
+            if !pending_mempool_visibility_required(pending_txs) {
+                Ok(None)
+            } else {
+                Err(format!("daemon_mempool_unreachable:{e}"))
+            }
+        }
+    }
+}
+
+fn pending_mempool_visibility_required(pending_txs: &[super::PendingTx]) -> bool {
+    !pending_txs.is_empty()
 }
 
 fn record_pending_send(
@@ -977,14 +1064,15 @@ fn scan_wallet_txs_via_blocks_from(
 ) -> Result<
     (
         i64,
-        Vec<(String, i64, i64, String, i64, bool, Vec<serde_json::Value>)>,
+        Vec<(String, i64, i64, String, i64, i64, bool, Vec<serde_json::Value>)>,
     ),
     String,
 > {
     let addr_set: HashSet<&str> = addrs.iter().map(|s| s.as_str()).collect();
     let cur_h = daemon_tip_height_with_retry(daemon_rpc_port, 0)?;
 
-    let mut out: Vec<(String, i64, i64, String, i64, bool, Vec<serde_json::Value>)> = Vec::new();
+    let mut out: Vec<(String, i64, i64, String, i64, i64, bool, Vec<serde_json::Value>)> =
+        Vec::new();
     let mut from: i64 = 0;
     let limit: i64 = 256;
 
@@ -1070,15 +1158,14 @@ fn scan_wallet_txs_via_blocks_from(
                 }
 
                 let fee = txv.get("fee").and_then(|x| x.as_i64()).unwrap_or(0);
-                let (category, amount, details) = if wallet_input {
+                let (category, amount, fee_amount, details) = if wallet_input {
                     if external_total > 0 {
-                        let amt = -(external_total.saturating_add(fee));
-                        ("send".to_string(), amt, send_details)
+                        ("send".to_string(), external_total, fee, send_details)
                     } else {
-                        ("move".to_string(), 0, Vec::new())
+                        ("move".to_string(), 0, 0, Vec::new())
                     }
                 } else {
-                    ("receive".to_string(), recv_total, recv_details)
+                    ("receive".to_string(), recv_total, 0, recv_details)
                 };
 
                 out.push((
@@ -1087,6 +1174,7 @@ fn scan_wallet_txs_via_blocks_from(
                     block_time,
                     category,
                     amount,
+                    fee_amount,
                     is_coinbase,
                     details,
                 ));
@@ -1545,8 +1633,8 @@ fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<(i64, i64, i64, i64, 
         .as_secs() as i64;
     let mut active_pending = pending_txs.clone();
     let mut reserved_outpoints = pending_reserved_outpoints(&active_pending);
-    match daemon_mempool_state(daemon_rpc_port) {
-        Ok((mempool_txids, mempool_reserved)) => {
+    match pending_mempool_state_or_err(&wallet_path, &active_pending, daemon_rpc_port)? {
+        Some((mempool_txids, mempool_reserved)) => {
             if prune_inactive_pending_txs(&mut active_pending, &mempool_txids, now_secs) {
                 {
                     let mut g = super::wallet_lock_or_recover();
@@ -1565,13 +1653,7 @@ fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<(i64, i64, i64, i64, 
             reserved_outpoints = pending_reserved_outpoints(&active_pending);
             reserved_outpoints.extend(mempool_reserved);
         }
-        Err(e) => {
-            wwlog!(
-                "wallet_rpc: mempool_reservation_probe_failed wallet={} err={}",
-                wallet_public_name(&wallet_path),
-                e
-            );
-        }
+        None => {}
     }
 
     // Auto-sync for correctness: rebuild when wallet is empty, when a tracked UTXO is
@@ -1945,29 +2027,48 @@ pub(crate) fn handle_request(
                             }
                         };
 
-                    let g = super::wallet_lock_or_recover();
-                    let ws = match g.as_ref() {
-                        Some(w) => w,
-                        None => {
-                            super::respond_json(
-                                request,
-                                tiny_http::StatusCode(400),
-                                rpc_response_err(id, -18, "wallet_not_open"),
-                            );
-                            return;
-                        }
+                    let (wallet_path, unlocked, keypoolsize, addrs, pending_txs) = {
+                        let g = super::wallet_lock_or_recover();
+                        let ws = match g.as_ref() {
+                            Some(w) => w,
+                            None => {
+                                super::respond_json(
+                                    request,
+                                    tiny_http::StatusCode(400),
+                                    rpc_response_err(id, -18, "wallet_not_open"),
+                                );
+                                return;
+                            }
+                        };
+                        (
+                            ws.wallet_path.clone(),
+                            !(ws.is_db && ws.locked),
+                            ws.pubkeys.len(),
+                            if !ws.pubkeys.is_empty() {
+                                ws.pubkeys.keys().cloned().collect::<Vec<String>>()
+                            } else {
+                                ws.keys.keys().cloned().collect::<Vec<String>>()
+                            },
+                            ws.pending_txs.clone(),
+                        )
                     };
 
-                    let unlocked = !(ws.is_db && ws.locked);
+                    let txcount = match scan_wallet_txs_via_blocks_from(&addrs, daemon_rpc_port) {
+                        Ok((_cur_h, txs)) => {
+                            let merged = merge_pending_wallet_txs(txs, &pending_txs);
+                            merged.len()
+                        }
+                        Err(_) => pending_txs.len(),
+                    };
 
                     let result = json!({
-                        "walletname": wallet_public_name(&ws.wallet_path),
+                        "walletname": wallet_public_name(&wallet_path),
                         "walletversion": 1,
                         "balance": balance,
                         "spendable_balance": spendable,
                         "immature_balance": immature,
-                        "txcount": 0,
-                        "keypoolsize": ws.keys.len(),
+                        "txcount": txcount,
+                        "keypoolsize": keypoolsize,
                         "unlocked": unlocked,
                         "height": height,
                         "utxos": utxos_n,
@@ -2105,8 +2206,8 @@ pub(crate) fn handle_request(
                         .as_secs() as i64;
                     let mut active_pending = pending_txs;
                     let mut reserved_outpoints = pending_reserved_outpoints(&active_pending);
-                    match daemon_mempool_state(daemon_rpc_port) {
-                        Ok((mempool_txids, mempool_reserved)) => {
+                    match pending_mempool_state_or_err(&wallet_path, &active_pending, daemon_rpc_port) {
+                        Ok(Some((mempool_txids, mempool_reserved))) => {
                             if prune_inactive_pending_txs(&mut active_pending, &mempool_txids, now_secs) {
                                 {
                                     let mut g = super::wallet_lock_or_recover();
@@ -2125,12 +2226,14 @@ pub(crate) fn handle_request(
                             reserved_outpoints = pending_reserved_outpoints(&active_pending);
                             reserved_outpoints.extend(mempool_reserved);
                         }
+                        Ok(None) => {}
                         Err(e) => {
-                            wwlog!(
-                                "wallet_rpc: mempool_reservation_probe_failed wallet={} err={}",
-                                wallet_public_name(&wallet_path),
-                                e
+                            super::respond_json(
+                                request,
+                                tiny_http::StatusCode(502),
+                                rpc_response_err(id, -32603, &e),
                             );
+                            return;
                         }
                     }
 
@@ -2228,7 +2331,7 @@ pub(crate) fn handle_request(
                     let txs = merge_pending_wallet_txs(txs, &pending_txs);
 
                     let mut out: Vec<serde_json::Value> = Vec::new();
-                    for (i, (txid, h, block_time, category, amt, coinbase, details)) in
+                    for (i, (txid, h, block_time, category, amt, fee, coinbase, details)) in
                         txs.into_iter().enumerate()
                     {
                         if i < skip {
@@ -2246,6 +2349,7 @@ pub(crate) fn handle_request(
                             "category": category,
                             "txid": txid,
                             "amount": amt,
+                            "fee": fee,
                             "confirmations": conf,
                             "blockheight": h,
                             "time": block_time,
@@ -2326,16 +2430,16 @@ pub(crate) fn handle_request(
                     );
                     let txs = merge_pending_wallet_txs(txs, &pending_txs);
 
-                    let mut found: Option<(i64, i64, String, i64, bool, Vec<serde_json::Value>)> =
+                    let mut found: Option<(i64, i64, String, i64, i64, bool, Vec<serde_json::Value>)> =
                         None;
-                    for (t, h, block_time, category, amt, cb, details) in txs.into_iter() {
+                    for (t, h, block_time, category, amt, fee, cb, details) in txs.into_iter() {
                         if t == txid {
-                            found = Some((h, block_time, category, amt, cb, details));
+                            found = Some((h, block_time, category, amt, fee, cb, details));
                             break;
                         }
                     }
 
-                    let (h, block_time, category, amt, coinbase, details) = match found {
+                    let (h, block_time, category, amt, fee, coinbase, details) = match found {
                         Some(x) => x,
                         None => {
                             super::respond_json(
@@ -2357,6 +2461,7 @@ pub(crate) fn handle_request(
                         "txid": txid,
                         "category": category,
                         "amount": amt,
+                        "fee": fee,
                         "confirmations": conf,
                         "blockheight": h,
                         "time": block_time,
@@ -2628,8 +2733,8 @@ pub(crate) fn handle_request(
                         .as_secs() as i64;
                     let mut active_pending = pending_txs.clone();
                     let mut reserved_outpoints = pending_reserved_outpoints(&active_pending);
-                    match daemon_mempool_state(daemon_rpc_port) {
-                        Ok((mempool_txids, mempool_reserved)) => {
+                    match pending_mempool_state_or_err(&wallet_path, &active_pending, daemon_rpc_port) {
+                        Ok(Some((mempool_txids, mempool_reserved))) => {
                             if prune_inactive_pending_txs(&mut active_pending, &mempool_txids, now_secs) {
                                 let mut g = super::wallet_lock_or_recover();
                                 if let Some(ws) = g.as_mut() {
@@ -2646,12 +2751,14 @@ pub(crate) fn handle_request(
                             reserved_outpoints = pending_reserved_outpoints(&active_pending);
                             reserved_outpoints.extend(mempool_reserved);
                         }
+                        Ok(None) => {}
                         Err(e) => {
-                            wwlog!(
-                                "wallet_rpc: mempool_reservation_probe_failed wallet={} err={}",
-                                wallet_public_name(&wallet_path),
-                                e
+                            super::respond_json(
+                                request,
+                                tiny_http::StatusCode(502),
+                                json!({"error":"daemon_mempool_unreachable","detail":e}).to_string(),
                             );
+                            return;
                         }
                     }
                     // Filter out stale UTXOs (wallet view may lag behind daemon UTXO set).
@@ -3845,6 +3952,21 @@ pub(crate) fn handle_request(
                 daemon_rpc_port,
             );
 
+            if let Err(e) = super::save_wallet_full_state(&wallet_path, &utxos, cur_h, &pending_txs) {
+                wwlog!(
+                    "wallet_rpc: manual_sync_persist_failed wallet={} err={}",
+                    wallet_public_name(&wallet_path),
+                    e
+                );
+                respond_http_error_detail(
+                    request,
+                    tiny_http::StatusCode(500),
+                    "wallet_state_persist_failed",
+                    e,
+                );
+                return;
+            }
+
             {
                 let mut g = super::wallet_lock_or_recover();
                 if let Some(ws) = g.as_mut() {
@@ -3852,14 +3974,6 @@ pub(crate) fn handle_request(
                     ws.last_sync_height = cur_h;
                     ws.pending_txs = pending_txs.clone();
                 }
-            }
-
-            if let Err(e) = super::save_wallet_full_state(&wallet_path, &utxos, cur_h, &pending_txs) {
-                wwlog!(
-                    "wallet_rpc: manual_sync_persist_failed wallet={} err={}",
-                    wallet_public_name(&wallet_path),
-                    e
-                );
             }
 
             // Compute balance + spendable.
@@ -4682,8 +4796,8 @@ pub(crate) fn handle_request(
                 .as_secs() as i64;
             let mut active_pending = pending_txs.clone();
             let mut reserved_outpoints = pending_reserved_outpoints(&active_pending);
-            match daemon_mempool_state(daemon_rpc_port) {
-                Ok((mempool_txids, mempool_reserved)) => {
+            match pending_mempool_state_or_err(&wallet_path, &active_pending, daemon_rpc_port) {
+                Ok(Some((mempool_txids, mempool_reserved))) => {
                     if prune_inactive_pending_txs(&mut active_pending, &mempool_txids, now_secs) {
                         let mut g = super::wallet_lock_or_recover();
                         if let Some(ws) = g.as_mut() {
@@ -4700,12 +4814,15 @@ pub(crate) fn handle_request(
                     reserved_outpoints = pending_reserved_outpoints(&active_pending);
                     reserved_outpoints.extend(mempool_reserved);
                 }
+                Ok(None) => {}
                 Err(e) => {
-                    wwlog!(
-                        "wallet_rpc: mempool_reservation_probe_failed wallet={} err={}",
-                        wallet_public_name(&wallet_path),
-                        e
+                    respond_http_error_detail(
+                        request,
+                        tiny_http::StatusCode(502),
+                        "daemon_mempool_unreachable",
+                        e,
                     );
+                    return;
                 }
             }
             // Filter out stale UTXOs (wallet view may lag behind daemon UTXO set).
@@ -5032,40 +5149,52 @@ pub(crate) fn handle_request(
                 pending
             };
 
-            // Persist to disk and update in-memory together.
-            let persist_result =
-                super::save_wallet_full_state(&wallet_path, &new_utxos, cur_h, &pending_after);
+                    let persist_result =
+                        super::save_wallet_full_state(&wallet_path, &new_utxos, cur_h, &pending_after);
 
-            {
-                let mut g = super::wallet_lock_or_recover();
-                if let Some(ws) = g.as_mut() {
-                    ws.utxos = new_utxos.clone();
-                    ws.last_sync_height = cur_h;
-                    ws.pending_txs = pending_after.clone();
-                }
-            }
+                    {
+                        let mut g = super::wallet_lock_or_recover();
+                        if let Some(ws) = g.as_mut() {
+                            ws.utxos = new_utxos.clone();
+                            ws.last_sync_height = cur_h;
+                            ws.pending_txs = pending_after.clone();
+                        }
+                    }
 
-            let body = send_success_body(
-                &txid,
-                req.amount,
-                final_fee,
-                final_change,
-                selected.len(),
-                cur_h,
-                persist_result,
-            );
-            if let Some(e) = body
-                .get("wallet_state_persist_error")
-                .and_then(|x| x.as_str())
-            {
-                wwlog!(
-                    "wallet_rpc: send_state_persist_failed wallet={} txid={} err={}",
-                    wallet_public_name(&wallet_path),
-                    body.get("txid").and_then(|x| x.as_str()).unwrap_or("-"),
-                    e
-                );
-            }
-            super::respond_json(request, tiny_http::StatusCode(200), body.to_string());
+                    if let Err(e) = persist_result {
+                        wwlog!(
+                            "wallet_rpc: send_state_persist_failed wallet={} txid={} err={}",
+                            wallet_public_name(&wallet_path),
+                            txid,
+                            e
+                        );
+                        super::respond_json(
+                            request,
+                            tiny_http::StatusCode(500),
+                            json!({
+                                "ok": false,
+                                "error": "wallet_state_persist_failed",
+                                "detail": e,
+                                "txid": txid,
+                                "amount": req.amount,
+                                "fee": final_fee,
+                                "change": final_change,
+                                "height": cur_h
+                            })
+                            .to_string(),
+                        );
+                        return;
+                    }
+                    let body = send_success_body(
+                        &txid,
+                        req.amount,
+                        final_fee,
+                        final_change,
+                        selected.len(),
+                        cur_h,
+                        Ok(()),
+                    );
+                    super::respond_json(request, tiny_http::StatusCode(200), body.to_string());
         }
 
         _ => super::respond_json(

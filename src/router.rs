@@ -635,6 +635,16 @@ fn send_success_body(
     body
 }
 
+fn wallet_send_lock_or_recover() -> std::sync::MutexGuard<'static, ()> {
+    match super::wallet_send_lock().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            wwlog!("wallet_rpc: mutex_poison_recovered name=wallet_send");
+            poisoned.into_inner()
+        }
+    }
+}
+
 fn should_probe_daemon_utxo_presence(u: &super::Utxo, cur_h: i64) -> bool {
     if u.txid.is_empty() {
         return false;
@@ -2500,6 +2510,8 @@ pub(crate) fn handle_request(
                         return;
                     }
 
+                    let _send_guard = wallet_send_lock_or_recover();
+
                     // Snapshot wallet state.
                     let (
                         wallet_path,
@@ -2888,6 +2900,12 @@ pub(crate) fn handle_request(
                                     e
                                 );
                             }
+                            super::respond_json(
+                                request,
+                                tiny_http::StatusCode(409),
+                                resp_v.to_string(),
+                            );
+                            return;
                         }
                         super::respond_json(
                             request,
@@ -2945,32 +2963,34 @@ pub(crate) fn handle_request(
                         }
                     };
 
-                    // Persist to disk and update in-memory.
-                    let persist_result =
-                        super::save_wallet_sync_state(&wallet_path, &new_utxos, cur_h);
-                    let pending_persist_result = {
-                        let mut g = super::wallet_lock_or_recover();
-                        if let Some(ws) = g.as_mut() {
-                            record_pending_send(
-                                &mut ws.pending_txs,
-                                &txid,
-                                &to_addr,
-                                req.amount,
-                                final_fee,
-                                final_change,
-                                &spent_inputs,
-                            );
-                            super::save_wallet_pending_txs(&wallet_path, &ws.pending_txs)
-                        } else {
-                            Ok(())
-                        }
+                    let pending_after = {
+                        let g = super::wallet_lock_or_recover();
+                        let mut pending = g
+                            .as_ref()
+                            .map(|ws| ws.pending_txs.clone())
+                            .unwrap_or_default();
+                        record_pending_send(
+                            &mut pending,
+                            &txid,
+                            &to_addr,
+                            req.amount,
+                            final_fee,
+                            final_change,
+                            &spent_inputs,
+                        );
+                        pending
                     };
+
+                    // Persist to disk and update in-memory together.
+                    let persist_result =
+                        super::save_wallet_full_state(&wallet_path, &new_utxos, cur_h, &pending_after);
 
                     {
                         let mut g = super::wallet_lock_or_recover();
                         if let Some(ws) = g.as_mut() {
                             ws.utxos = new_utxos.clone();
                             ws.last_sync_height = cur_h;
+                            ws.pending_txs = pending_after.clone();
                         }
                     }
 
@@ -2994,15 +3014,6 @@ pub(crate) fn handle_request(
                             e
                         );
                     }
-                    if let Err(e) = pending_persist_result {
-                        wwlog!(
-                            "wallet_rpc: send_pending_persist_failed wallet={} txid={} err={}",
-                            wallet_public_name(&wallet_path),
-                            body.get("txid").and_then(|x| x.as_str()).unwrap_or("-"),
-                            e
-                        );
-                    }
-
                     super::respond_json(request, tiny_http::StatusCode(200), body.to_string());
 
                     // Success path above responded with plain JSON.
@@ -3783,7 +3794,7 @@ pub(crate) fn handle_request(
             }
 
             // Snapshot wallet state.
-            let (wallet_path, addrs) = {
+            let (wallet_path, addrs, pending_txs) = {
                 let g = super::wallet_lock_or_recover();
                 let ws = match g.as_ref() {
                     Some(w) => w,
@@ -3799,6 +3810,7 @@ pub(crate) fn handle_request(
                     } else {
                         ws.keys.keys().cloned().collect::<Vec<String>>()
                     },
+                    ws.pending_txs.clone(),
                 )
             };
 
@@ -3825,15 +3837,24 @@ pub(crate) fn handle_request(
                 }
             };
 
+            let mut pending_txs = pending_txs;
+            sync_pending_txs_with_chain_and_mempool(
+                &wallet_path,
+                &mut pending_txs,
+                &[],
+                daemon_rpc_port,
+            );
+
             {
                 let mut g = super::wallet_lock_or_recover();
                 if let Some(ws) = g.as_mut() {
                     ws.utxos = utxos.clone();
                     ws.last_sync_height = cur_h;
+                    ws.pending_txs = pending_txs.clone();
                 }
             }
 
-            if let Err(e) = super::save_wallet_sync_state(&wallet_path, &utxos, cur_h) {
+            if let Err(e) = super::save_wallet_full_state(&wallet_path, &utxos, cur_h, &pending_txs) {
                 wwlog!(
                     "wallet_rpc: manual_sync_persist_failed wallet={} err={}",
                     wallet_public_name(&wallet_path),
@@ -3844,6 +3865,7 @@ pub(crate) fn handle_request(
             // Compute balance + spendable.
             let mut balance: i64 = 0;
             let mut spendable: i64 = 0;
+            let reserved_outpoints = pending_reserved_outpoints(&pending_txs);
             for u in utxos.iter() {
                 balance += u.value;
                 let mature = if u.coinbase {
@@ -3851,7 +3873,7 @@ pub(crate) fn handle_request(
                 } else {
                     true
                 };
-                if mature {
+                if mature && !reserved_outpoints.contains(&(u.txid.clone(), u.vout)) {
                     spendable += u.value;
                 }
             }
@@ -3865,6 +3887,8 @@ pub(crate) fn handle_request(
                     "height": cur_h,
                     "balance": balance,
                     "spendable": spendable,
+                    "pending_txs": pending_txs.len(),
+                    "sync_scope": "confirmed_chain_plus_pending_reconcile",
                     "unit": "DUTA",
                     "utxos": utxos.len()
                 })
@@ -4508,6 +4532,8 @@ pub(crate) fn handle_request(
                 return;
             }
 
+            let _send_guard = wallet_send_lock_or_recover();
+
             // Snapshot wallet state.
             let (
                 wallet_path,
@@ -4925,6 +4951,12 @@ pub(crate) fn handle_request(
                             e
                         );
                     }
+                    super::respond_json(
+                        request,
+                        tiny_http::StatusCode(409),
+                        resp_v.to_string(),
+                    );
+                    return;
                 }
                 super::respond_json(
                     request,
@@ -4982,31 +5014,34 @@ pub(crate) fn handle_request(
                 }
             };
 
-            // Persist to disk and update in-memory.
-            let persist_result = super::save_wallet_sync_state(&wallet_path, &new_utxos, cur_h);
-            let pending_persist_result = {
-                let mut g = super::wallet_lock_or_recover();
-                if let Some(ws) = g.as_mut() {
-                    record_pending_send(
-                        &mut ws.pending_txs,
-                        &txid,
-                        &to_addr,
-                        req.amount,
-                        final_fee,
-                        final_change,
-                        &spent_inputs,
-                    );
-                    super::save_wallet_pending_txs(&wallet_path, &ws.pending_txs)
-                } else {
-                    Ok(())
-                }
+            let pending_after = {
+                let g = super::wallet_lock_or_recover();
+                let mut pending = g
+                    .as_ref()
+                    .map(|ws| ws.pending_txs.clone())
+                    .unwrap_or_default();
+                record_pending_send(
+                    &mut pending,
+                    &txid,
+                    &to_addr,
+                    req.amount,
+                    final_fee,
+                    final_change,
+                    &spent_inputs,
+                );
+                pending
             };
+
+            // Persist to disk and update in-memory together.
+            let persist_result =
+                super::save_wallet_full_state(&wallet_path, &new_utxos, cur_h, &pending_after);
 
             {
                 let mut g = super::wallet_lock_or_recover();
                 if let Some(ws) = g.as_mut() {
                     ws.utxos = new_utxos.clone();
                     ws.last_sync_height = cur_h;
+                    ws.pending_txs = pending_after.clone();
                 }
             }
 
@@ -5030,15 +5065,6 @@ pub(crate) fn handle_request(
                     e
                 );
             }
-            if let Err(e) = pending_persist_result {
-                wwlog!(
-                    "wallet_rpc: send_pending_persist_failed wallet={} txid={} err={}",
-                    wallet_public_name(&wallet_path),
-                    body.get("txid").and_then(|x| x.as_str()).unwrap_or("-"),
-                    e
-                );
-            }
-
             super::respond_json(request, tiny_http::StatusCode(200), body.to_string());
         }
 

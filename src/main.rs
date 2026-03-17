@@ -244,9 +244,14 @@ pub(crate) struct PendingInput {
 }
 
 static WALLET: OnceLock<Mutex<Option<WalletState>>> = OnceLock::new();
+static WALLET_SEND_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(crate) fn wallet_lock() -> &'static Mutex<Option<WalletState>> {
     WALLET.get_or_init(|| Mutex::new(None))
+}
+
+pub(crate) fn wallet_send_lock() -> &'static Mutex<()> {
+    WALLET_SEND_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 pub(crate) fn wallet_lock_or_recover() -> MutexGuard<'static, Option<WalletState>> {
@@ -860,6 +865,19 @@ pub(crate) fn save_wallet_pending_txs(path: &str, pending_txs: &[PendingTx]) -> 
     }
     let db = walletdb::WalletDb::open(path)?;
     db.update_pending_txs(pending_txs)
+}
+
+pub(crate) fn save_wallet_full_state(
+    path: &str,
+    utxos: &[Utxo],
+    last_sync_height: i64,
+    pending_txs: &[PendingTx],
+) -> Result<(), String> {
+    if !(path.ends_with(".db") || path.ends_with(".dat")) {
+        return Err("legacy_plaintext_wallet_disabled_use_db_wallet".to_string());
+    }
+    let db = walletdb::WalletDb::open(path)?;
+    db.update_full_state(utxos, last_sync_height, pending_txs)
 }
 
 fn start_wallet_rpc(rpc_addr: String, daemon_rpc_port: u16, net: String) -> Result<(), String> {

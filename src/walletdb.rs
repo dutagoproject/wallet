@@ -598,6 +598,52 @@ impl WalletDb {
             .map_err(|e| format!("db_meta_write_failed: {e}"))?;
         Ok(())
     }
+
+    pub(crate) fn update_full_state(
+        &self,
+        utxos: &[crate::Utxo],
+        last_sync_height: i64,
+        pending_txs: &[crate::PendingTx],
+    ) -> Result<(), String> {
+        let utxos_body =
+            serde_json::to_vec(utxos).map_err(|e| format!("db_utxos_encode_failed: {e}"))?;
+        let pending_body = serde_json::to_vec(pending_txs)
+            .map_err(|e| format!("db_pending_txs_encode_failed: {e}"))?;
+        self.conn
+            .execute("BEGIN IMMEDIATE TRANSACTION", [])
+            .map_err(|e| format!("db_tx_begin_failed: {e}"))?;
+
+        let result: Result<(), String> = (|| {
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO meta(k,v) VALUES('utxos_json', ?1)",
+                    params![utxos_body],
+                )
+                .map_err(|e| format!("db_meta_write_failed: {e}"))?;
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO meta(k,v) VALUES('last_sync_height', ?1)",
+                    params![last_sync_height],
+                )
+                .map_err(|e| format!("db_meta_write_failed: {e}"))?;
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO meta(k,v) VALUES('pending_txs_json', ?1)",
+                    params![pending_body],
+                )
+                .map_err(|e| format!("db_meta_write_failed: {e}"))?;
+            self.conn
+                .execute("COMMIT", [])
+                .map_err(|e| format!("db_tx_commit_failed: {e}"))?;
+            Ok(())
+        })();
+
+        if let Err(e) = result {
+            let _ = self.conn.execute("ROLLBACK", []);
+            return Err(e);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -707,5 +753,44 @@ mod tests {
         assert_eq!(got[0].amount, -9);
         assert_eq!(got[0].spent_inputs.len(), 1);
         assert_eq!(got[0].spent_inputs[0].txid, "ab".repeat(32));
+    }
+
+    #[test]
+    fn update_full_state_writes_utxos_height_and_pending_together() {
+        let path = temp_wallet_path("full-state");
+        let db = WalletDb::create_new(&path, "strong-pass-123", &[8u8; 32], 1).unwrap();
+        let utxos = vec![crate::Utxo {
+            value: 21,
+            height: 55,
+            coinbase: false,
+            address: "dut1full".to_string(),
+            txid: "cd".repeat(32),
+            vout: 2,
+        }];
+        let pending = vec![crate::PendingTx {
+            txid: "ef".repeat(32),
+            category: "send".to_string(),
+            amount: -11,
+            fee: 1,
+            change: 3,
+            timestamp: 456,
+            details: vec![serde_json::json!({"category":"send","address":"dut1dest","amount":-10})],
+            spent_inputs: vec![crate::PendingInput {
+                txid: "cd".repeat(32),
+                vout: 2,
+            }],
+        }];
+
+        db.update_full_state(&utxos, 77, &pending).unwrap();
+
+        let reopened = WalletDb::open(&path).unwrap();
+        assert_eq!(reopened.read_last_sync_height().unwrap(), 77);
+        let got_utxos = reopened.read_utxos().unwrap();
+        assert_eq!(got_utxos.len(), 1);
+        assert_eq!(got_utxos[0].txid, "cd".repeat(32));
+        let got_pending = reopened.read_pending_txs().unwrap();
+        assert_eq!(got_pending.len(), 1);
+        assert_eq!(got_pending[0].txid, "ef".repeat(32));
+        assert_eq!(got_pending[0].spent_inputs[0].txid, "cd".repeat(32));
     }
 }

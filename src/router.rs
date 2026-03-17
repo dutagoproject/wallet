@@ -951,7 +951,15 @@ fn rebuild_wallet_utxos_via_blocks_from(
     addrs: &[String],
     daemon_rpc_port: u16,
 ) -> Result<(i64, Vec<super::Utxo>), String> {
-    // Current chain tip.
+    sync_wallet_utxos_via_blocks_from(addrs, daemon_rpc_port, 0, &[])
+}
+
+fn sync_wallet_utxos_via_blocks_from(
+    addrs: &[String],
+    daemon_rpc_port: u16,
+    from_height: i64,
+    base_utxos: &[super::Utxo],
+) -> Result<(i64, Vec<super::Utxo>), String> {
     let cur_h = daemon_tip_height_with_retry(daemon_rpc_port, 0)?;
 
     let addr_set: HashSet<&str> = addrs.iter().map(|s| s.as_str()).collect();
@@ -959,9 +967,12 @@ fn rebuild_wallet_utxos_via_blocks_from(
         return Ok((cur_h, Vec::new()));
     }
 
-    // Rebuild wallet UTXOs by scanning blocks via daemon RPC (/blocks_from).
-    let mut map: HashMap<(String, u32), super::Utxo> = HashMap::new();
-    let mut from: i64 = 0;
+    let mut map: HashMap<(String, u32), super::Utxo> = base_utxos
+        .iter()
+        .cloned()
+        .map(|u| ((u.txid.clone(), u.vout), u))
+        .collect();
+    let mut from: i64 = from_height.max(0);
     let limit: i64 = 256;
 
     loop {
@@ -1059,6 +1070,44 @@ fn rebuild_wallet_utxos_via_blocks_from(
     let mut utxos: Vec<super::Utxo> = map.values().cloned().collect();
     utxos.sort_by(|a, b| (a.txid.clone(), a.vout).cmp(&(b.txid.clone(), b.vout)));
     Ok((cur_h, utxos))
+}
+
+fn wallet_needs_full_utxo_rebuild(utxos: &[super::Utxo], cur_h: i64, last_sync_height: i64) -> bool {
+    if cur_h <= 0 {
+        return false;
+    }
+    if last_sync_height <= 0 {
+        return true;
+    }
+    utxos.is_empty() || utxos.iter().any(|u| u.height > cur_h)
+}
+
+fn refresh_wallet_utxos_runtime(
+    addrs: &[String],
+    daemon_rpc_port: u16,
+    current_utxos: &[super::Utxo],
+    last_sync_height: i64,
+) -> Result<(i64, Vec<super::Utxo>), String> {
+    let cur_h = daemon_tip_height_with_retry(daemon_rpc_port, last_sync_height)?;
+    if addrs.is_empty() || cur_h <= 0 {
+        return Ok((cur_h, current_utxos.to_vec()));
+    }
+
+    let full_rebuild = wallet_needs_full_utxo_rebuild(current_utxos, cur_h, last_sync_height);
+    if full_rebuild {
+        return rebuild_wallet_utxos_via_blocks_from(addrs, daemon_rpc_port);
+    }
+
+    if cur_h > last_sync_height {
+        return sync_wallet_utxos_via_blocks_from(
+            addrs,
+            daemon_rpc_port,
+            last_sync_height.saturating_add(1),
+            current_utxos,
+        );
+    }
+
+    Ok((cur_h, current_utxos.to_vec()))
 }
 
 fn scan_wallet_txs_via_blocks_from(
@@ -1662,28 +1711,41 @@ fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<(i64, i64, i64, i64, 
         None => {}
     }
 
-    // Auto-sync for correctness: rebuild when wallet is empty, when a tracked UTXO is
-    // impossible at current tip, or when daemon no longer has one of the tracked outpoints.
-    let needs_rebuild = (!addrs.is_empty() && cur_h > 0)
-        && (cur_h > last_sync_height
-            || utxos.is_empty()
-            || utxos.iter().any(|u| u.height > cur_h)
-            || utxos.iter().any(|u| {
-                if !should_probe_daemon_utxo_presence(u, cur_h) {
-                    return false;
-                }
-                let path = format!("/utxo?txid={}&vout={}", u.txid, u.vout);
-                match super::http_get_local("127.0.0.1", daemon_rpc_port, &path)
-                    .ok()
-                    .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
-                    .and_then(|v| v.get("found").and_then(|x| x.as_bool()))
-                {
-                    Some(found) => !found,
-                    None => false,
-                }
-            }));
-    if needs_rebuild {
-        match rebuild_wallet_utxos_via_blocks_from(&addrs, daemon_rpc_port) {
+    let missing_tracked_utxo = utxos.iter().any(|u| {
+        if !should_probe_daemon_utxo_presence(u, cur_h) {
+            return false;
+        }
+        let path = format!("/utxo?txid={}&vout={}", u.txid, u.vout);
+        match super::http_get_local("127.0.0.1", daemon_rpc_port, &path)
+            .ok()
+            .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
+            .and_then(|v| v.get("found").and_then(|x| x.as_bool()))
+        {
+            Some(found) => !found,
+            None => false,
+        }
+    });
+
+    let full_rebuild = !addrs.is_empty()
+        && wallet_needs_full_utxo_rebuild(&utxos, cur_h, last_sync_height);
+    let incremental_sync = !addrs.is_empty()
+        && cur_h > last_sync_height
+        && last_sync_height > 0
+        && !full_rebuild;
+
+    if full_rebuild || incremental_sync || missing_tracked_utxo {
+        let sync_result = if full_rebuild || missing_tracked_utxo {
+            rebuild_wallet_utxos_via_blocks_from(&addrs, daemon_rpc_port)
+        } else {
+            sync_wallet_utxos_via_blocks_from(
+                &addrs,
+                daemon_rpc_port,
+                last_sync_height.saturating_add(1),
+                &utxos,
+            )
+        };
+
+        match sync_result {
             Ok((_h, new_utxos)) => {
                 utxos = new_utxos;
 
@@ -2624,17 +2686,18 @@ pub(crate) fn handle_request(
                     let _send_guard = wallet_send_lock_or_recover();
 
                     // Snapshot wallet state.
-                    let (
-                        wallet_path,
-                        change_addr,
-                        addrs,
-                        signers_by_pkh,
-                        signers_by_addr,
-                        utxos,
-                        pending_txs,
-                    ) = {
-                        let g = super::wallet_lock_or_recover();
-                        let ws = match g.as_ref() {
+            let (
+                wallet_path,
+                change_addr,
+                addrs,
+                signers_by_pkh,
+                signers_by_addr,
+                utxos,
+                pending_txs,
+                last_sync_height,
+            ) = {
+                let g = super::wallet_lock_or_recover();
+                let ws = match g.as_ref() {
                             Some(w) => w,
                             None => {
                                 super::respond_json(
@@ -2691,6 +2754,7 @@ pub(crate) fn handle_request(
                             },
                             ws.utxos.clone(),
                             ws.pending_txs.clone(),
+                            ws.last_sync_height,
                         )
                     };
 
@@ -2703,17 +2767,37 @@ pub(crate) fn handle_request(
                         return;
                     }
                     // Need daemon height for maturity calculation.
-                    let cur_h = match daemon_tip_height_with_retry(daemon_rpc_port, 0) {
-                        Ok(h) => h,
+                    let (cur_h, utxos) = match refresh_wallet_utxos_runtime(
+                        &addrs,
+                        daemon_rpc_port,
+                        &utxos,
+                        last_sync_height,
+                    ) {
+                        Ok(v) => v,
                         Err(e) => {
                             super::respond_json(
                                 request,
                                 tiny_http::StatusCode(502),
-                                json!({"error":"daemon_unreachable","detail":e}).to_string(),
+                                json!({"error":"wallet_state_refresh_failed","detail":e}).to_string(),
                             );
                             return;
                         }
                     };
+
+                    {
+                        let mut g = super::wallet_lock_or_recover();
+                        if let Some(ws) = g.as_mut() {
+                            ws.utxos = utxos.clone();
+                            ws.last_sync_height = cur_h;
+                        }
+                    }
+                    if let Err(e) = super::save_wallet_sync_state(&wallet_path, &utxos, cur_h) {
+                        wwlog!(
+                            "wallet_rpc: send_refresh_persist_failed wallet={} err={}",
+                            wallet_public_name(&wallet_path),
+                            e
+                        );
+                    }
 
                     // Select spendable inputs.
                     const COINBASE_MATURITY: i64 = 60;
@@ -3806,7 +3890,7 @@ pub(crate) fn handle_request(
                 return;
             }
 
-            let (wallet_addrs, primary_address) = {
+            let (wallet_addrs, primary_address, wallet_path, wallet_utxos, last_sync_height) = {
                 let g = super::wallet_lock_or_recover();
                 let ws = match g.as_ref() {
                     Some(w) => w,
@@ -3822,6 +3906,9 @@ pub(crate) fn handle_request(
                         ws.keys.keys().cloned().collect::<HashSet<String>>()
                     },
                     ws.primary_address.clone(),
+                    ws.wallet_path.clone(),
+                    ws.utxos.clone(),
+                    ws.last_sync_height,
                 )
             };
             if wallet_addrs.is_empty() {
@@ -3856,19 +3943,44 @@ pub(crate) fn handle_request(
                 return;
             }
 
-            let (cur_h, utxos) =
-                match rebuild_wallet_utxos_via_blocks_from(&vec![addr.clone()], daemon_rpc_port) {
-                    Ok(x) => x,
-                    Err(e) => {
-                        respond_http_error_detail(
-                            request,
-                            tiny_http::StatusCode(502),
-                            wallet_refresh_error_code(&e),
-                            e,
-                        );
-                        return;
-                    }
-                };
+            let wallet_addrs_vec = wallet_addrs.iter().cloned().collect::<Vec<String>>();
+            let (cur_h, refreshed_utxos) = match refresh_wallet_utxos_runtime(
+                &wallet_addrs_vec,
+                daemon_rpc_port,
+                &wallet_utxos,
+                last_sync_height,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    respond_http_error_detail(
+                        request,
+                        tiny_http::StatusCode(502),
+                        wallet_refresh_error_code(&e),
+                        e,
+                    );
+                    return;
+                }
+            };
+
+            {
+                let mut g = super::wallet_lock_or_recover();
+                if let Some(ws) = g.as_mut() {
+                    ws.utxos = refreshed_utxos.clone();
+                    ws.last_sync_height = cur_h;
+                }
+            }
+            if let Err(e) = super::save_wallet_sync_state(&wallet_path, &refreshed_utxos, cur_h) {
+                wwlog!(
+                    "wallet_rpc: address_balance_refresh_persist_failed wallet={} err={}",
+                    wallet_public_name(&wallet_path),
+                    e
+                );
+            }
+
+            let utxos: Vec<super::Utxo> = refreshed_utxos
+                .into_iter()
+                .filter(|u| u.address == addr)
+                .collect();
 
             const COINBASE_MATURITY: i64 = 60;
             let mut balance: i64 = 0;
@@ -4663,6 +4775,7 @@ pub(crate) fn handle_request(
                 signers_by_addr,
                 mut utxos,
                 pending_txs,
+                last_sync_height,
             ) = {
                 let g = super::wallet_lock_or_recover();
                 let ws = match g.as_ref() {
@@ -4718,6 +4831,7 @@ pub(crate) fn handle_request(
                     },
                     ws.utxos.clone(),
                     ws.pending_txs.clone(),
+                    ws.last_sync_height,
                 )
             };
 
@@ -4730,53 +4844,38 @@ pub(crate) fn handle_request(
                 return;
             }
             // Need daemon height for maturity calculation.
-            let cur_h = match daemon_tip_height_with_retry(daemon_rpc_port, 0) {
-                Ok(h) => h,
+            let (cur_h, new_utxos) = match refresh_wallet_utxos_runtime(
+                &addrs,
+                daemon_rpc_port,
+                &utxos,
+                last_sync_height,
+            ) {
+                Ok(v) => v,
                 Err(e) => {
                     respond_http_error_detail(
                         request,
                         tiny_http::StatusCode(502),
-                        "daemon_unreachable",
+                        "wallet_state_refresh_failed",
                         e,
                     );
                     return;
                 }
             };
 
-            if !addrs.is_empty() && cur_h > 0 {
-                match rebuild_wallet_utxos_via_blocks_from(&addrs, daemon_rpc_port) {
-                    Ok((_h, new_utxos)) => {
-                        utxos = new_utxos;
-
-                        {
-                            let mut g = super::wallet_lock_or_recover();
-                            if let Some(ws) = g.as_mut() {
-                                ws.utxos = utxos.clone();
-                            }
-                        }
-
-                        if let Err(e) = super::save_wallet_utxos(&wallet_path, &utxos) {
-                            wwlog!(
-                                "wallet_rpc: send_rebuild_persist_failed wallet={} err={}",
-                                wallet_public_name(&wallet_path),
-                                e
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        wwlog!(
-                            "wallet_rpc: send_rebuild_failed wallet={} err={}",
-                            wallet_public_name(&wallet_path),
-                            e
-                        );
-                        super::respond_json(
-                            request,
-                            tiny_http::StatusCode(502),
-                            json!({"error":"wallet_state_refresh_failed","detail":e}).to_string(),
-                        );
-                        return;
-                    }
+            utxos = new_utxos;
+            {
+                let mut g = super::wallet_lock_or_recover();
+                if let Some(ws) = g.as_mut() {
+                    ws.utxos = utxos.clone();
+                    ws.last_sync_height = cur_h;
                 }
+            }
+            if let Err(e) = super::save_wallet_sync_state(&wallet_path, &utxos, cur_h) {
+                wwlog!(
+                    "wallet_rpc: send_refresh_persist_failed wallet={} err={}",
+                    wallet_public_name(&wallet_path),
+                    e
+                );
             }
 
             // Select spendable inputs.

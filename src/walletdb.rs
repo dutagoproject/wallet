@@ -576,17 +576,6 @@ impl WalletDb {
         serde_json::from_slice(&raw).map_err(|e| format!("db_pending_txs_invalid: {e}"))
     }
 
-    pub(crate) fn update_utxos(&self, utxos: &[crate::Utxo]) -> Result<(), String> {
-        let body = serde_json::to_vec(utxos).map_err(|e| format!("db_utxos_encode_failed: {e}"))?;
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO meta(k,v) VALUES('utxos_json', ?1)",
-                params![body],
-            )
-            .map_err(|e| format!("db_meta_write_failed: {e}"))?;
-        Ok(())
-    }
-
     pub(crate) fn update_pending_txs(&self, pending_txs: &[crate::PendingTx]) -> Result<(), String> {
         let body = serde_json::to_vec(pending_txs)
             .map_err(|e| format!("db_pending_txs_encode_failed: {e}"))?;

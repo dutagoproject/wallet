@@ -843,14 +843,6 @@ fn validate_wallet_state_addresses(ws: &WalletState) -> Result<(), String> {
 
     Ok(())
 }
-pub(crate) fn save_wallet_utxos(path: &str, utxos: &[Utxo]) -> Result<(), String> {
-    if !(path.ends_with(".db") || path.ends_with(".dat")) {
-        return Err("legacy_plaintext_wallet_disabled_use_db_wallet".to_string());
-    }
-    let db = walletdb::WalletDb::open(path)?;
-    db.update_utxos(utxos)
-}
-
 pub(crate) fn save_wallet_sync_state(path: &str, utxos: &[Utxo], last_sync_height: i64) -> Result<(), String> {
     if !(path.ends_with(".db") || path.ends_with(".dat")) {
         return Err("legacy_plaintext_wallet_disabled_use_db_wallet".to_string());
@@ -1332,7 +1324,7 @@ fn main() {
 mod tests {
     use super::{
         build_http_request, clear_wallet_sensitive_state, load_wallet_db_to_state, read_pid_file,
-        remove_pid_file_if_matches, save_wallet_sync_state, save_wallet_utxos, wallet_rpc_bind_warning,
+        remove_pid_file_if_matches, save_wallet_sync_state, wallet_rpc_bind_warning,
         Args, Cmd, validate_wallet_state_addresses, wallet_rpc_settings, PidFileGuard, Utxo,
         WalletState,
     };
@@ -1419,12 +1411,6 @@ mod tests {
         assert!(ws.keys.is_empty());
         assert!(ws.seed_hex.is_none());
         assert!(ws.db_passphrase.is_none());
-    }
-
-    #[test]
-    fn save_wallet_utxos_rejects_plaintext_wallet_paths() {
-        let err = save_wallet_utxos("wallet.json", &[]).unwrap_err();
-        assert_eq!(err, "legacy_plaintext_wallet_disabled_use_db_wallet");
     }
 
     #[test]

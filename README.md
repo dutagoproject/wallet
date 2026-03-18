@@ -47,5 +47,7 @@ It is not the node repository and it is not the public stratum repository.
 
 - Linux build: [docs/BUILD_LINUX.md](./docs/BUILD_LINUX.md)
 - Windows build: [docs/BUILD_WINDOWS.md](./docs/BUILD_WINDOWS.md)
+- Install from binary: [docs/INSTALL_FROM_BINARY.md](./docs/INSTALL_FROM_BINARY.md)
 - Operator guide: [docs/OPERATOR_GUIDE.md](./docs/OPERATOR_GUIDE.md)
 - CLI guide: [docs/CLI_GUIDE.md](./docs/CLI_GUIDE.md)
+- Denomination migration: [docs/DENOMINATION_MIGRATION.md](./docs/DENOMINATION_MIGRATION.md)

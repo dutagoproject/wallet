@@ -68,6 +68,20 @@ Common wallet RPC endpoints include:
 
 Treat wallet RPC as private operator surface. Do not expose it directly to the public internet.
 
+## Denomination rules
+
+- `DUTA` is the display unit
+- `dut` is the base unit
+- all on-chain and stored values remain integer `dut`
+- RPC fields like `amount`, `balance`, `fee`, and `change` are display-layer values in `DUTA`
+- raw values are exposed as `*_dut`
+- operators and automation should prefer `*_dut` for accounting and exact comparisons
+
+Examples:
+
+- `amount = "0.00000001"` means `amount_dut = 1`
+- `fee = "0.0001"` means `fee_dut = 10000`
+
 ## Operating rules
 
 - keep wallet RPC bound to loopback unless you have a strong reason not to

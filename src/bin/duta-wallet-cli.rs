@@ -4,6 +4,7 @@
 //!   RUSTFLAGS="-Dwarnings" cargo build --release -p dutawalletd --bin duta-wallet-cli
 
 use clap::{Parser, Subcommand};
+use duta_core::amount::{format_dut_i64, parse_duta_to_dut_i64, DISPLAY_UNIT};
 use duta_core::netparams::Network;
 use serde_json::json;
 use std::io::{Read, Write};
@@ -128,11 +129,41 @@ enum Cmd {
     Send {
         /// Destination address
         to: String,
-        /// Amount (integer, current wallet API uses i64)
-        amount: i64,
-        /// Fee (optional; if omitted, wallet defaults to 1)
+        /// Amount in display-unit DUTA (stored on-chain as integer dut; example: 1.25)
+        amount: String,
+        /// Fee in display-unit DUTA (optional; example: 0.0001)
         #[arg(long)]
-        fee: Option<i64>,
+        fee: Option<String>,
+    },
+
+    /// POST /sendmany {"outputs":[...], "fee":optional}
+    Sendmany {
+        /// Repeatable destination=amount pair, example: addr1=0.1
+        outputs: Vec<String>,
+        /// Fee for the whole transaction in display-unit DUTA
+        #[arg(long)]
+        fee: Option<String>,
+    },
+
+    /// POST /sendmany_plan {"outputs":[...], "fee":optional}
+    Sendmanyplan {
+        /// Repeatable destination=amount pair, example: addr1=0.1
+        outputs: Vec<String>,
+        /// Optional fee for the whole transaction in display-unit DUTA
+        #[arg(long)]
+        fee: Option<String>,
+    },
+
+    /// POST /send_plan {"amount":..., "fee":optional, "outputs":optional}
+    Sendplan {
+        /// Amount per payout in display-unit DUTA
+        amount: String,
+        /// Fee per payout in display-unit DUTA
+        #[arg(long)]
+        fee: Option<String>,
+        /// Optional number of payouts to evaluate
+        #[arg(long)]
+        outputs: Option<usize>,
     },
 
     /// POST /rpc {"method":"listunspent"}
@@ -142,6 +173,7 @@ enum Cmd {
     Getwalletinfo,
 
     /// POST /rpc {"method":"listtransactions","params":[count, skip]}
+    #[command(visible_alias = "listtransactions")]
     History {
         /// Max number of entries (default 10)
         #[arg(long, default_value_t = 10)]
@@ -152,6 +184,7 @@ enum Cmd {
     },
 
     /// POST /rpc {"method":"gettransaction","params":[txid]}
+    #[command(visible_alias = "gettransaction")]
     Tx { txid: String },
 }
 
@@ -227,6 +260,63 @@ fn main() {
                 v["fee"] = json!(f);
             }
             http_post_json(&host, port, "/send", v)
+        }
+
+        Cmd::Sendmany { outputs, fee } => {
+            let mut parsed = Vec::new();
+            let mut parse_error = None;
+            for item in outputs {
+                let Some((to, amount)) = item.split_once('=') else {
+                    parse_error = Some("invalid_output_pair_use_address_equals_amount".to_string());
+                    break;
+                };
+                parsed.push(json!({"to": to, "amount": amount}));
+            }
+            if let Some(err) = parse_error {
+                Err(err)
+            } else {
+            let mut v = json!({"outputs": parsed});
+            if let Some(f) = fee {
+                v["fee"] = json!(f);
+            }
+            http_post_json(&host, port, "/sendmany", v)
+            }
+        }
+
+        Cmd::Sendmanyplan { outputs, fee } => {
+            let mut parsed = Vec::new();
+            let mut parse_error = None;
+            for item in outputs {
+                let Some((to, amount)) = item.split_once('=') else {
+                    parse_error = Some("invalid_output_pair_use_address_equals_amount".to_string());
+                    break;
+                };
+                parsed.push(json!({"to": to, "amount": amount}));
+            }
+            if let Some(err) = parse_error {
+                Err(err)
+            } else {
+                let mut v = json!({"outputs": parsed});
+                if let Some(f) = fee {
+                    v["fee"] = json!(f);
+                }
+                http_post_json(&host, port, "/sendmany_plan", v)
+            }
+        }
+
+        Cmd::Sendplan {
+            amount,
+            fee,
+            outputs,
+        } => {
+            let mut v = json!({"amount": amount});
+            if let Some(f) = fee {
+                v["fee"] = json!(f);
+            }
+            if let Some(count) = outputs {
+                v["outputs"] = json!(count);
+            }
+            http_post_json(&host, port, "/send_plan", v)
         }
 
         Cmd::Listunspent => http_post_json(
@@ -325,8 +415,8 @@ fn history_priority(category: &str, height: i64) -> i32 {
 
 fn history_amount_and_fee(item: &serde_json::Value) -> (String, Option<String>) {
     let category = item.get("category").and_then(|x| x.as_str()).unwrap_or("tx");
-    let amount = item.get("amount").and_then(|x| x.as_i64()).unwrap_or(0);
-    let fee = item.get("fee").and_then(|x| x.as_i64()).unwrap_or(0);
+    let amount = amount_from_json(item, "amount", "amount_dut").unwrap_or(0);
+    let fee = amount_from_json(item, "fee", "fee_dut").unwrap_or(0);
 
     if category == "send" {
         let sent = if amount >= 0 {
@@ -337,14 +427,38 @@ fn history_amount_and_fee(item: &serde_json::Value) -> (String, Option<String>) 
             amount.abs()
         };
         let fee_text = if fee != 0 {
-            Some(format!("fee {} DUTA", fee.abs()))
+            Some(format!("fee {} {}", format_dut_i64(fee.abs()), DISPLAY_UNIT))
         } else {
             None
         };
-        (format!("{sent} DUTA"), fee_text)
+        (format!("{} {}", format_dut_i64(sent), DISPLAY_UNIT), fee_text)
+    } else if category == "move" {
+        let fee_text = if fee != 0 {
+            Some(format!("fee {} {}", format_dut_i64(fee.abs()), DISPLAY_UNIT))
+        } else {
+            None
+        };
+        (format!("{} {}", format_dut_i64(amount), DISPLAY_UNIT), fee_text)
     } else {
-        (format!("{amount} DUTA"), None)
+        (format!("{} {}", format_dut_i64(amount), DISPLAY_UNIT), None)
     }
+}
+
+fn amount_from_json(v: &serde_json::Value, display_key: &str, raw_key: &str) -> Option<i64> {
+    if let Some(raw) = v.get(raw_key).and_then(|x| x.as_i64()) {
+        return Some(raw);
+    }
+    match v.get(display_key) {
+        Some(serde_json::Value::String(s)) => parse_duta_to_dut_i64(s).ok(),
+        Some(serde_json::Value::Number(n)) => parse_duta_to_dut_i64(&n.to_string()).ok(),
+        _ => None,
+    }
+}
+
+fn amount_text(v: &serde_json::Value, display_key: &str, raw_key: &str) -> String {
+    amount_from_json(v, display_key, raw_key)
+        .map(|dut| format!("{} {}", format_dut_i64(dut), DISPLAY_UNIT))
+        .unwrap_or_else(|| format!("0 {}", DISPLAY_UNIT))
 }
 
 fn json_field<'a>(v: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde_json::Value> {
@@ -384,15 +498,13 @@ fn format_response(cmd: &Cmd, body: &str) -> String {
         Cmd::Info => {
             let net = json_str(&v, &["net"]).unwrap_or("unknown");
             let rpc = json_str(&v, &["wallet_rpc"]).unwrap_or("-");
-            let balance = json_i64(&v, &["balance"]).unwrap_or(0);
-            let spendable = json_i64(&v, &["spendable"]).unwrap_or(0);
             let height = json_i64(&v, &["height"]).unwrap_or(0);
             format!(
                 "{}\n{}\n{}\n{}\n{}",
                 info_line(format!("network: {net}")),
                 info_line(format!("wallet rpc: {rpc}")),
-                info_line(format!("balance: {balance} DUTA")),
-                info_line(format!("spendable: {spendable} DUTA")),
+                info_line(format!("balance: {}", amount_text(&v, "balance", "balance_dut"))),
+                info_line(format!("spendable: {}", amount_text(&v, "spendable", "spendable_dut"))),
                 info_line(format!("height: {height}"))
             )
         }
@@ -430,49 +542,87 @@ fn format_response(cmd: &Cmd, body: &str) -> String {
             }
         }
         Cmd::Getbalance => {
-            let balance = json_i64(&v, &["balance"]).unwrap_or(0);
-            let spendable = json_i64(&v, &["spendable"]).unwrap_or(0);
             let height = json_i64(&v, &["height"]).unwrap_or(0);
             let utxos = json_i64(&v, &["utxos"]).unwrap_or(0);
+            let pending = json_i64(&v, &["pending_txs"]).unwrap_or(0);
+            let balance = amount_text(&v, "balance", "balance_dut");
+            let spendable = amount_text(&v, "spendable", "spendable_dut");
             format!(
-                "{}\n{}\n{}\n{}",
-                info_line(format!("balance: {balance} DUTA")),
-                info_line(format!("spendable: {spendable} DUTA")),
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                info_line(format!("balance: {balance}")),
+                info_line(format!("spendable: {spendable}")),
+                info_line(format!("reserved: {}", amount_text(&v, "reserved", "reserved_dut"))),
+                info_line(format!(
+                    "pending send: {}",
+                    amount_text(&v, "pending_send", "pending_send_dut")
+                )),
+                info_line(format!(
+                    "pending change: {}",
+                    amount_text(&v, "pending_change", "pending_change_dut")
+                )),
                 info_line(format!("height: {height}")),
-                info_line(format!("utxos: {utxos}"))
+                info_line(format!("utxos: {utxos}")),
+                wait_line(format!("pending txs: {pending}"))
             )
         }
         Cmd::Getwalletinfo => {
-            let balance = json_i64(&v, &["result", "balance"]).unwrap_or(0);
-            let spendable = json_i64(&v, &["result", "spendable_balance"]).unwrap_or(0);
-            let immature = json_i64(&v, &["result", "immature_balance"]).unwrap_or(0);
             let height = json_i64(&v, &["result", "height"]).unwrap_or(0);
             let wallet = json_str(&v, &["result", "walletname"]).unwrap_or("wallet");
             let unlocked = json_bool(&v, &["result", "unlocked"]).unwrap_or(false);
+            let result = json_field(&v, &["result"]).cloned().unwrap_or_else(|| json!({}));
             format!(
-                "{}\n{}\n{}\n{}\n{}\n{}",
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
                 info_line(format!("wallet: {wallet}")),
-                info_line(format!("balance: {balance} DUTA")),
-                info_line(format!("spendable: {spendable} DUTA")),
-                info_line(format!("immature: {immature} DUTA")),
+                info_line(format!("balance: {}", amount_text(&result, "balance", "balance_dut"))),
+                info_line(format!(
+                    "spendable: {}",
+                    amount_text(&result, "spendable_balance", "spendable_balance_dut")
+                )),
+                info_line(format!(
+                    "immature: {}",
+                    amount_text(&result, "immature_balance", "immature_balance_dut")
+                )),
+                info_line(format!(
+                    "reserved: {}",
+                    amount_text(&result, "reserved_balance", "reserved_balance_dut")
+                )),
+                info_line(format!(
+                    "pending send: {}",
+                    amount_text(&result, "pending_send", "pending_send_dut")
+                )),
+                info_line(format!(
+                    "pending change: {}",
+                    amount_text(&result, "pending_change", "pending_change_dut")
+                )),
                 info_line(format!("height: {height}")),
                 info_line(format!(
                     "status: {}",
                     if unlocked { "unlocked" } else { "locked" }
+                )),
+                wait_line(format!(
+                    "pending txs: {}",
+                    json_i64(&result, &["pending_txs"]).unwrap_or(0)
                 ))
             )
         }
         Cmd::Sync => {
             if json_bool(&v, &["ok"]) == Some(true) {
-                let balance = json_i64(&v, &["balance"]).unwrap_or(0);
-                let spendable = json_i64(&v, &["spendable"]).unwrap_or(0);
                 let height = json_i64(&v, &["height"]).unwrap_or(0);
                 let pending = json_i64(&v, &["pending_txs"]).unwrap_or(0);
                 format!(
-                    "{}\n{}\n{}\n{}\n{}",
+                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
                     ok_line("wallet sync complete"),
-                    info_line(format!("balance: {balance} DUTA")),
-                    info_line(format!("spendable: {spendable} DUTA")),
+                    info_line(format!("balance: {}", amount_text(&v, "balance", "balance_dut"))),
+                    info_line(format!("spendable: {}", amount_text(&v, "spendable", "spendable_dut"))),
+                    info_line(format!("reserved: {}", amount_text(&v, "reserved", "reserved_dut"))),
+                    info_line(format!(
+                        "pending send: {}",
+                        amount_text(&v, "pending_send", "pending_send_dut")
+                    )),
+                    info_line(format!(
+                        "pending change: {}",
+                        amount_text(&v, "pending_change", "pending_change_dut")
+                    )),
                     info_line(format!("height: {height}")),
                     wait_line(format!("pending sends: {pending}"))
                 )
@@ -483,22 +633,137 @@ fn format_response(cmd: &Cmd, body: &str) -> String {
         Cmd::Send { .. } => {
             if json_bool(&v, &["ok"]) == Some(true) {
                 let txid = json_str(&v, &["txid"]).unwrap_or("-");
-                let amount = json_i64(&v, &["amount"]).unwrap_or(0);
-                let fee = json_i64(&v, &["fee"]).unwrap_or(0);
-                let change = json_i64(&v, &["change"]).unwrap_or(0);
                 let persisted = json_bool(&v, &["wallet_state_persisted"]).unwrap_or(false);
-                format!(
-                    "{}\n{}\n{}\n{}\n{}\n{}",
+                let fee_mode = if json_bool(&v, &["fee_auto"]).unwrap_or(false) {
+                    "auto-min-relay"
+                } else {
+                    "manual"
+                };
+                vec![
                     ok_line("send accepted"),
                     info_line(format!("txid: {txid}")),
-                    info_line(format!("amount: {amount} DUTA")),
-                    info_line(format!("fee: {fee} DUTA")),
-                    info_line(format!("change: {change} DUTA")),
+                    info_line(format!("amount: {}", amount_text(&v, "amount", "amount_dut"))),
+                    info_line(format!("fee: {}", amount_text(&v, "fee", "fee_dut"))),
+                    info_line(format!("fee mode: {fee_mode}")),
+                    info_line(format!(
+                        "min relay fee: {}",
+                        amount_text(&v, "min_relay_fee", "min_relay_fee_dut")
+                    )),
+                    info_line(format!("change: {}", amount_text(&v, "change", "change_dut"))),
+                    info_line(format!("size: {} bytes", json_i64(&v, &["size"]).unwrap_or(0))),
                     info_line(format!(
                         "saved: {}",
                         if persisted { "yes" } else { "not yet" }
-                    ))
-                )
+                    )),
+                ]
+                .join("\n")
+            } else {
+                body.to_string()
+            }
+        }
+        Cmd::Sendmany { .. } => {
+            if json_bool(&v, &["ok"]) == Some(true) {
+                let txid = json_str(&v, &["txid"]).unwrap_or("-");
+                let fee_mode = if json_bool(&v, &["fee_auto"]).unwrap_or(false) {
+                    "auto-min-relay"
+                } else {
+                    "manual"
+                };
+                vec![
+                    ok_line("batch send accepted"),
+                    info_line(format!("txid: {txid}")),
+                    info_line(format!("outputs: {}", json_i64(&v, &["outputs"]).unwrap_or(0))),
+                    info_line(format!("inputs: {}", json_i64(&v, &["inputs"]).unwrap_or(0))),
+                    info_line(format!("amount: {}", amount_text(&v, "amount", "amount_dut"))),
+                    info_line(format!("fee: {}", amount_text(&v, "fee", "fee_dut"))),
+                    info_line(format!("fee mode: {fee_mode}")),
+                    info_line(format!(
+                        "min relay fee: {}",
+                        amount_text(&v, "min_relay_fee", "min_relay_fee_dut")
+                    )),
+                    info_line(format!("change: {}", amount_text(&v, "change", "change_dut"))),
+                    info_line(format!("size: {} bytes", json_i64(&v, &["size"]).unwrap_or(0))),
+                ]
+                .join("\n")
+            } else {
+                body.to_string()
+            }
+        }
+        Cmd::Sendmanyplan { .. } => {
+            if json_bool(&v, &["ok"]) == Some(true) {
+                let fits = json_bool(&v, &["can_send"]).unwrap_or(false);
+                let mut lines = vec![
+                    info_line(format!("batch outputs: {}", json_i64(&v, &["outputs"]).unwrap_or(0))),
+                    info_line(format!("estimated inputs: {}", json_i64(&v, &["inputs"]).unwrap_or(0))),
+                    info_line(format!("amount total: {}", amount_text(&v, "amount", "amount_dut"))),
+                    info_line(format!("estimated fee: {}", amount_text(&v, "fee", "fee_dut"))),
+                    info_line(format!("min relay fee: {}", amount_text(&v, "min_relay_fee", "min_relay_fee_dut"))),
+                    info_line(format!("estimated size: {} bytes", json_i64(&v, &["size"]).unwrap_or(0))),
+                    info_line(format!(
+                        "spendable now: {} across {} utxo(s)",
+                        amount_text(&v, "spendable_balance", "spendable_balance_dut"),
+                        json_i64(&v, &["spendable_utxos"]).unwrap_or(0)
+                    )),
+                    info_line(format!(
+                        "batch viability: {}",
+                        if fits { "ready_to_send" } else { "would_fail" }
+                    )),
+                ];
+                if !fits {
+                    let failure = json_field(&v, &["failure"]).cloned().unwrap_or_else(|| json!({}));
+                    let detail = json_str(&failure, &["detail"])
+                        .or_else(|| json_str(&failure, &["error"]))
+                        .unwrap_or("batch_not_viable");
+                    lines.push(wait_line(format!("failure detail: {detail}")));
+                    if let Some(min_fee) = json_i64(&failure, &["min_fee"]) {
+                        lines.push(wait_line(format!(
+                            "required relay fee: {} {}",
+                            format_dut_i64(min_fee),
+                            DISPLAY_UNIT
+                        )));
+                    }
+                }
+                lines.join("\n")
+            } else {
+                body.to_string()
+            }
+        }
+        Cmd::Sendplan { .. } => {
+            if json_bool(&v, &["ok"]) == Some(true) {
+                let requested = json_i64(&v, &["requested_outputs"]);
+                let fits = json_bool(&v, &["requested_outputs_fit"]).unwrap_or(true);
+                let max_outputs = json_i64(&v, &["max_outputs"]).unwrap_or(0);
+                let mut lines = vec![
+                    info_line(format!("amount per payout: {}", amount_text(&v, "amount", "amount_dut"))),
+                    info_line(format!("fee per payout: {}", amount_text(&v, "fee", "fee_dut"))),
+                    info_line(format!("need per payout: {}", amount_text(&v, "need", "need_dut"))),
+                    info_line(format!("max confirmed payouts now: {max_outputs}")),
+                    info_line(format!(
+                        "spendable now: {} across {} utxo(s)",
+                        amount_text(&v, "spendable_balance", "spendable_balance_dut"),
+                        json_i64(&v, &["spendable_utxos"]).unwrap_or(0)
+                    )),
+                ];
+                if let Some(req) = requested {
+                    lines.push(info_line(format!(
+                        "requested payouts: {} ({})",
+                        req,
+                        if fits { "fits" } else { "would exhaust confirmed utxos" }
+                    )));
+                }
+                if !fits {
+                    let failure = json_field(&v, &["failure"]).cloned().unwrap_or_else(|| json!({}));
+                    lines.push(wait_line(format!(
+                        "failure detail: {}",
+                        json_str(&failure, &["detail"]).unwrap_or("confirmed_spendable_utxos_exhausted_or_reserved")
+                    )));
+                    lines.push(wait_line(format!(
+                        "pending send/change: {} / {}",
+                        amount_text(&failure, "pending_send", "pending_send_dut"),
+                        amount_text(&failure, "pending_change", "pending_change_dut")
+                    )));
+                }
+                lines.join("\n")
             } else {
                 body.to_string()
             }
@@ -667,7 +932,11 @@ fn resolve_wallet_path(args: &Args, wallet: &str) -> String {
     }
 
     // If caller provided an explicit path, keep it.
-    if w.contains('/') {
+    let is_windows_abs = w.len() >= 3
+        && w.as_bytes()[1] == b':'
+        && matches!(w.as_bytes()[2], b'\\' | b'/');
+    let is_unc = w.starts_with("\\\\");
+    if w.contains('/') || w.contains('\\') || is_windows_abs || is_unc {
         return w;
     }
 
@@ -795,4 +1064,133 @@ fn decode_chunked_body(body: &str) -> Result<String, String> {
     }
 
     Ok(decoded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        amount_text, format_response, history_amount_and_fee, resolve_wallet_path, Args, Cmd,
+    };
+    use clap::Parser;
+    use serde_json::json;
+
+    fn args() -> Args {
+        Args {
+            testnet: true,
+            stagenet: false,
+            rpc: String::new(),
+            cmd: Cmd::Health,
+        }
+    }
+
+    #[test]
+    fn resolve_wallet_path_keeps_windows_absolute_paths() {
+        let args = args();
+        let path = r"C:\Dutafinal\runtime-e2e\wallet-testnet\pooltest.db";
+        assert_eq!(resolve_wallet_path(&args, path), path);
+    }
+
+    #[test]
+    fn resolve_wallet_path_keeps_forward_slash_absolute_paths() {
+        let args = args();
+        let path = "C:/Dutafinal/runtime-e2e/wallet-testnet/pooltest.db";
+        assert_eq!(resolve_wallet_path(&args, path), path);
+    }
+
+    #[test]
+    fn history_amount_and_fee_shows_internal_move_fee() {
+        let item = json!({
+            "category": "move",
+            "amount_dut": 0,
+            "fee_dut": 10000
+        });
+        let (amount_text, fee_text) = history_amount_and_fee(&item);
+        assert_eq!(amount_text, "0 DUTA");
+        assert_eq!(fee_text.as_deref(), Some("fee 0.0001 DUTA"));
+    }
+
+    #[test]
+    fn amount_text_formats_raw_dut_as_display_unit() {
+        let item = json!({
+            "amount_dut": 1,
+            "unit": "DUTA",
+            "base_unit": "dut",
+            "decimals": 8
+        });
+        assert_eq!(amount_text(&item, "amount", "amount_dut"), "0.00000001 DUTA");
+    }
+
+    #[test]
+    fn amount_text_prefers_display_amount_for_getbalance_shape() {
+        let item = json!({
+            "amount": "598",
+            "amount_dut": 59800000000i64,
+            "unit": "DUTA",
+            "base_unit": "dut",
+            "decimals": 8
+        });
+        assert_eq!(amount_text(&item, "amount", "amount_dut"), "598 DUTA");
+    }
+
+    #[test]
+    fn getbalance_uses_balance_and_spendable_fields() {
+        let out = format_response(
+            &Cmd::Getbalance,
+            &json!({
+                "balance": "18720.76996788",
+                "balance_dut": 1872076996788i64,
+                "spendable": "15960.76996788",
+                "spendable_dut": 1596076996788i64,
+                "reserved": "0",
+                "reserved_dut": 0,
+                "pending_send": "0",
+                "pending_send_dut": 0,
+                "pending_change": "0",
+                "pending_change_dut": 0,
+                "height": 407,
+                "utxos": 407,
+                "pending_txs": 0,
+                "unit": "DUTA",
+                "base_unit": "dut",
+                "decimals": 8
+            })
+            .to_string(),
+        );
+        assert!(out.contains("balance: 18720.76996788 DUTA"));
+        assert!(out.contains("spendable: 15960.76996788 DUTA"));
+    }
+
+    #[test]
+    fn gettransaction_alias_maps_to_tx_command() {
+        let parsed = Args::try_parse_from([
+            "duta-wallet-cli",
+            "gettransaction",
+            "abcd1234",
+        ])
+        .expect("gettransaction alias should parse");
+        match parsed.cmd {
+            Cmd::Tx { txid } => assert_eq!(txid, "abcd1234"),
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn listtransactions_alias_maps_to_history_command() {
+        let parsed = Args::try_parse_from([
+            "duta-wallet-cli",
+            "listtransactions",
+            "--count",
+            "25",
+            "--skip",
+            "5",
+        ])
+        .expect("listtransactions alias should parse");
+        match parsed.cmd {
+            Cmd::History { count, skip } => {
+                assert_eq!(count, 25);
+                assert_eq!(skip, 5);
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
 }

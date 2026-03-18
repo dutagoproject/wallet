@@ -4,6 +4,13 @@
 
 It contains encrypted wallet storage, wallet RPC, mnemonic and recovery handling, passphrase management, and wallet-side send and sync logic.
 
+Amount model in this repository:
+
+- display unit: `DUTA`
+- base unit: `dut`
+- precision: `8` decimals
+- raw RPC values use `*_dut`
+
 Current release line: `1.0.0`
 
 Website: https://dutago.xyz

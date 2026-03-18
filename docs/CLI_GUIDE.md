@@ -14,6 +14,18 @@ This guide is for people who want to use the DUTA wallet daemon and CLI without 
 - `dutawalletd` runs the wallet service
 - `duta-wallet-cli` talks to that wallet service
 
+## Amount model
+
+- display-facing amounts use `DUTA`
+- consensus and storage use integer `dut`
+- display fields such as `amount`, `balance`, `fee`, and `change` are formatted in `DUTA`
+- raw fields are exposed as `*_dut`
+- unit metadata is exposed as:
+  - `unit = DUTA`
+  - `display_unit = DUTA`
+  - `base_unit = dut`
+  - `decimals = 8`
+
 In normal use, start the wallet daemon first, then talk to it from the CLI or your own RPC client.
 
 ## Start the wallet daemon
@@ -57,13 +69,13 @@ Testnet default wallet RPC:
 Create a wallet:
 
 ```bash
-./duta-wallet-cli createwallet --wallet-path /srv/duta/wallet/mainnet/alice.db --passphrase YOUR_PASS
+./duta-wallet-cli createwallet /srv/duta/wallet/mainnet/alice.db --passphrase YOUR_PASS
 ```
 
 Open a wallet:
 
 ```bash
-./duta-wallet-cli open --wallet-path /srv/duta/wallet/mainnet/alice.db --passphrase YOUR_PASS
+./duta-wallet-cli open /srv/duta/wallet/mainnet/alice.db
 ```
 
 Get the current address:
@@ -75,7 +87,7 @@ Get the current address:
 Get the current balance:
 
 ```bash
-./duta-wallet-cli balance
+./duta-wallet-cli getbalance
 ```
 
 Unlock the wallet:
@@ -87,14 +99,22 @@ Unlock the wallet:
 Send funds:
 
 ```bash
-./duta-wallet-cli send --to DESTINATION_ADDRESS --amount 1.25 --passphrase YOUR_PASS
+./duta-wallet-cli send DESTINATION_ADDRESS 1.25
 ```
 
 If your wallet RPC uses a non-default port:
 
 ```bash
-./duta-wallet-cli --rpc 127.0.0.1:19084 balance
+./duta-wallet-cli --rpc 127.0.0.1:19084 getbalance
 ```
+
+## Reading balance and send output
+
+- `getbalance` returns display-layer `DUTA` in `amount`
+- raw integer spendable value is `amount_dut`
+- `send` returns display-layer `amount`, `fee`, and `change`
+- raw integer values are `amount_dut`, `fee_dut`, and `change_dut`
+- automation should prefer `*_dut`
 
 ## Good habits
 

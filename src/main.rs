@@ -1347,6 +1347,7 @@ mod tests {
         Args, Cmd, validate_wallet_state_addresses, wallet_rpc_settings, PidFileGuard, Utxo,
         WalletState,
     };
+    use crate::{PendingInput, PendingTx, ReservedInput};
     use clap::Parser;
     use duta_core::address::{pkh_from_pubkey, pkh_to_address_for_network};
     use duta_core::netparams::{Conf, Network};
@@ -1503,6 +1504,80 @@ mod tests {
 
         let err = load_wallet_db_to_state(&path).unwrap_err();
         assert_eq!(err, "wallet_primary_address_unknown");
+    }
+
+    #[test]
+    fn load_wallet_db_to_state_restores_pending_and_reserved_runtime_state() {
+        let mut p = std::env::temp_dir();
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        p.push(format!("duta-wallet-runtime-state-{}.db", uniq));
+        let path = p.to_string_lossy().to_string();
+
+        let db = WalletDb::create_new(&path, "strong-pass-123", &[9u8; 32], 1).unwrap();
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let pubkey_hex = hex::encode(signing_key.verifying_key().to_bytes());
+        let mut ent = [0u8; 32];
+        ent.copy_from_slice(&[9u8; 32]);
+        let addr = pkh_to_address_for_network(
+            Network::Mainnet,
+            &pkh_from_pubkey(signing_key.verifying_key().as_bytes()),
+        );
+        db.insert_key_with_meta_atomic(
+            &addr,
+            &pubkey_hex,
+            &ent,
+            "strong-pass-123",
+            Some(1),
+            Some(addr.as_str()),
+            None,
+        )
+        .unwrap();
+
+        let utxos = vec![Utxo {
+            txid: "aa".repeat(32),
+            vout: 0,
+            value: 4_600_000_000,
+            address: addr.clone(),
+            height: 70,
+            coinbase: true,
+        }];
+        let pending = vec![PendingTx {
+            txid: "bb".repeat(32),
+            category: "send".to_string(),
+            amount: 100_000_001,
+            fee: 10_000,
+            change: 4_499_989_999,
+            timestamp: 1_700_000_000,
+            details: vec![],
+            spent_inputs: vec![PendingInput {
+                txid: "aa".repeat(32),
+                vout: 0,
+            }],
+        }];
+        let reserved = vec![ReservedInput {
+            txid: "aa".repeat(32),
+            vout: 0,
+            timestamp: 1_700_000_001,
+        }];
+        db.update_full_state(&utxos, 77, &pending, &reserved).unwrap();
+        drop(db);
+
+        let ws = load_wallet_db_to_state(&path).unwrap();
+        assert_eq!(ws.last_sync_height, 77);
+        assert_eq!(ws.utxos.len(), 1);
+        assert_eq!(ws.pending_txs.len(), 1);
+        assert_eq!(ws.pending_txs[0].txid, "bb".repeat(32));
+        assert_eq!(ws.pending_txs[0].spent_inputs.len(), 1);
+        assert_eq!(ws.pending_txs[0].spent_inputs[0].txid, "aa".repeat(32));
+        assert_eq!(ws.reserved_inputs.len(), 1);
+        assert_eq!(ws.reserved_inputs[0].txid, "aa".repeat(32));
+        assert!(ws.keys.is_empty());
+        assert!(ws.locked);
+        assert!(ws.is_db);
+        assert_eq!(ws.primary_address, addr);
     }
 
     #[test]

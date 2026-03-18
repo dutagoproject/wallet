@@ -160,6 +160,11 @@ impl WalletDb {
         )
         .map_err(|e| format!("db_meta_write_failed: {e}"))?;
         tx.execute(
+            "INSERT OR REPLACE INTO meta(k,v) VALUES('reserved_inputs_json', ?1)",
+            params![b"[]".to_vec()],
+        )
+        .map_err(|e| format!("db_meta_write_failed: {e}"))?;
+        tx.execute(
             "INSERT OR REPLACE INTO meta(k,v) VALUES('last_sync_height', ?1)",
             params![0i64],
         )
@@ -506,8 +511,11 @@ impl WalletDb {
         &self,
         utxos: &[crate::Utxo],
         last_sync_height: i64,
+        reserved_inputs: &[crate::ReservedInput],
     ) -> Result<(), String> {
         let body = serde_json::to_vec(utxos).map_err(|e| format!("db_utxos_encode_failed: {e}"))?;
+        let reserved_body = serde_json::to_vec(reserved_inputs)
+            .map_err(|e| format!("db_reserved_inputs_encode_failed: {e}"))?;
         self.conn
             .execute("BEGIN IMMEDIATE TRANSACTION", [])
             .map_err(|e| format!("db_tx_begin_failed: {e}"))?;
@@ -523,6 +531,12 @@ impl WalletDb {
                 .execute(
                     "INSERT OR REPLACE INTO meta(k,v) VALUES('last_sync_height', ?1)",
                     params![last_sync_height],
+                )
+                .map_err(|e| format!("db_meta_write_failed: {e}"))?;
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO meta(k,v) VALUES('reserved_inputs_json', ?1)",
+                    params![reserved_body],
                 )
                 .map_err(|e| format!("db_meta_write_failed: {e}"))?;
             self.conn
@@ -576,6 +590,19 @@ impl WalletDb {
         serde_json::from_slice(&raw).map_err(|e| format!("db_pending_txs_invalid: {e}"))
     }
 
+    pub(crate) fn read_reserved_inputs(&self) -> Result<Vec<crate::ReservedInput>, String> {
+        let raw: Vec<u8> = match self.conn.query_row(
+            "SELECT v FROM meta WHERE k='reserved_inputs_json'",
+            [],
+            |r| r.get(0),
+        ) {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(Vec::new()),
+            Err(e) => return Err(format!("db_meta_read_failed: {e}")),
+        };
+        serde_json::from_slice(&raw).map_err(|e| format!("db_reserved_inputs_invalid: {e}"))
+    }
+
     pub(crate) fn update_pending_txs(&self, pending_txs: &[crate::PendingTx]) -> Result<(), String> {
         let body = serde_json::to_vec(pending_txs)
             .map_err(|e| format!("db_pending_txs_encode_failed: {e}"))?;
@@ -593,11 +620,14 @@ impl WalletDb {
         utxos: &[crate::Utxo],
         last_sync_height: i64,
         pending_txs: &[crate::PendingTx],
+        reserved_inputs: &[crate::ReservedInput],
     ) -> Result<(), String> {
         let utxos_body =
             serde_json::to_vec(utxos).map_err(|e| format!("db_utxos_encode_failed: {e}"))?;
         let pending_body = serde_json::to_vec(pending_txs)
             .map_err(|e| format!("db_pending_txs_encode_failed: {e}"))?;
+        let reserved_body = serde_json::to_vec(reserved_inputs)
+            .map_err(|e| format!("db_reserved_inputs_encode_failed: {e}"))?;
         self.conn
             .execute("BEGIN IMMEDIATE TRANSACTION", [])
             .map_err(|e| format!("db_tx_begin_failed: {e}"))?;
@@ -619,6 +649,12 @@ impl WalletDb {
                 .execute(
                     "INSERT OR REPLACE INTO meta(k,v) VALUES('pending_txs_json', ?1)",
                     params![pending_body],
+                )
+                .map_err(|e| format!("db_meta_write_failed: {e}"))?;
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO meta(k,v) VALUES('reserved_inputs_json', ?1)",
+                    params![reserved_body],
                 )
                 .map_err(|e| format!("db_meta_write_failed: {e}"))?;
             self.conn
@@ -704,7 +740,7 @@ mod tests {
             vout: 1,
         }];
 
-        db.update_sync_state(&utxos, 44).unwrap();
+        db.update_sync_state(&utxos, 44, &[]).unwrap();
 
         let reopened = WalletDb::open(&path).unwrap();
         assert_eq!(reopened.read_last_sync_height().unwrap(), 44);
@@ -745,6 +781,26 @@ mod tests {
     }
 
     #[test]
+    fn reserved_inputs_round_trip_through_db_meta() {
+        let path = temp_wallet_path("reserved-inputs");
+        let db = WalletDb::create_new(&path, "strong-pass-123", &[9u8; 32], 1).unwrap();
+        let reserved = vec![crate::ReservedInput {
+            txid: "aa".repeat(32),
+            vout: 7,
+            timestamp: 1234,
+        }];
+
+        db.update_sync_state(&[], 0, &reserved).unwrap();
+
+        let reopened = WalletDb::open(&path).unwrap();
+        let got = reopened.read_reserved_inputs().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].txid, "aa".repeat(32));
+        assert_eq!(got[0].vout, 7);
+        assert_eq!(got[0].timestamp, 1234);
+    }
+
+    #[test]
     fn update_full_state_writes_utxos_height_and_pending_together() {
         let path = temp_wallet_path("full-state");
         let db = WalletDb::create_new(&path, "strong-pass-123", &[8u8; 32], 1).unwrap();
@@ -770,7 +826,13 @@ mod tests {
             }],
         }];
 
-        db.update_full_state(&utxos, 77, &pending).unwrap();
+        let reserved = vec![crate::ReservedInput {
+            txid: "11".repeat(32),
+            vout: 5,
+            timestamp: 999,
+        }];
+
+        db.update_full_state(&utxos, 77, &pending, &reserved).unwrap();
 
         let reopened = WalletDb::open(&path).unwrap();
         assert_eq!(reopened.read_last_sync_height().unwrap(), 77);
@@ -781,5 +843,8 @@ mod tests {
         assert_eq!(got_pending.len(), 1);
         assert_eq!(got_pending[0].txid, "ef".repeat(32));
         assert_eq!(got_pending[0].spent_inputs[0].txid, "cd".repeat(32));
+        let got_reserved = reopened.read_reserved_inputs().unwrap();
+        assert_eq!(got_reserved.len(), 1);
+        assert_eq!(got_reserved[0].txid, "11".repeat(32));
     }
 }

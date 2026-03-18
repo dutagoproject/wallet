@@ -189,6 +189,7 @@ pub(crate) struct WalletState {
     pub(crate) pubkeys: BTreeMap<String, String>,
     pub(crate) utxos: Vec<Utxo>,
     pub(crate) pending_txs: Vec<PendingTx>,
+    pub(crate) reserved_inputs: Vec<ReservedInput>,
     pub(crate) last_sync_height: i64,
     pub(crate) seed_hex: Option<String>,
     pub(crate) next_index: u32,
@@ -241,6 +242,16 @@ pub(crate) struct PendingInput {
     pub(crate) txid: String,
     #[serde(default)]
     pub(crate) vout: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ReservedInput {
+    #[serde(default)]
+    pub(crate) txid: String,
+    #[serde(default)]
+    pub(crate) vout: u32,
+    #[serde(default)]
+    pub(crate) timestamp: i64,
 }
 
 static WALLET: OnceLock<Mutex<Option<WalletState>>> = OnceLock::new();
@@ -716,6 +727,7 @@ pub(crate) fn load_wallet_db_to_state(path: &str) -> Result<WalletState, String>
     let next_index = db.read_next_index()?.max(0) as u32;
     let utxos = db.read_utxos()?;
     let pending_txs = db.read_pending_txs()?;
+    let reserved_inputs = db.read_reserved_inputs()?;
     let last_sync_height = db.read_last_sync_height()?;
     let mut primary_address = db.read_primary_address()?;
     if primary_address.is_empty() {
@@ -732,6 +744,7 @@ pub(crate) fn load_wallet_db_to_state(path: &str) -> Result<WalletState, String>
         pubkeys,
         utxos,
         pending_txs,
+        reserved_inputs,
         last_sync_height,
         seed_hex: None,
         next_index,
@@ -843,12 +856,17 @@ fn validate_wallet_state_addresses(ws: &WalletState) -> Result<(), String> {
 
     Ok(())
 }
-pub(crate) fn save_wallet_sync_state(path: &str, utxos: &[Utxo], last_sync_height: i64) -> Result<(), String> {
+pub(crate) fn save_wallet_sync_state(
+    path: &str,
+    utxos: &[Utxo],
+    last_sync_height: i64,
+    reserved_inputs: &[ReservedInput],
+) -> Result<(), String> {
     if !(path.ends_with(".db") || path.ends_with(".dat")) {
         return Err("legacy_plaintext_wallet_disabled_use_db_wallet".to_string());
     }
     let db = walletdb::WalletDb::open(path)?;
-    db.update_sync_state(utxos, last_sync_height)
+    db.update_sync_state(utxos, last_sync_height, reserved_inputs)
 }
 
 pub(crate) fn save_wallet_pending_txs(path: &str, pending_txs: &[PendingTx]) -> Result<(), String> {
@@ -864,12 +882,13 @@ pub(crate) fn save_wallet_full_state(
     utxos: &[Utxo],
     last_sync_height: i64,
     pending_txs: &[PendingTx],
+    reserved_inputs: &[ReservedInput],
 ) -> Result<(), String> {
     if !(path.ends_with(".db") || path.ends_with(".dat")) {
         return Err("legacy_plaintext_wallet_disabled_use_db_wallet".to_string());
     }
     let db = walletdb::WalletDb::open(path)?;
-    db.update_full_state(utxos, last_sync_height, pending_txs)
+    db.update_full_state(utxos, last_sync_height, pending_txs, reserved_inputs)
 }
 
 fn start_wallet_rpc(rpc_addr: String, daemon_rpc_port: u16, net: String) -> Result<(), String> {
@@ -1360,6 +1379,7 @@ mod tests {
                 vout: 0,
             }],
             pending_txs: Vec::new(),
+            reserved_inputs: Vec::new(),
             last_sync_height: 1,
             seed_hex: Some("deadbeef".to_string()),
             next_index: 1,
@@ -1415,7 +1435,7 @@ mod tests {
 
     #[test]
     fn save_wallet_sync_state_rejects_plaintext_wallet_paths() {
-        let err = save_wallet_sync_state("wallet.json", &[], 0).unwrap_err();
+        let err = save_wallet_sync_state("wallet.json", &[], 0, &[]).unwrap_err();
         assert_eq!(err, "legacy_plaintext_wallet_disabled_use_db_wallet");
     }
 

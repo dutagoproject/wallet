@@ -176,6 +176,7 @@ mod tests {
             pubkeys: BTreeMap::new(),
             utxos: Vec::new(),
             pending_txs: Vec::new(),
+            reserved_inputs: Vec::new(),
             last_sync_height: 0,
             seed_hex: None,
             next_index: 0,
@@ -200,6 +201,7 @@ mod tests {
             pubkeys,
             utxos: Vec::new(),
             pending_txs: Vec::new(),
+            reserved_inputs: Vec::new(),
             last_sync_height: 0,
             seed_hex: None,
             next_index: 0,
@@ -219,6 +221,7 @@ mod tests {
             pubkeys: BTreeMap::new(),
             utxos: Vec::new(),
             pending_txs: Vec::new(),
+            reserved_inputs: Vec::new(),
             last_sync_height: 0,
             seed_hex: None,
             next_index: 0,
@@ -466,6 +469,97 @@ mod tests {
         assert!(spent.contains(&("dd".repeat(32), 4)));
         assert_eq!(spent.len(), 2);
     }
+
+    #[test]
+    fn selected_inputs_conflict_with_reserved_detects_pending_mempool_conflict() {
+        let selected = vec![OwnedInput {
+            utxo: super::super::Utxo {
+                value: 46,
+                height: 100,
+                coinbase: false,
+                address: "dut1owned".to_string(),
+                txid: "aa".repeat(32),
+                vout: 1,
+            },
+            signer: WalletSigner {
+                addr: "dut1owned".to_string(),
+                sk_hex: "11".repeat(32),
+                pub_hex: "22".repeat(32),
+            },
+        }];
+        let reserved = std::collections::HashSet::from([("aa".repeat(32), 1u32)]);
+        let conflicts = super::selected_inputs_conflict_with_reserved(&selected, &reserved);
+        assert_eq!(conflicts, vec![("aa".repeat(32), 1u32)]);
+    }
+
+    #[test]
+    fn unconfirmed_change_is_not_spendable() {
+        let unconfirmed_change = super::super::Utxo {
+            value: 44,
+            height: 0,
+            coinbase: false,
+            address: "dut1change".to_string(),
+            txid: "ee".repeat(32),
+            vout: 1,
+        };
+        assert!(!super::is_wallet_utxo_spendable(&unconfirmed_change, 250));
+    }
+
+    #[test]
+    fn sequential_payouts_reserve_inputs_for_followup_send() {
+        let mut pending = Vec::new();
+        super::record_pending_send(
+            &mut pending,
+            "tx1",
+            "dut1dest1",
+            5,
+            1,
+            40,
+            &[super::super::PendingInput {
+                txid: "aa".repeat(32),
+                vout: 0,
+            }],
+        );
+        super::record_pending_send(
+            &mut pending,
+            "tx2",
+            "dut1dest2",
+            6,
+            1,
+            30,
+            &[super::super::PendingInput {
+                txid: "bb".repeat(32),
+                vout: 1,
+            }],
+        );
+        let reserved = super::pending_reserved_outpoints(&pending);
+        assert!(reserved.contains(&("aa".repeat(32), 0)));
+        assert!(reserved.contains(&("bb".repeat(32), 1)));
+        assert_eq!(reserved.len(), 2);
+    }
+
+    #[test]
+    fn sync_then_send_keeps_pending_inputs_reserved() {
+        let mut pending = vec![super::super::PendingTx {
+            txid: "tx-pending".to_string(),
+            category: "send".to_string(),
+            amount: -7,
+            fee: 1,
+            change: 0,
+            timestamp: 100,
+            details: Vec::new(),
+            spent_inputs: vec![super::super::PendingInput {
+                txid: "cc".repeat(32),
+                vout: 2,
+            }],
+        }];
+        let confirmed: Vec<(String, i64, i64, String, i64, i64, bool, Vec<serde_json::Value>)> =
+            Vec::new();
+        let changed = super::prune_confirmed_pending_txs(&mut pending, &confirmed);
+        assert!(!changed);
+        let reserved = super::pending_reserved_outpoints(&pending);
+        assert!(reserved.contains(&("cc".repeat(32), 2)));
+    }
 }
 
 fn net_from_name(net: &str) -> duta_core::netparams::Network {
@@ -700,6 +794,16 @@ fn should_probe_daemon_utxo_presence(u: &super::Utxo, cur_h: i64) -> bool {
     u.height <= cur_h
 }
 
+fn is_wallet_utxo_spendable(u: &super::Utxo, cur_h: i64) -> bool {
+    if u.height <= 0 {
+        return false;
+    }
+    if u.coinbase {
+        return (cur_h - u.height) >= 60;
+    }
+    true
+}
+
 fn tx_output_address(ov: &serde_json::Value) -> &str {
     ov.get("address")
         .and_then(|x| x.as_str())
@@ -778,6 +882,102 @@ fn pending_reserved_outpoints(pending: &[super::PendingTx]) -> HashSet<(String, 
         .collect()
 }
 
+fn explicit_reserved_outpoints(reserved_inputs: &[super::ReservedInput]) -> HashSet<(String, u32)> {
+    reserved_inputs
+        .iter()
+        .filter(|i| !i.txid.is_empty())
+        .map(|i| (i.txid.clone(), i.vout))
+        .collect()
+}
+
+fn selected_inputs_conflict_with_reserved(
+    selected: &[OwnedInput],
+    reserved_outpoints: &HashSet<(String, u32)>,
+) -> Vec<(String, u32)> {
+    selected
+        .iter()
+        .filter_map(|input| {
+            let key = (input.utxo.txid.clone(), input.utxo.vout);
+            reserved_outpoints.contains(&key).then_some(key)
+        })
+        .collect()
+}
+
+fn append_selected_reserved_inputs(
+    reserved_inputs: &mut Vec<super::ReservedInput>,
+    selected: &[OwnedInput],
+    now_secs: i64,
+) {
+    let mut existing = explicit_reserved_outpoints(reserved_inputs);
+    for input in selected {
+        let key = (input.utxo.txid.clone(), input.utxo.vout);
+        if existing.insert(key.clone()) {
+            reserved_inputs.push(super::ReservedInput {
+                txid: key.0,
+                vout: key.1,
+                timestamp: now_secs,
+            });
+        }
+    }
+}
+
+fn release_selected_reserved_inputs(
+    reserved_inputs: &mut Vec<super::ReservedInput>,
+    selected: &[OwnedInput],
+) {
+    let selected_keys: HashSet<(String, u32)> = selected
+        .iter()
+        .map(|input| (input.utxo.txid.clone(), input.utxo.vout))
+        .collect();
+    reserved_inputs.retain(|input| !selected_keys.contains(&(input.txid.clone(), input.vout)));
+}
+
+fn persist_runtime_reserved_inputs(
+    wallet_path: &str,
+    utxos: &[super::Utxo],
+    cur_h: i64,
+    reserved_inputs: &[super::ReservedInput],
+) -> Result<(), String> {
+    {
+        let mut g = super::wallet_lock_or_recover();
+        if let Some(ws) = g.as_mut() {
+            ws.utxos = utxos.to_vec();
+            ws.last_sync_height = cur_h;
+            ws.reserved_inputs = reserved_inputs.to_vec();
+        }
+    }
+    super::save_wallet_sync_state(wallet_path, utxos, cur_h, reserved_inputs)
+}
+
+fn prune_stale_reserved_inputs(
+    reserved_inputs: &mut Vec<super::ReservedInput>,
+    current_utxos: &[super::Utxo],
+    pending_txs: &[super::PendingTx],
+    mempool_reserved: &HashSet<(String, u32)>,
+    now_secs: i64,
+) -> bool {
+    const RESERVED_INPUT_TTL_SECS: i64 = 120;
+    let before = reserved_inputs.len();
+    let pending_reserved = pending_reserved_outpoints(pending_txs);
+    reserved_inputs.retain(|input| {
+        if input.txid.is_empty() {
+            return false;
+        }
+        let key = (input.txid.clone(), input.vout);
+        if pending_reserved.contains(&key) {
+            return false;
+        }
+        if mempool_reserved.contains(&key) {
+            return true;
+        }
+        let still_present = current_utxos
+            .iter()
+            .any(|utxo| utxo.txid == input.txid && utxo.vout == input.vout);
+        still_present && now_secs.saturating_sub(input.timestamp) <= RESERVED_INPUT_TTL_SECS
+    });
+    before != reserved_inputs.len()
+}
+
 fn collect_mempool_txids(v: &serde_json::Value) -> HashSet<String> {
     v.get("txids")
         .and_then(|x| x.as_array())
@@ -837,11 +1037,20 @@ fn refresh_wallet_utxos_after_submit_conflict(
     wallet_path: &str,
     addrs: &[String],
     daemon_rpc_port: u16,
+    current_utxos: &[super::Utxo],
+    last_sync_height: i64,
 ) -> Result<(), String> {
     if addrs.is_empty() {
         return Ok(());
     }
-    let (cur_h, utxos) = rebuild_wallet_utxos_via_blocks_from(addrs, daemon_rpc_port)?;
+    let (cur_h, utxos) =
+        refresh_wallet_utxos_runtime(addrs, daemon_rpc_port, current_utxos, last_sync_height)?;
+    let reserved_inputs = {
+        let g = super::wallet_lock_or_recover();
+        g.as_ref()
+            .map(|ws| ws.reserved_inputs.clone())
+            .unwrap_or_default()
+    };
     {
         let mut g = super::wallet_lock_or_recover();
         if let Some(ws) = g.as_mut() {
@@ -849,7 +1058,7 @@ fn refresh_wallet_utxos_after_submit_conflict(
             ws.last_sync_height = cur_h;
         }
     }
-    super::save_wallet_sync_state(wallet_path, &utxos, cur_h)
+    super::save_wallet_sync_state(wallet_path, &utxos, cur_h, &reserved_inputs)
 }
 
 fn sync_pending_txs_with_chain_and_mempool(
@@ -905,6 +1114,20 @@ fn pending_mempool_state_or_err(
 
 fn pending_mempool_visibility_required(pending_txs: &[super::PendingTx]) -> bool {
     !pending_txs.is_empty()
+}
+
+fn send_mempool_state_or_err(
+    wallet_path: &str,
+    daemon_rpc_port: u16,
+) -> Result<(HashSet<String>, HashSet<(String, u32)>), String> {
+    daemon_mempool_state(daemon_rpc_port).map_err(|e| {
+        wwlog!(
+            "wallet_rpc: mempool_send_probe_failed wallet={} err={}",
+            wallet_public_name(wallet_path),
+            e
+        );
+        format!("daemon_mempool_unreachable:{e}")
+    })
 }
 
 fn record_pending_send(
@@ -1665,7 +1888,7 @@ fn daemon_tip_height_with_retry(daemon_rpc_port: u16, fallback_height: i64) -> R
 
 fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<(i64, i64, i64, i64, usize), String> {
     // Snapshot wallet state (avoid holding lock during daemon RPC).
-    let (wallet_path, addrs, mut utxos, pending_txs, last_sync_height) = {
+    let (wallet_path, addrs, mut utxos, pending_txs, mut reserved_inputs, last_sync_height) = {
         let g = super::wallet_lock_or_recover();
         let ws = g.as_ref().ok_or_else(|| "wallet_not_open".to_string())?;
         (
@@ -1677,6 +1900,7 @@ fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<(i64, i64, i64, i64, 
             },
             ws.utxos.clone(),
             ws.pending_txs.clone(),
+            ws.reserved_inputs.clone(),
             ws.last_sync_height,
         )
     };
@@ -1690,7 +1914,9 @@ fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<(i64, i64, i64, i64, 
     let mut reserved_outpoints = pending_reserved_outpoints(&active_pending);
     match pending_mempool_state_or_err(&wallet_path, &active_pending, daemon_rpc_port)? {
         Some((mempool_txids, mempool_reserved)) => {
+            let mut state_changed = false;
             if prune_inactive_pending_txs(&mut active_pending, &mempool_txids, now_secs) {
+                state_changed = true;
                 {
                     let mut g = super::wallet_lock_or_recover();
                     if let Some(ws) = g.as_mut() {
@@ -1705,7 +1931,39 @@ fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<(i64, i64, i64, i64, 
                     );
                 }
             }
+            if prune_stale_reserved_inputs(
+                &mut reserved_inputs,
+                &utxos,
+                &active_pending,
+                &mempool_reserved,
+                now_secs,
+            ) {
+                state_changed = true;
+            }
+            if state_changed {
+                {
+                    let mut g = super::wallet_lock_or_recover();
+                    if let Some(ws) = g.as_mut() {
+                        ws.pending_txs = active_pending.clone();
+                        ws.reserved_inputs = reserved_inputs.clone();
+                    }
+                }
+                if let Err(e) = super::save_wallet_full_state(
+                    &wallet_path,
+                    &utxos,
+                    last_sync_height,
+                    &active_pending,
+                    &reserved_inputs,
+                ) {
+                    wwlog!(
+                        "wallet_rpc: pending_or_reserved_reconcile_persist_failed wallet={} err={}",
+                        wallet_public_name(&wallet_path),
+                        e
+                    );
+                }
+            }
             reserved_outpoints = pending_reserved_outpoints(&active_pending);
+            reserved_outpoints.extend(explicit_reserved_outpoints(&reserved_inputs));
             reserved_outpoints.extend(mempool_reserved);
         }
         None => {}
@@ -1753,9 +2011,12 @@ fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<(i64, i64, i64, i64, 
                 if let Some(ws) = g.as_mut() {
                     ws.utxos = utxos.clone();
                     ws.last_sync_height = cur_h;
+                    ws.reserved_inputs = reserved_inputs.clone();
                 }
 
-                if let Err(e) = super::save_wallet_sync_state(&wallet_path, &utxos, cur_h) {
+                if let Err(e) =
+                    super::save_wallet_sync_state(&wallet_path, &utxos, cur_h, &reserved_inputs)
+                {
                     wwlog!(
                         "wallet_rpc: balance_sync_persist_failed wallet={} err={}",
                         wallet_public_name(&wallet_path),
@@ -1774,7 +2035,6 @@ fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<(i64, i64, i64, i64, 
         }
     }
 
-    const COINBASE_MATURITY: i64 = 60;
     let mut balance: i64 = 0;
     let mut spendable: i64 = 0;
     let mut immature: i64 = 0;
@@ -1788,15 +2048,13 @@ fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<(i64, i64, i64, i64, 
             if reserved {
                 continue;
             }
-            if (cur_h - u.height) >= COINBASE_MATURITY {
+            if is_wallet_utxo_spendable(u, cur_h) {
                 spendable += v;
             } else {
                 immature += v;
             }
-        } else {
-            if !reserved {
-                spendable += v;
-            }
+        } else if !reserved && is_wallet_utxo_spendable(u, cur_h) {
+            spendable += v;
         }
     }
 
@@ -2321,7 +2579,8 @@ pub(crate) fn handle_request(
                             "address": u.address,
                             "amount": u.value,
                             "confirmations": conf,
-                            "spendable": !(u.coinbase && conf < 60) && !reserved_outpoints.contains(&(u.txid.clone(), u.vout)),
+                            "spendable": is_wallet_utxo_spendable(u, cur_h)
+                                && !reserved_outpoints.contains(&(u.txid.clone(), u.vout)),
                             "coinbase": u.coinbase
                         }));
                     }
@@ -2694,6 +2953,7 @@ pub(crate) fn handle_request(
                 signers_by_addr,
                 utxos,
                 pending_txs,
+                reserved_inputs,
                 last_sync_height,
             ) = {
                 let g = super::wallet_lock_or_recover();
@@ -2754,6 +3014,7 @@ pub(crate) fn handle_request(
                             },
                             ws.utxos.clone(),
                             ws.pending_txs.clone(),
+                            ws.reserved_inputs.clone(),
                             ws.last_sync_height,
                         )
                     };
@@ -2784,14 +3045,12 @@ pub(crate) fn handle_request(
                         }
                     };
 
-                    {
-                        let mut g = super::wallet_lock_or_recover();
-                        if let Some(ws) = g.as_mut() {
-                            ws.utxos = utxos.clone();
-                            ws.last_sync_height = cur_h;
-                        }
-                    }
-                    if let Err(e) = super::save_wallet_sync_state(&wallet_path, &utxos, cur_h) {
+                    if let Err(e) = persist_runtime_reserved_inputs(
+                        &wallet_path,
+                        &utxos,
+                        cur_h,
+                        &reserved_inputs,
+                    ) {
                         wwlog!(
                             "wallet_rpc: send_refresh_persist_failed wallet={} err={}",
                             wallet_public_name(&wallet_path),
@@ -2800,7 +3059,6 @@ pub(crate) fn handle_request(
                     }
 
                     // Select spendable inputs.
-                    const COINBASE_MATURITY: i64 = 60;
                     const MAX_INPUTS: usize = 64;
                     const DUST_CHANGE: i64 = 1;
                     let mut selected = Vec::new();
@@ -2823,6 +3081,7 @@ pub(crate) fn handle_request(
                         .as_secs() as i64;
                     let mut active_pending = pending_txs.clone();
                     let mut reserved_outpoints = pending_reserved_outpoints(&active_pending);
+                    reserved_outpoints.extend(explicit_reserved_outpoints(&reserved_inputs));
                     match pending_mempool_state_or_err(&wallet_path, &active_pending, daemon_rpc_port) {
                         Ok(Some((mempool_txids, mempool_reserved))) => {
                             if prune_inactive_pending_txs(&mut active_pending, &mempool_txids, now_secs) {
@@ -2839,6 +3098,7 @@ pub(crate) fn handle_request(
                                 }
                             }
                             reserved_outpoints = pending_reserved_outpoints(&active_pending);
+                            reserved_outpoints.extend(explicit_reserved_outpoints(&reserved_inputs));
                             reserved_outpoints.extend(mempool_reserved);
                         }
                         Ok(None) => {}
@@ -2858,7 +3118,7 @@ pub(crate) fn handle_request(
                         .filter(|u| u.value > 0)
                         .filter(|u| !u.txid.is_empty())
                         .filter(|u| !reserved_outpoints.contains(&(u.txid.clone(), u.vout)))
-                        .filter(|u| !(u.coinbase && (cur_h - u.height) < COINBASE_MATURITY))
+                        .filter(|u| is_wallet_utxo_spendable(u, cur_h))
                     {
                         match resolve_owned_input(
                             daemon_rpc_port,
@@ -2929,6 +3189,48 @@ pub(crate) fn handle_request(
                                 "have": total_in,
                                 "fee": fee,
                                 "height": cur_h
+                            })
+                            .to_string(),
+                        );
+                        return;
+                    }
+
+                    let (_mempool_txids_pre_submit, mempool_reserved_pre_submit) =
+                        match send_mempool_state_or_err(&wallet_path, daemon_rpc_port) {
+                            Ok(state) => state,
+                            Err(e) => {
+                                super::respond_json(
+                                    request,
+                                    tiny_http::StatusCode(502),
+                                    json!({"error":"daemon_mempool_unreachable","detail":e})
+                                        .to_string(),
+                                );
+                                return;
+                            }
+                        };
+                    let pre_submit_conflicts =
+                        selected_inputs_conflict_with_reserved(&selected, &mempool_reserved_pre_submit);
+                    if !pre_submit_conflicts.is_empty() {
+                        if let Err(e) = refresh_wallet_utxos_after_submit_conflict(
+                            &wallet_path,
+                            &addrs,
+                            daemon_rpc_port,
+                            &utxos,
+                            last_sync_height.max(cur_h),
+                        ) {
+                            wwlog!(
+                                "wallet_rpc: send_presubmit_refresh_failed wallet={} err={}",
+                                wallet_public_name(&wallet_path),
+                                e
+                            );
+                        }
+                        super::respond_json(
+                            request,
+                            tiny_http::StatusCode(409),
+                            json!({
+                                "error":"input_conflict_before_submit",
+                                "detail":"selected_inputs_already_reserved_in_mempool",
+                                "conflicts": pre_submit_conflicts,
                             })
                             .to_string(),
                         );
@@ -3041,6 +3343,26 @@ pub(crate) fn handle_request(
                         }
                     };
 
+                    let mut reserved_inputs_after_select = reserved_inputs.clone();
+                    append_selected_reserved_inputs(
+                        &mut reserved_inputs_after_select,
+                        &selected,
+                        now_secs,
+                    );
+                    if let Err(e) = persist_runtime_reserved_inputs(
+                        &wallet_path,
+                        &utxos,
+                        cur_h,
+                        &reserved_inputs_after_select,
+                    ) {
+                        super::respond_json(
+                            request,
+                            tiny_http::StatusCode(500),
+                            json!({"error":"wallet_state_persist_failed","detail":e}).to_string(),
+                        );
+                        return;
+                    }
+
                     let resp_body = match super::http_post_local(
                         "127.0.0.1",
                         daemon_rpc_port,
@@ -3050,6 +3372,16 @@ pub(crate) fn handle_request(
                     ) {
                         Ok(b) => b,
                         Err(e) => {
+                            release_selected_reserved_inputs(
+                                &mut reserved_inputs_after_select,
+                                &selected,
+                            );
+                            let _ = persist_runtime_reserved_inputs(
+                                &wallet_path,
+                                &utxos,
+                                cur_h,
+                                &reserved_inputs_after_select,
+                            );
                             super::respond_json(
                                 request,
                                 tiny_http::StatusCode(502),
@@ -3062,6 +3394,16 @@ pub(crate) fn handle_request(
                     let resp_v: serde_json::Value = match serde_json::from_str(&resp_body) {
                         Ok(v) => v,
                         Err(e) => {
+                            release_selected_reserved_inputs(
+                                &mut reserved_inputs_after_select,
+                                &selected,
+                            );
+                            let _ = persist_runtime_reserved_inputs(
+                                &wallet_path,
+                                &utxos,
+                                cur_h,
+                                &reserved_inputs_after_select,
+                            );
                             let d = format!("daemon_invalid_json: {}", e);
                             super::respond_json(
                                 request,
@@ -3075,6 +3417,16 @@ pub(crate) fn handle_request(
                     if resp_v.get("ok").and_then(|x| x.as_bool()) != Some(true) {
                         // Pass through fee-floor errors as 422 so clients don't treat it as a gateway failure.
                         if resp_v.get("error").and_then(|x| x.as_str()) == Some("fee_too_low") {
+                            release_selected_reserved_inputs(
+                                &mut reserved_inputs_after_select,
+                                &selected,
+                            );
+                            let _ = persist_runtime_reserved_inputs(
+                                &wallet_path,
+                                &utxos,
+                                cur_h,
+                                &reserved_inputs_after_select,
+                            );
                             super::respond_json(
                                 request,
                                 tiny_http::StatusCode(422),
@@ -3086,10 +3438,22 @@ pub(crate) fn handle_request(
                             resp_v.get("error").and_then(|x| x.as_str()),
                             Some("input_not_found" | "double_spend")
                         ) {
+                            release_selected_reserved_inputs(
+                                &mut reserved_inputs_after_select,
+                                &selected,
+                            );
+                            let _ = persist_runtime_reserved_inputs(
+                                &wallet_path,
+                                &utxos,
+                                cur_h,
+                                &reserved_inputs_after_select,
+                            );
                             if let Err(e) = refresh_wallet_utxos_after_submit_conflict(
                                 &wallet_path,
                                 &addrs,
                                 daemon_rpc_port,
+                                &utxos,
+                                last_sync_height.max(cur_h),
                             ) {
                                 wwlog!(
                                     "wallet_rpc: send_conflict_refresh_failed wallet={} err={}",
@@ -3104,6 +3468,16 @@ pub(crate) fn handle_request(
                             );
                             return;
                         }
+                        release_selected_reserved_inputs(
+                            &mut reserved_inputs_after_select,
+                            &selected,
+                        );
+                        let _ = persist_runtime_reserved_inputs(
+                            &wallet_path,
+                            &utxos,
+                            cur_h,
+                            &reserved_inputs_after_select,
+                        );
                         super::respond_json(
                             request,
                             tiny_http::StatusCode(502),
@@ -3177,10 +3551,16 @@ pub(crate) fn handle_request(
                         );
                         pending
                     };
+                    release_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected);
 
                     // Persist to disk and update in-memory together.
-                    let persist_result =
-                        super::save_wallet_full_state(&wallet_path, &new_utxos, cur_h, &pending_after);
+                    let persist_result = super::save_wallet_full_state(
+                        &wallet_path,
+                        &new_utxos,
+                        cur_h,
+                        &pending_after,
+                        &reserved_inputs_after_select,
+                    );
 
                     {
                         let mut g = super::wallet_lock_or_recover();
@@ -3188,6 +3568,7 @@ pub(crate) fn handle_request(
                             ws.utxos = new_utxos.clone();
                             ws.last_sync_height = cur_h;
                             ws.pending_txs = pending_after.clone();
+                            ws.reserved_inputs = reserved_inputs_after_select.clone();
                         }
                     }
 
@@ -3700,6 +4081,7 @@ pub(crate) fn handle_request(
                     },
                     utxos: Vec::new(),
                     pending_txs: Vec::new(),
+                    reserved_inputs: Vec::new(),
                     last_sync_height: 0,
                     seed_hex: None,
                     next_index: 1,
@@ -3962,14 +4344,22 @@ pub(crate) fn handle_request(
                 }
             };
 
-            {
+            let reserved_inputs = {
                 let mut g = super::wallet_lock_or_recover();
                 if let Some(ws) = g.as_mut() {
                     ws.utxos = refreshed_utxos.clone();
                     ws.last_sync_height = cur_h;
+                    ws.reserved_inputs.clone()
+                } else {
+                    Vec::new()
                 }
-            }
-            if let Err(e) = super::save_wallet_sync_state(&wallet_path, &refreshed_utxos, cur_h) {
+            };
+            if let Err(e) = super::save_wallet_sync_state(
+                &wallet_path,
+                &refreshed_utxos,
+                cur_h,
+                &reserved_inputs,
+            ) {
                 wwlog!(
                     "wallet_rpc: address_balance_refresh_persist_failed wallet={} err={}",
                     wallet_public_name(&wallet_path),
@@ -3982,17 +4372,12 @@ pub(crate) fn handle_request(
                 .filter(|u| u.address == addr)
                 .collect();
 
-            const COINBASE_MATURITY: i64 = 60;
             let mut balance: i64 = 0;
             let mut spendable: i64 = 0;
             for u in utxos.iter() {
                 let v = u.value;
                 balance += v;
-                if u.coinbase {
-                    if (cur_h - u.height) >= COINBASE_MATURITY {
-                        spendable += v;
-                    }
-                } else {
+                if is_wallet_utxo_spendable(u, cur_h) {
                     spendable += v;
                 }
             }
@@ -4063,6 +4448,12 @@ pub(crate) fn handle_request(
             };
 
             let mut pending_txs = pending_txs;
+            let reserved_inputs = {
+                let g = super::wallet_lock_or_recover();
+                g.as_ref()
+                    .map(|ws| ws.reserved_inputs.clone())
+                    .unwrap_or_default()
+            };
             sync_pending_txs_with_chain_and_mempool(
                 &wallet_path,
                 &mut pending_txs,
@@ -4070,7 +4461,13 @@ pub(crate) fn handle_request(
                 daemon_rpc_port,
             );
 
-            if let Err(e) = super::save_wallet_full_state(&wallet_path, &utxos, cur_h, &pending_txs) {
+            if let Err(e) = super::save_wallet_full_state(
+                &wallet_path,
+                &utxos,
+                cur_h,
+                &pending_txs,
+                &reserved_inputs,
+            ) {
                 wwlog!(
                     "wallet_rpc: manual_sync_persist_failed wallet={} err={}",
                     wallet_public_name(&wallet_path),
@@ -4091,21 +4488,20 @@ pub(crate) fn handle_request(
                     ws.utxos = utxos.clone();
                     ws.last_sync_height = cur_h;
                     ws.pending_txs = pending_txs.clone();
+                    ws.reserved_inputs = reserved_inputs.clone();
                 }
             }
 
             // Compute balance + spendable.
             let mut balance: i64 = 0;
             let mut spendable: i64 = 0;
-            let reserved_outpoints = pending_reserved_outpoints(&pending_txs);
+            let mut reserved_outpoints = pending_reserved_outpoints(&pending_txs);
+            reserved_outpoints.extend(explicit_reserved_outpoints(&reserved_inputs));
             for u in utxos.iter() {
                 balance += u.value;
-                let mature = if u.coinbase {
-                    (cur_h - u.height) >= 60
-                } else {
-                    true
-                };
-                if mature && !reserved_outpoints.contains(&(u.txid.clone(), u.vout)) {
+                if is_wallet_utxo_spendable(u, cur_h)
+                    && !reserved_outpoints.contains(&(u.txid.clone(), u.vout))
+                {
                     spendable += u.value;
                 }
             }
@@ -4775,6 +5171,7 @@ pub(crate) fn handle_request(
                 signers_by_addr,
                 mut utxos,
                 pending_txs,
+                reserved_inputs,
                 last_sync_height,
             ) = {
                 let g = super::wallet_lock_or_recover();
@@ -4831,6 +5228,7 @@ pub(crate) fn handle_request(
                     },
                     ws.utxos.clone(),
                     ws.pending_txs.clone(),
+                    ws.reserved_inputs.clone(),
                     ws.last_sync_height,
                 )
             };
@@ -4863,14 +5261,9 @@ pub(crate) fn handle_request(
             };
 
             utxos = new_utxos;
+            if let Err(e) =
+                persist_runtime_reserved_inputs(&wallet_path, &utxos, cur_h, &reserved_inputs)
             {
-                let mut g = super::wallet_lock_or_recover();
-                if let Some(ws) = g.as_mut() {
-                    ws.utxos = utxos.clone();
-                    ws.last_sync_height = cur_h;
-                }
-            }
-            if let Err(e) = super::save_wallet_sync_state(&wallet_path, &utxos, cur_h) {
                 wwlog!(
                     "wallet_rpc: send_refresh_persist_failed wallet={} err={}",
                     wallet_public_name(&wallet_path),
@@ -4879,7 +5272,6 @@ pub(crate) fn handle_request(
             }
 
             // Select spendable inputs.
-            const COINBASE_MATURITY: i64 = 60;
             const MAX_INPUTS: usize = 64;
             const DUST_CHANGE: i64 = 1;
             let mut selected = Vec::new();
@@ -4901,6 +5293,7 @@ pub(crate) fn handle_request(
                 .as_secs() as i64;
             let mut active_pending = pending_txs.clone();
             let mut reserved_outpoints = pending_reserved_outpoints(&active_pending);
+            reserved_outpoints.extend(explicit_reserved_outpoints(&reserved_inputs));
             match pending_mempool_state_or_err(&wallet_path, &active_pending, daemon_rpc_port) {
                 Ok(Some((mempool_txids, mempool_reserved))) => {
                     if prune_inactive_pending_txs(&mut active_pending, &mempool_txids, now_secs) {
@@ -4917,6 +5310,7 @@ pub(crate) fn handle_request(
                         }
                     }
                     reserved_outpoints = pending_reserved_outpoints(&active_pending);
+                    reserved_outpoints.extend(explicit_reserved_outpoints(&reserved_inputs));
                     reserved_outpoints.extend(mempool_reserved);
                 }
                 Ok(None) => {}
@@ -4937,7 +5331,7 @@ pub(crate) fn handle_request(
                 .filter(|u| u.value > 0)
                 .filter(|u| !u.txid.is_empty())
                 .filter(|u| !reserved_outpoints.contains(&(u.txid.clone(), u.vout)))
-                .filter(|u| !(u.coinbase && (cur_h - u.height) < COINBASE_MATURITY))
+                .filter(|u| is_wallet_utxo_spendable(u, cur_h))
             {
                 match resolve_owned_input(
                     daemon_rpc_port,
@@ -5008,6 +5402,47 @@ pub(crate) fn handle_request(
                         "have": total_in,
                         "fee": fee,
                         "height": cur_h
+                    })
+                    .to_string(),
+                );
+                return;
+            }
+
+            let (_mempool_txids_pre_submit, mempool_reserved_pre_submit) =
+                match send_mempool_state_or_err(&wallet_path, daemon_rpc_port) {
+                    Ok(state) => state,
+                    Err(e) => {
+                        super::respond_json(
+                            request,
+                            tiny_http::StatusCode(502),
+                            json!({"error":"daemon_mempool_unreachable","detail":e}).to_string(),
+                        );
+                        return;
+                    }
+                };
+            let pre_submit_conflicts =
+                selected_inputs_conflict_with_reserved(&selected, &mempool_reserved_pre_submit);
+            if !pre_submit_conflicts.is_empty() {
+                if let Err(e) = refresh_wallet_utxos_after_submit_conflict(
+                    &wallet_path,
+                    &addrs,
+                    daemon_rpc_port,
+                    &utxos,
+                    last_sync_height.max(cur_h),
+                ) {
+                    wwlog!(
+                        "wallet_rpc: send_presubmit_refresh_failed wallet={} err={}",
+                        wallet_public_name(&wallet_path),
+                        e
+                    );
+                }
+                super::respond_json(
+                    request,
+                    tiny_http::StatusCode(409),
+                    json!({
+                        "error":"input_conflict_before_submit",
+                        "detail":"selected_inputs_already_reserved_in_mempool",
+                        "conflicts": pre_submit_conflicts,
                     })
                     .to_string(),
                 );
@@ -5120,6 +5555,22 @@ pub(crate) fn handle_request(
                 }
             };
 
+            let mut reserved_inputs_after_select = reserved_inputs.clone();
+            append_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected, now_secs);
+            if let Err(e) = persist_runtime_reserved_inputs(
+                &wallet_path,
+                &utxos,
+                cur_h,
+                &reserved_inputs_after_select,
+            ) {
+                super::respond_json(
+                    request,
+                    tiny_http::StatusCode(500),
+                    json!({"error":"wallet_state_persist_failed","detail":e}).to_string(),
+                );
+                return;
+            }
+
             let resp_body = match super::http_post_local(
                 "127.0.0.1",
                 daemon_rpc_port,
@@ -5129,6 +5580,13 @@ pub(crate) fn handle_request(
             ) {
                 Ok(b) => b,
                 Err(e) => {
+                    release_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected);
+                    let _ = persist_runtime_reserved_inputs(
+                        &wallet_path,
+                        &utxos,
+                        cur_h,
+                        &reserved_inputs_after_select,
+                    );
                     respond_http_error_detail(
                         request,
                         tiny_http::StatusCode(502),
@@ -5142,6 +5600,13 @@ pub(crate) fn handle_request(
             let resp_v: serde_json::Value = match serde_json::from_str(&resp_body) {
                 Ok(v) => v,
                 Err(e) => {
+                    release_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected);
+                    let _ = persist_runtime_reserved_inputs(
+                        &wallet_path,
+                        &utxos,
+                        cur_h,
+                        &reserved_inputs_after_select,
+                    );
                     let d = format!("daemon_invalid_json: {}", e);
                     super::respond_json(
                         request,
@@ -5155,6 +5620,13 @@ pub(crate) fn handle_request(
             if resp_v.get("ok").and_then(|x| x.as_bool()) != Some(true) {
                 // Pass through fee-floor errors as 422 so clients don't treat it as a gateway failure.
                 if resp_v.get("error").and_then(|x| x.as_str()) == Some("fee_too_low") {
+                    release_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected);
+                    let _ = persist_runtime_reserved_inputs(
+                        &wallet_path,
+                        &utxos,
+                        cur_h,
+                        &reserved_inputs_after_select,
+                    );
                     super::respond_json(request, tiny_http::StatusCode(422), resp_v.to_string());
                     return;
                 }
@@ -5162,10 +5634,19 @@ pub(crate) fn handle_request(
                     resp_v.get("error").and_then(|x| x.as_str()),
                     Some("input_not_found" | "double_spend")
                 ) {
+                    release_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected);
+                    let _ = persist_runtime_reserved_inputs(
+                        &wallet_path,
+                        &utxos,
+                        cur_h,
+                        &reserved_inputs_after_select,
+                    );
                     if let Err(e) = refresh_wallet_utxos_after_submit_conflict(
                         &wallet_path,
                         &addrs,
                         daemon_rpc_port,
+                        &utxos,
+                        last_sync_height.max(cur_h),
                     ) {
                         wwlog!(
                             "wallet_rpc: send_conflict_refresh_failed wallet={} err={}",
@@ -5180,6 +5661,13 @@ pub(crate) fn handle_request(
                     );
                     return;
                 }
+                release_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected);
+                let _ = persist_runtime_reserved_inputs(
+                    &wallet_path,
+                    &utxos,
+                    cur_h,
+                    &reserved_inputs_after_select,
+                );
                 super::respond_json(
                     request,
                     tiny_http::StatusCode(502),
@@ -5253,9 +5741,15 @@ pub(crate) fn handle_request(
                 );
                 pending
             };
+            release_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected);
 
-                    let persist_result =
-                        super::save_wallet_full_state(&wallet_path, &new_utxos, cur_h, &pending_after);
+                    let persist_result = super::save_wallet_full_state(
+                        &wallet_path,
+                        &new_utxos,
+                        cur_h,
+                        &pending_after,
+                        &reserved_inputs_after_select,
+                    );
 
                     {
                         let mut g = super::wallet_lock_or_recover();
@@ -5263,6 +5757,7 @@ pub(crate) fn handle_request(
                             ws.utxos = new_utxos.clone();
                             ws.last_sync_height = cur_h;
                             ws.pending_txs = pending_after.clone();
+                            ws.reserved_inputs = reserved_inputs_after_select.clone();
                         }
                     }
 

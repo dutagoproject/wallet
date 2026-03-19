@@ -30,6 +30,35 @@ fn status_for_body_err(detail: &str) -> tiny_http::StatusCode {
     }
 }
 
+fn wallet_health_response(
+    wallet_open: bool,
+    refresh: Result<(i64,), String>,
+) -> (tiny_http::StatusCode, serde_json::Value) {
+    if wallet_open {
+        match refresh {
+            Ok((height,)) => (tiny_http::StatusCode(200), json!({
+                "ok": true,
+                "wallet_open": true,
+                "height": height,
+            })),
+            Err(e) => (
+                tiny_http::StatusCode(503),
+                json!({
+                    "ok": false,
+                    "wallet_open": true,
+                    "error": wallet_refresh_error_code(&e),
+                    "detail": e,
+                }),
+            ),
+        }
+    } else {
+        (
+            tiny_http::StatusCode(200),
+            json!({"ok": true, "wallet_open": false}),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -41,7 +70,7 @@ mod tests {
         retry_from_pruned_boundary_for_empty_wallet,
         require_non_empty_passphrase, resolve_owned_input, select_inputs_for_need,
         send_success_body, should_probe_daemon_utxo_presence, sign_send_tx, simulate_send_plan,
-        status_for_body_err, tx_output_address, wallet_needs_full_utxo_rebuild,
+        status_for_body_err, tx_output_address, wallet_health_response, wallet_needs_full_utxo_rebuild,
         wallet_public_name, wallet_refresh_error_code, wallet_state_network, OwnedInput,
         PendingBalanceStats, WalletSigner, MAX_WALLET_SEND_INPUTS,
     };
@@ -155,6 +184,25 @@ mod tests {
             wallet_refresh_error_code("blocks_from_invalid_json: expected value"),
             "wallet_state_refresh_failed"
         );
+    }
+
+    #[test]
+    fn wallet_health_response_marks_open_wallet_with_dead_backend_unhealthy() {
+        let (status, body) = wallet_health_response(
+            true,
+            Err("connect_failed: connection refused".to_string()),
+        );
+        assert_eq!(status, tiny_http::StatusCode(503));
+        assert_eq!(body["ok"], json!(false));
+        assert_eq!(body["wallet_open"], json!(true));
+        assert_eq!(body["error"], json!("daemon_unreachable"));
+    }
+
+    #[test]
+    fn wallet_health_response_keeps_closed_wallet_healthy() {
+        let (status, body) = wallet_health_response(false, Ok((0,)));
+        assert_eq!(status, tiny_http::StatusCode(200));
+        assert_eq!(body, json!({"ok": true, "wallet_open": false}));
     }
 
     #[test]
@@ -3722,11 +3770,19 @@ pub(crate) fn handle_request(
             if request.method() != &tiny_http::Method::Get {
                 respond_method_not_allowed(request);
             } else {
-                super::respond_json(
-                    request,
-                    tiny_http::StatusCode(200),
-                    json!({"ok":true}).to_string(),
-                );
+                let g = super::wallet_lock_or_recover();
+                let wallet_open = g.is_some();
+                drop(g);
+
+                let (status, body) = if wallet_open {
+                    match wallet_balance_snapshot(daemon_rpc_port) {
+                        Ok(snapshot) => wallet_health_response(true, Ok((snapshot.height,))),
+                        Err(e) => wallet_health_response(true, Err(e)),
+                    }
+                } else {
+                    wallet_health_response(false, Ok((0,)))
+                };
+                super::respond_json(request, status, body.to_string());
             }
         }
 

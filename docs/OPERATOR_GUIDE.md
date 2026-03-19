@@ -74,13 +74,15 @@ Treat wallet RPC as private operator surface. Do not expose it directly to the p
 - `dut` is the base unit
 - all on-chain and stored values remain integer `dut`
 - RPC fields like `amount`, `balance`, `fee`, and `change` are display-layer values in `DUTA`
+- display-facing `DUTA` values are rendered with fixed `8` decimal places
 - raw values are exposed as `*_dut`
 - operators and automation should prefer `*_dut` for accounting and exact comparisons
 
 Examples:
 
 - `amount = "0.00000001"` means `amount_dut = 1`
-- `fee = "0.0001"` means `fee_dut = 10000`
+- `fee = "0.00010000"` means `fee_dut = 10000`
+- `balance = "1.00000000"` means `balance_dut = 100000000`
 
 ## Operating rules
 

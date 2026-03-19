@@ -19,6 +19,7 @@ This guide is for people who want to use the DUTA wallet daemon and CLI without 
 - display-facing amounts use `DUTA`
 - consensus and storage use integer `dut`
 - display fields such as `amount`, `balance`, `fee`, and `change` are formatted in `DUTA`
+- display output is rendered with fixed `8` decimal places, even when the fractional part is all zeros
 - raw fields are exposed as `*_dut`
 - unit metadata is exposed as:
   - `unit = DUTA`
@@ -93,7 +94,7 @@ Get the current balance:
 Unlock the wallet:
 
 ```bash
-./duta-wallet-cli unlock --passphrase YOUR_PASS
+./duta-wallet-cli unlock YOUR_PASS
 ```
 
 Send funds:
@@ -110,11 +111,15 @@ If your wallet RPC uses a non-default port:
 
 ## Reading balance and send output
 
-- `getbalance` returns display-layer `DUTA` in `amount`
-- raw integer spendable value is `amount_dut`
+- `getbalance` returns display-layer `balance`, `spendable`, `reserved`, `pending_send`, and `pending_change` fields in `DUTA`
+- matching raw integer values are exposed as `balance_dut`, `spendable_dut`, `reserved_dut`, `pending_send_dut`, and `pending_change_dut`
 - `send` returns display-layer `amount`, `fee`, and `change`
 - raw integer values are `amount_dut`, `fee_dut`, and `change_dut`
 - automation should prefer `*_dut`
+- example display values:
+  - `1` is shown as `1.00000000`
+  - `0.5` is shown as `0.50000000`
+  - `12.34` is shown as `12.34000000`
 
 ## Good habits
 

@@ -1203,6 +1203,16 @@ fn validate_conf_wallet_rpc_settings(
     Ok(())
 }
 
+fn load_runtime_conf(conf_path: &str, required: bool) -> Result<duta_core::netparams::Conf, String> {
+    match fs::read_to_string(conf_path) {
+        Ok(s) => Ok(duta_core::netparams::Conf::parse(&s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => {
+            Ok(duta_core::netparams::Conf::default())
+        }
+        Err(e) => Err(format!("config_read_failed: path={} err={}", conf_path, e)),
+    }
+}
+
 fn spawn_daemon_wallet(data_dir: &str, rpc_addr: &str) -> Result<u32, String> {
     use std::process::{Command, Stdio};
     std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
@@ -1293,8 +1303,12 @@ fn main() {
             conf_path = cp2;
         }
     }
-    if let Ok(s) = fs::read_to_string(&conf_path) {
-        conf = duta_core::netparams::Conf::parse(&s);
+    match load_runtime_conf(&conf_path, args.conf.is_some()) {
+        Ok(parsed) => conf = parsed,
+        Err(e) => {
+            eprintln!("dutawalletd: {}", e);
+            std::process::exit(1);
+        }
     }
     if let Err(e) = validate_conf_network_name(&conf) {
         eprintln!("dutawalletd: {}", e);
@@ -1315,8 +1329,12 @@ fn main() {
                 if args.conf.is_none() {
                     conf_path = format!("{}/duta.conf", data_dir.trim_end_matches('/'));
                 }
-                if let Ok(s) = fs::read_to_string(&conf_path) {
-                    conf = duta_core::netparams::Conf::parse(&s);
+                match load_runtime_conf(&conf_path, args.conf.is_some()) {
+                    Ok(parsed) => conf = parsed,
+                    Err(e) => {
+                        eprintln!("dutawalletd: {}", e);
+                        std::process::exit(1);
+                    }
                 }
                 if let Err(e) = validate_conf_network_name(&conf) {
                     eprintln!("dutawalletd: {}", e);
@@ -1464,7 +1482,7 @@ fn main() {
 mod tests {
     use super::{
         build_http_request, clear_wallet_sensitive_state, load_wallet_db_to_state, read_pid_file,
-        remove_pid_file_if_matches, save_wallet_sync_state, validate_conf_network_name,
+        load_runtime_conf, remove_pid_file_if_matches, save_wallet_sync_state, validate_conf_network_name,
         validate_conf_wallet_rpc_settings, wallet_rpc_bind_warning, Args, Cmd,
         validate_wallet_state_addresses,
         wallet_rpc_settings, PidFileGuard, Utxo, WalletState,
@@ -1476,6 +1494,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use crate::walletdb::WalletDb;
     use std::collections::BTreeMap;
+    use std::fs;
 
     fn sample_wallet_state() -> WalletState {
         let signing_key = SigningKey::from_bytes(&[7u8; 32]);
@@ -1762,6 +1781,59 @@ mod tests {
             validate_conf_wallet_rpc_settings(Network::Mainnet, &bad_port).unwrap_err(),
             "invalid_daemon_rpc_port: notaport"
         );
+    }
+
+    #[test]
+    fn load_runtime_conf_returns_default_when_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "dutawalletd-load-runtime-conf-missing-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("missing.conf");
+        let conf = load_runtime_conf(path.to_str().unwrap(), false).unwrap();
+        assert!(conf.get_last("network").is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn load_runtime_conf_fails_when_existing_file_is_unreadable() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "dutawalletd-load-runtime-conf-unreadable-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("duta.conf");
+        {
+            let mut f = fs::File::create(&path).unwrap();
+            writeln!(f, "network=testnet").unwrap();
+        }
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&path, perms).unwrap();
+        let err = load_runtime_conf(path.to_str().unwrap(), false).unwrap_err();
+        assert!(err.contains("config_read_failed"));
+        let mut cleanup_perms = fs::metadata(&path).unwrap().permissions();
+        cleanup_perms.set_mode(0o644);
+        let _ = fs::set_permissions(&path, cleanup_perms);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_runtime_conf_fails_when_explicit_path_is_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "dutawalletd-load-runtime-conf-required-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("missing-required.conf");
+        let err = load_runtime_conf(path.to_str().unwrap(), true).unwrap_err();
+        assert!(err.contains("config_read_failed"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -35,7 +35,7 @@ mod tests {
     use super::{
         advance_utxo_sync_from_pruned_boundary, blocks_from_pruned_error, classify_wallet_history_tx, db_wallet_path,
         decode_seed_hex_for_migration, merge_pending_wallet_txs, net_from_name,
-        parse_wallet_utxo_snapshot_response,
+        parse_wallet_utxo_snapshot_response, wallet_utxo_snapshot_retry_after_secs,
         insufficient_funds_body, net_from_wallet_path, prune_confirmed_pending_txs,
         parse_prune_below_from_blocks_from_error, query_param, relay_fee_for_tx_bytes,
         retry_from_pruned_boundary_for_empty_wallet,
@@ -296,6 +296,25 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("wallet_utxo_snapshot_failed"));
         assert!(err.contains("invalid_address"));
+    }
+
+    #[test]
+    fn wallet_utxo_snapshot_retry_after_secs_extracts_rate_limit_hint() {
+        assert_eq!(
+            wallet_utxo_snapshot_retry_after_secs(&json!({
+                "ok": false,
+                "error": "rate_limited",
+                "retry_after_secs": 1
+            })),
+            Some(1)
+        );
+        assert_eq!(
+            wallet_utxo_snapshot_retry_after_secs(&json!({
+                "ok": false,
+                "error": "wallet_utxo_snapshot_failed"
+            })),
+            None
+        );
     }
 
     #[test]
@@ -1399,21 +1418,45 @@ fn parse_wallet_utxo_snapshot_response(
     Ok((tip_height, utxos))
 }
 
+fn wallet_utxo_snapshot_retry_after_secs(value: &serde_json::Value) -> Option<u64> {
+    if value.get("error").and_then(|x| x.as_str()) == Some("rate_limited") {
+        return value
+            .get("retry_after_secs")
+            .and_then(|x| x.as_u64())
+            .map(|secs| secs.min(2).max(1));
+    }
+    None
+}
+
 fn rebuild_wallet_utxos_via_daemon_snapshot(
     addrs: &[String],
     daemon_rpc_port: u16,
 ) -> Result<(i64, Vec<super::Utxo>), String> {
-    let body = json!({ "addresses": addrs }).to_string();
-    let resp = super::http_post_local(
-        "127.0.0.1",
-        daemon_rpc_port,
-        "/wallet_utxos",
-        "application/json",
-        body.as_bytes(),
-    )?;
-    let value: serde_json::Value = serde_json::from_str(&resp)
-        .map_err(|e| format!("wallet_utxo_snapshot_invalid_json: {}", e))?;
-    parse_wallet_utxo_snapshot_response(&value)
+    for attempt in 0..3 {
+        let body = json!({ "addresses": addrs }).to_string();
+        let resp = super::http_post_local(
+            "127.0.0.1",
+            daemon_rpc_port,
+            "/wallet_utxos",
+            "application/json",
+            body.as_bytes(),
+        )?;
+        let value: serde_json::Value = serde_json::from_str(&resp)
+            .map_err(|e| format!("wallet_utxo_snapshot_invalid_json: {}", e))?;
+        if let Some(retry_secs) = wallet_utxo_snapshot_retry_after_secs(&value) {
+            wwlog!(
+                "wallet_rpc: wallet_utxo_snapshot_rate_limited port={} retry_after_secs={} attempt={}",
+                daemon_rpc_port,
+                retry_secs,
+                attempt + 1
+            );
+            std::thread::sleep(std::time::Duration::from_secs(retry_secs));
+            continue;
+        }
+        return parse_wallet_utxo_snapshot_response(&value);
+    }
+
+    Err("wallet_utxo_snapshot_unavailable_after_retries".to_string())
 }
 
 fn wallet_refresh_error_code(detail: &str) -> &'static str {

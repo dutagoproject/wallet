@@ -188,9 +188,20 @@ mod tests {
     }
 
     #[test]
+    fn daemon_tip_regressed_error_reports_stale_wallet_context() {
+        let err = super::daemon_tip_regressed_below_wallet_state_error(0, 308, 308, 308);
+        assert!(err.contains("daemon_tip_regressed_below_wallet_state"));
+        assert!(err.contains("tip_height=0"));
+        assert!(err.contains("last_sync_height=308"));
+        assert!(err.contains("tracked_utxos=308"));
+        assert!(err.contains("max_utxo_height=308"));
+    }
+
+    #[test]
     fn empty_wallet_with_known_anchor_does_not_force_full_rebuild() {
         assert!(!wallet_needs_full_utxo_rebuild(&[], 1500, 1185));
         assert!(wallet_needs_full_utxo_rebuild(&[], 1500, 0));
+        assert!(wallet_needs_full_utxo_rebuild(&[], 0, 1185));
     }
 
     #[test]
@@ -1288,6 +1299,18 @@ fn wallet_history_incomplete_error(prune_below: Option<i64>) -> String {
         ),
         None => "wallet_history_incomplete_on_pruned_daemon: action=use_unpruned_daemon_for_full_history".to_string(),
     }
+}
+
+fn daemon_tip_regressed_below_wallet_state_error(
+    cur_h: i64,
+    last_sync_height: i64,
+    tracked_utxos: usize,
+    max_utxo_height: i64,
+) -> String {
+    format!(
+        "daemon_tip_regressed_below_wallet_state: tip_height={} last_sync_height={} tracked_utxos={} max_utxo_height={} action=resync_daemon_or_reopen_wallet_after_chain_reset",
+        cur_h, last_sync_height, tracked_utxos, max_utxo_height
+    )
 }
 
 fn parse_prune_below_from_blocks_from_error(detail: &str) -> Option<i64> {
@@ -2530,7 +2553,7 @@ fn sync_wallet_utxos_via_blocks_from(
 
 fn wallet_needs_full_utxo_rebuild(utxos: &[super::Utxo], cur_h: i64, last_sync_height: i64) -> bool {
     if cur_h <= 0 {
-        return false;
+        return !utxos.is_empty() || last_sync_height > 0;
     }
     if last_sync_height <= 0 {
         return true;
@@ -2545,11 +2568,24 @@ fn refresh_wallet_utxos_runtime(
     last_sync_height: i64,
 ) -> Result<(i64, Vec<super::Utxo>), String> {
     let cur_h = daemon_tip_height_with_retry(daemon_rpc_port, last_sync_height)?;
-    if addrs.is_empty() || cur_h <= 0 {
+    if addrs.is_empty() {
         return Ok((cur_h, current_utxos.to_vec()));
     }
 
     let full_rebuild = wallet_needs_full_utxo_rebuild(current_utxos, cur_h, last_sync_height);
+    if cur_h <= 0 {
+        if full_rebuild {
+            let max_utxo_height = current_utxos.iter().map(|u| u.height).max().unwrap_or(0);
+            return Err(daemon_tip_regressed_below_wallet_state_error(
+                cur_h,
+                last_sync_height,
+                current_utxos.len(),
+                max_utxo_height,
+            ));
+        }
+        return Ok((cur_h, current_utxos.to_vec()));
+    }
+
     if full_rebuild {
         match rebuild_wallet_utxos_with_pruned_fallback(addrs, daemon_rpc_port) {
             Ok(v) => return Ok(v),

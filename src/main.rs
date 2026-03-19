@@ -471,27 +471,34 @@ fn wallet_daemon_status(data_dir: &str, rpc_addr: &str) -> Result<i32, String> {
         }
         Some(pid) => {
             let _ = fs::remove_file(&pid_path);
-            console_line("WALLET", ANSI_YELLOW, "dutawalletd stopped");
-            console_kv("PROC", ANSI_YELLOW, "stale_pid_removed", pid.to_string());
-            console_kv("RPC", ANSI_BLUE, "bind", rpc_addr);
-            console_kv(
-                "RPC",
-                ANSI_BLUE,
-                "reachable",
-                if rpc_reachable { "yes" } else { "no" },
-            );
-            Ok(1)
+            if rpc_reachable {
+                console_line("WALLET", ANSI_GREEN, "dutawalletd running");
+                console_kv("PROC", ANSI_YELLOW, "stale_pid_removed", pid.to_string());
+                console_kv("PROC", ANSI_YELLOW, "pid", "externally_managed_or_missing");
+                console_kv("RPC", ANSI_BLUE, "bind", rpc_addr);
+                console_kv("RPC", ANSI_BLUE, "reachable", "yes");
+                Ok(0)
+            } else {
+                console_line("WALLET", ANSI_YELLOW, "dutawalletd stopped");
+                console_kv("PROC", ANSI_YELLOW, "stale_pid_removed", pid.to_string());
+                console_kv("RPC", ANSI_BLUE, "bind", rpc_addr);
+                console_kv("RPC", ANSI_BLUE, "reachable", "no");
+                Ok(1)
+            }
         }
         None => {
-            console_line("WALLET", ANSI_YELLOW, "dutawalletd stopped");
-            console_kv("RPC", ANSI_BLUE, "bind", rpc_addr);
-            console_kv(
-                "RPC",
-                ANSI_BLUE,
-                "reachable",
-                if rpc_reachable { "yes" } else { "no" },
-            );
-            Ok(1)
+            if rpc_reachable {
+                console_line("WALLET", ANSI_GREEN, "dutawalletd running");
+                console_kv("PROC", ANSI_YELLOW, "pid", "externally_managed_or_missing");
+                console_kv("RPC", ANSI_BLUE, "bind", rpc_addr);
+                console_kv("RPC", ANSI_BLUE, "reachable", "yes");
+                Ok(0)
+            } else {
+                console_line("WALLET", ANSI_YELLOW, "dutawalletd stopped");
+                console_kv("RPC", ANSI_BLUE, "bind", rpc_addr);
+                console_kv("RPC", ANSI_BLUE, "reachable", "no");
+                Ok(1)
+            }
         }
     }
 }
@@ -1679,5 +1686,18 @@ mod tests {
         let args = Args::parse_from(["dutawalletd", "status"]);
         assert!(matches!(args.command, Some(Cmd::Status)));
         assert!(!args.daemon);
+    }
+
+    #[test]
+    fn wallet_status_treats_reachable_rpc_without_pid_file_as_running() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("duta-wallet-status-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rc = super::wallet_daemon_status(dir.to_str().unwrap(), &addr.to_string()).unwrap();
+        assert_eq!(rc, 0);
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

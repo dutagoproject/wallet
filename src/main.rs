@@ -1121,6 +1121,16 @@ fn wallet_rpc_settings(net: Network, conf: &duta_core::netparams::Conf) -> (Stri
     (rpc_addr, daemon_rpc_port, net_s)
 }
 
+fn validate_conf_network_name(conf: &duta_core::netparams::Conf) -> Result<(), String> {
+    if let Some(raw) = conf.get_last("network").or_else(|| conf.get_last("chain")) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() && Network::parse_name(trimmed).is_none() {
+            return Err(format!("invalid_network_name: {}", trimmed));
+        }
+    }
+    Ok(())
+}
+
 fn spawn_daemon_wallet(data_dir: &str, rpc_addr: &str) -> Result<u32, String> {
     use std::process::{Command, Stdio};
     std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
@@ -1214,6 +1224,10 @@ fn main() {
     if let Ok(s) = fs::read_to_string(&conf_path) {
         conf = duta_core::netparams::Conf::parse(&s);
     }
+    if let Err(e) = validate_conf_network_name(&conf) {
+        eprintln!("dutawalletd: {}", e);
+        std::process::exit(1);
+    }
 
     // datadir= override (optional). If present, re-load config from that dir.
     // NOTE: CLI --datadir always wins.
@@ -1227,6 +1241,10 @@ fn main() {
                 }
                 if let Ok(s) = fs::read_to_string(&conf_path) {
                     conf = duta_core::netparams::Conf::parse(&s);
+                }
+                if let Err(e) = validate_conf_network_name(&conf) {
+                    eprintln!("dutawalletd: {}", e);
+                    std::process::exit(1);
                 }
             }
         }
@@ -1361,7 +1379,7 @@ mod tests {
     use super::{
         build_http_request, clear_wallet_sensitive_state, load_wallet_db_to_state, read_pid_file,
         prepare_wallet_runtime_files, remove_pid_file_if_matches, save_wallet_sync_state,
-        wallet_rpc_bind_warning, Args, Cmd, validate_wallet_state_addresses,
+        validate_conf_network_name, wallet_rpc_bind_warning, Args, Cmd, validate_wallet_state_addresses,
         wallet_rpc_settings, PidFileGuard, Utxo, WalletState,
     };
     use crate::{PendingInput, PendingTx, ReservedInput};
@@ -1629,6 +1647,17 @@ mod tests {
         assert_eq!(daemon_rpc_port, 28083);
         assert_eq!(net_s, "testnet");
         assert_eq!(wallet_rpc_bind_warning(Network::Testnet, &conf), None);
+    }
+
+    #[test]
+    fn runtime_config_rejects_unknown_network_name() {
+        let conf = Conf::parse("network=bogus\n");
+        assert_eq!(
+            validate_conf_network_name(&conf).unwrap_err(),
+            "invalid_network_name: bogus"
+        );
+        let ok = Conf::parse("chain=mainnet\n");
+        assert!(validate_conf_network_name(&ok).is_ok());
     }
 
     #[test]

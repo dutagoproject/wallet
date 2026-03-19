@@ -33,7 +33,7 @@ fn status_for_body_err(detail: &str) -> tiny_http::StatusCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        blocks_from_pruned_error, classify_wallet_history_tx, db_wallet_path,
+        advance_utxo_sync_from_pruned_boundary, blocks_from_pruned_error, classify_wallet_history_tx, db_wallet_path,
         decode_seed_hex_for_migration, merge_pending_wallet_txs, net_from_name,
         insufficient_funds_body, net_from_wallet_path, prune_confirmed_pending_txs,
         parse_prune_below_from_blocks_from_error, query_param, relay_fee_for_tx_bytes,
@@ -220,6 +220,43 @@ mod tests {
         );
         assert_eq!(
             super::advance_history_scan_from_pruned_boundary(0, None),
+            None
+        );
+    }
+
+    #[test]
+    fn utxo_sync_advances_empty_wallet_to_prune_boundary() {
+        assert_eq!(
+            advance_utxo_sync_from_pruned_boundary(&[], 2662, Some(5515)).unwrap(),
+            Some(5515)
+        );
+    }
+
+    #[test]
+    fn utxo_sync_fails_closed_when_pruned_gap_covers_tracked_utxos() {
+        let tracked = vec![super::super::Utxo {
+            value: 50_000_000,
+            height: 2500,
+            coinbase: false,
+            address: "duta6b2fe7cce017891863991b60d21b0d785b22bb3".to_string(),
+            txid: "ab".repeat(32),
+            vout: 0,
+        }];
+        let err = advance_utxo_sync_from_pruned_boundary(&tracked, 2662, Some(5515)).unwrap_err();
+        assert!(err.contains("wallet_pruned_history_gap"));
+        assert!(err.contains("from=2662"));
+        assert!(err.contains("prune_below=5515"));
+        assert!(err.contains("tracked_utxos=1"));
+    }
+
+    #[test]
+    fn utxo_sync_does_not_move_when_request_is_already_inside_retained_window() {
+        assert_eq!(
+            advance_utxo_sync_from_pruned_boundary(&[], 5515, Some(5515)).unwrap(),
+            None
+        );
+        assert_eq!(
+            advance_utxo_sync_from_pruned_boundary(&[], 6000, Some(5515)).unwrap(),
             None
         );
     }
@@ -1191,6 +1228,28 @@ fn advance_history_scan_from_pruned_boundary(from: i64, prune_below: Option<i64>
     }
 }
 
+fn advance_utxo_sync_from_pruned_boundary(
+    current_utxos: &[super::Utxo],
+    from: i64,
+    prune_below: Option<i64>,
+) -> Result<Option<i64>, String> {
+    let Some(prune_below) = prune_below else {
+        return Ok(None);
+    };
+    if prune_below <= from {
+        return Ok(None);
+    }
+    if current_utxos.is_empty() {
+        return Ok(Some(prune_below));
+    }
+    Err(format!(
+        "wallet_pruned_history_gap: from={} prune_below={} tracked_utxos={} action=recover_with_unpruned_daemon_or_reopen_with_fresh_wallet_state",
+        from,
+        prune_below,
+        current_utxos.len()
+    ))
+}
+
 fn retry_from_pruned_boundary_for_empty_wallet(
     current_utxos: &[super::Utxo],
     detail: &str,
@@ -2159,10 +2218,22 @@ fn sync_wallet_utxos_via_blocks_from(
             break;
         }
         if v.get("error").and_then(|x| x.as_str()) == Some("pruned") {
-            return Err(blocks_from_pruned_error(
+            match advance_utxo_sync_from_pruned_boundary(
+                base_utxos,
                 from,
                 v.get("prune_below").and_then(|x| x.as_i64()),
-            ));
+            )? {
+                Some(next_from) => {
+                    from = next_from;
+                    continue;
+                }
+                None => {
+                    return Err(blocks_from_pruned_error(
+                        from,
+                        v.get("prune_below").and_then(|x| x.as_i64()),
+                    ));
+                }
+            }
         }
 
         let blocks = v
@@ -3123,7 +3194,7 @@ fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<WalletBalanceSnapshot
             }
             Err(e) => {
                 wwlog!(
-                    "wallet_rpc: balance_rebuild_failed wallet={} err={}",
+                    "wallet_rpc: balance_refresh_failed wallet={} err={}",
                     wallet_public_name(&wallet_path),
                     e
                 );

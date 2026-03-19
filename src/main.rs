@@ -1049,28 +1049,39 @@ fn wait_for_wallet_rpc_ready(rpc_addr: &str, child_pid: u32, timeout_ms: u64) ->
     ))
 }
 
-fn normalize_wallet_loopback_bind(bind: &str, default_port: u16) -> Option<String> {
+fn parse_wallet_loopback_bind(bind: &str, default_port: u16) -> Result<Option<String>, String> {
     let bind = bind.trim();
     if bind.is_empty() {
-        return None;
+        return Ok(None);
     }
     if bind == "127.0.0.1" {
-        return Some(format!("127.0.0.1:{}", default_port));
+        return Ok(Some(format!("127.0.0.1:{}", default_port)));
     }
-    let (host, port) = bind.split_once(':')?;
-    let host = host.trim();
-    let port = port.trim().parse::<u16>().ok()?;
-    if host == "127.0.0.1" && port > 0 {
-        return Some(format!("127.0.0.1:{}", port));
+    if let Some((host, port)) = bind.split_once(':') {
+        let host = host.trim();
+        let port = port
+            .trim()
+            .parse::<u16>()
+            .map_err(|_| format!("invalid_wallet_rpc_bind: {}", bind))?;
+        if port == 0 {
+            return Err(format!("invalid_wallet_rpc_bind: {}", bind));
+        }
+        if host == "127.0.0.1" {
+            return Ok(Some(format!("127.0.0.1:{}", port)));
+        }
+        return Ok(None);
     }
-    None
+    Ok(None)
 }
 
 fn wallet_rpc_bind_warning(net: Network, conf: &duta_core::netparams::Conf) -> Option<String> {
     let raw = conf
         .get_last("walletrpcbind")
         .or_else(|| conf.get_last("rpcbind"))?;
-    if normalize_wallet_loopback_bind(&raw, net.default_wallet_rpc_port()).is_some() {
+    if matches!(
+        parse_wallet_loopback_bind(&raw, net.default_wallet_rpc_port()),
+        Ok(Some(_))
+    ) {
         return None;
     }
     Some(format!(
@@ -1079,7 +1090,10 @@ fn wallet_rpc_bind_warning(net: Network, conf: &duta_core::netparams::Conf) -> O
     ))
 }
 
-fn wallet_rpc_settings(net: Network, conf: &duta_core::netparams::Conf) -> (String, u16, String) {
+fn wallet_rpc_settings(
+    net: Network,
+    conf: &duta_core::netparams::Conf,
+) -> Result<(String, u16, String), String> {
     let (mut rpc_addr, mut daemon_rpc_port, net_s) = match net {
         Network::Mainnet => (
             "127.0.0.1:19084".to_string(),
@@ -1102,7 +1116,7 @@ fn wallet_rpc_settings(net: Network, conf: &duta_core::netparams::Conf) -> (Stri
         .get_last("walletrpcbind")
         .or_else(|| conf.get_last("rpcbind"))
     {
-        if let Some(addr) = normalize_wallet_loopback_bind(&b, net.default_wallet_rpc_port()) {
+        if let Some(addr) = parse_wallet_loopback_bind(&b, net.default_wallet_rpc_port())? {
             rpc_addr = addr;
         }
     }
@@ -1111,14 +1125,17 @@ fn wallet_rpc_settings(net: Network, conf: &duta_core::netparams::Conf) -> (Stri
         .get_last("daemonrpcport")
         .or_else(|| conf.get_last("rpcport"))
     {
-        if let Ok(v) = p.trim().parse::<u16>() {
-            if v > 0 {
-                daemon_rpc_port = v;
-            }
+        let v = p
+            .trim()
+            .parse::<u16>()
+            .map_err(|_| format!("invalid_daemon_rpc_port: {}", p.trim()))?;
+        if v == 0 {
+            return Err(format!("invalid_daemon_rpc_port: {}", p.trim()));
         }
+        daemon_rpc_port = v;
     }
 
-    (rpc_addr, daemon_rpc_port, net_s)
+    Ok((rpc_addr, daemon_rpc_port, net_s))
 }
 
 fn validate_conf_network_name(conf: &duta_core::netparams::Conf) -> Result<(), String> {
@@ -1126,6 +1143,31 @@ fn validate_conf_network_name(conf: &duta_core::netparams::Conf) -> Result<(), S
         let trimmed = raw.trim();
         if !trimmed.is_empty() && Network::parse_name(trimmed).is_none() {
             return Err(format!("invalid_network_name: {}", trimmed));
+        }
+    }
+    Ok(())
+}
+
+fn validate_conf_wallet_rpc_settings(
+    net: Network,
+    conf: &duta_core::netparams::Conf,
+) -> Result<(), String> {
+    if let Some(raw) = conf
+        .get_last("walletrpcbind")
+        .or_else(|| conf.get_last("rpcbind"))
+    {
+        let _ = parse_wallet_loopback_bind(&raw, net.default_wallet_rpc_port())?;
+    }
+    if let Some(raw) = conf
+        .get_last("daemonrpcport")
+        .or_else(|| conf.get_last("rpcport"))
+    {
+        let port = raw
+            .trim()
+            .parse::<u16>()
+            .map_err(|_| format!("invalid_daemon_rpc_port: {}", raw.trim()))?;
+        if port == 0 {
+            return Err(format!("invalid_daemon_rpc_port: {}", raw.trim()));
         }
     }
     Ok(())
@@ -1228,6 +1270,10 @@ fn main() {
         eprintln!("dutawalletd: {}", e);
         std::process::exit(1);
     }
+    if let Err(e) = validate_conf_wallet_rpc_settings(net, &conf) {
+        eprintln!("dutawalletd: {}", e);
+        std::process::exit(1);
+    }
 
     // datadir= override (optional). If present, re-load config from that dir.
     // NOTE: CLI --datadir always wins.
@@ -1246,11 +1292,21 @@ fn main() {
                     eprintln!("dutawalletd: {}", e);
                     std::process::exit(1);
                 }
+                if let Err(e) = validate_conf_wallet_rpc_settings(net, &conf) {
+                    eprintln!("dutawalletd: {}", e);
+                    std::process::exit(1);
+                }
             }
         }
     }
 
-    let (rpc_addr, daemon_rpc_port, net_s) = wallet_rpc_settings(net, &conf);
+    let (rpc_addr, daemon_rpc_port, net_s) = match wallet_rpc_settings(net, &conf) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("dutawalletd: {}", e);
+            std::process::exit(1);
+        }
+    };
     let startup_bind_warning = wallet_rpc_bind_warning(net, &conf);
 
     if matches!(args.command, Some(Cmd::Stop)) {
@@ -1379,7 +1435,7 @@ mod tests {
     use super::{
         build_http_request, clear_wallet_sensitive_state, load_wallet_db_to_state, read_pid_file,
         prepare_wallet_runtime_files, remove_pid_file_if_matches, save_wallet_sync_state,
-        validate_conf_network_name, wallet_rpc_bind_warning, Args, Cmd, validate_wallet_state_addresses,
+                validate_conf_network_name, validate_conf_wallet_rpc_settings, wallet_rpc_bind_warning, Args, Cmd, validate_wallet_state_addresses,
         wallet_rpc_settings, PidFileGuard, Utxo, WalletState,
     };
     use crate::{PendingInput, PendingTx, ReservedInput};
@@ -1618,7 +1674,8 @@ mod tests {
     #[test]
     fn wallet_rpc_settings_keeps_release_loopback_policy() {
         let conf = Conf::default();
-        let (rpc_addr, daemon_rpc_port, net_s) = wallet_rpc_settings(Network::Testnet, &conf);
+        let (rpc_addr, daemon_rpc_port, net_s) =
+            wallet_rpc_settings(Network::Testnet, &conf).unwrap();
         assert_eq!(rpc_addr, "127.0.0.1:18084");
         assert_eq!(daemon_rpc_port, 18083);
         assert_eq!(net_s, "testnet");
@@ -1627,7 +1684,8 @@ mod tests {
     #[test]
     fn wallet_rpc_settings_ignores_non_loopback_override() {
         let conf = Conf::parse("walletrpcbind=0.0.0.0:18084\ndaemonrpcport=18083\n");
-        let (rpc_addr, daemon_rpc_port, _) = wallet_rpc_settings(Network::Testnet, &conf);
+        let (rpc_addr, daemon_rpc_port, _) =
+            wallet_rpc_settings(Network::Testnet, &conf).unwrap();
         assert_eq!(rpc_addr, "127.0.0.1:18084");
         assert_eq!(daemon_rpc_port, 18083);
         assert_eq!(
@@ -1642,7 +1700,8 @@ mod tests {
     #[test]
     fn wallet_rpc_settings_accepts_custom_loopback_ports() {
         let conf = Conf::parse("walletrpcbind=127.0.0.1:28084\ndaemonrpcport=28083\n");
-        let (rpc_addr, daemon_rpc_port, net_s) = wallet_rpc_settings(Network::Testnet, &conf);
+        let (rpc_addr, daemon_rpc_port, net_s) =
+            wallet_rpc_settings(Network::Testnet, &conf).unwrap();
         assert_eq!(rpc_addr, "127.0.0.1:28084");
         assert_eq!(daemon_rpc_port, 28083);
         assert_eq!(net_s, "testnet");
@@ -1658,6 +1717,20 @@ mod tests {
         );
         let ok = Conf::parse("chain=mainnet\n");
         assert!(validate_conf_network_name(&ok).is_ok());
+    }
+
+    #[test]
+    fn runtime_config_rejects_invalid_wallet_rpc_bind_and_daemon_port() {
+        let bad_bind = Conf::parse("walletrpcbind=127.0.0.1:notaport\n");
+        assert_eq!(
+            validate_conf_wallet_rpc_settings(Network::Mainnet, &bad_bind).unwrap_err(),
+            "invalid_wallet_rpc_bind: 127.0.0.1:notaport"
+        );
+        let bad_port = Conf::parse("daemonrpcport=notaport\n");
+        assert_eq!(
+            validate_conf_wallet_rpc_settings(Network::Mainnet, &bad_port).unwrap_err(),
+            "invalid_daemon_rpc_port: notaport"
+        );
     }
 
     #[test]

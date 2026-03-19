@@ -35,6 +35,7 @@ mod tests {
     use super::{
         advance_utxo_sync_from_pruned_boundary, blocks_from_pruned_error, classify_wallet_history_tx, db_wallet_path,
         decode_seed_hex_for_migration, merge_pending_wallet_txs, net_from_name,
+        parse_wallet_utxo_snapshot_response,
         insufficient_funds_body, net_from_wallet_path, prune_confirmed_pending_txs,
         parse_prune_below_from_blocks_from_error, query_param, relay_fee_for_tx_bytes,
         retry_from_pruned_boundary_for_empty_wallet,
@@ -259,6 +260,42 @@ mod tests {
             advance_utxo_sync_from_pruned_boundary(&[], 6000, Some(5515)).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn wallet_utxo_snapshot_response_parses_active_daemon_state() {
+        let parsed = parse_wallet_utxo_snapshot_response(&json!({
+            "ok": true,
+            "tip_height": 5515,
+            "utxos": [
+                {
+                    "txid": "ab".repeat(32),
+                    "vout": 1,
+                    "amount_dut": 10_000,
+                    "height": 5500,
+                    "coinbase": false,
+                    "address": "dut1111111111111111111111111111111111111111"
+                }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(parsed.0, 5515);
+        assert_eq!(parsed.1.len(), 1);
+        assert_eq!(parsed.1[0].value, 10_000);
+        assert_eq!(parsed.1[0].height, 5500);
+        assert_eq!(parsed.1[0].vout, 1);
+    }
+
+    #[test]
+    fn wallet_utxo_snapshot_response_rejects_non_success_payloads() {
+        let err = parse_wallet_utxo_snapshot_response(&json!({
+            "ok": false,
+            "error": "wallet_utxo_snapshot_failed",
+            "detail": "invalid_address"
+        }))
+        .unwrap_err();
+        assert!(err.contains("wallet_utxo_snapshot_failed"));
+        assert!(err.contains("invalid_address"));
     }
 
     #[test]
@@ -1300,6 +1337,85 @@ fn daemon_blocks_from_with_retry(
     ))
 }
 
+fn parse_wallet_utxo_snapshot_response(
+    value: &serde_json::Value,
+) -> Result<(i64, Vec<super::Utxo>), String> {
+    if value.get("ok").and_then(|x| x.as_bool()) != Some(true) {
+        let error = value
+            .get("error")
+            .and_then(|x| x.as_str())
+            .unwrap_or("wallet_utxo_snapshot_failed");
+        let detail = value
+            .get("detail")
+            .and_then(|x| x.as_str())
+            .unwrap_or("daemon_rejected_wallet_utxo_snapshot");
+        return Err(format!("{error}: {detail}"));
+    }
+
+    let tip_height = value
+        .get("tip_height")
+        .and_then(|x| x.as_i64())
+        .ok_or_else(|| "daemon_bad_response:missing_tip_height".to_string())?;
+    let utxos_v = value
+        .get("utxos")
+        .and_then(|x| x.as_array())
+        .ok_or_else(|| "daemon_bad_response:missing_utxos".to_string())?;
+    let mut utxos = Vec::with_capacity(utxos_v.len());
+    for entry in utxos_v {
+        let txid = entry
+            .get("txid")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| "daemon_bad_response:missing_txid".to_string())?;
+        let vout = entry
+            .get("vout")
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| "daemon_bad_response:missing_vout".to_string())?;
+        let amount_dut = entry
+            .get("amount_dut")
+            .and_then(|x| x.as_i64())
+            .ok_or_else(|| "daemon_bad_response:missing_amount_dut".to_string())?;
+        let height = entry
+            .get("height")
+            .and_then(|x| x.as_i64())
+            .ok_or_else(|| "daemon_bad_response:missing_height".to_string())?;
+        let coinbase = entry
+            .get("coinbase")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        let address = entry
+            .get("address")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| "daemon_bad_response:missing_address".to_string())?;
+        utxos.push(super::Utxo {
+            value: amount_dut,
+            height,
+            coinbase,
+            address: address.to_string(),
+            txid: txid.to_string(),
+            vout: vout as u32,
+        });
+    }
+    utxos.sort_by(|a, b| (a.txid.clone(), a.vout).cmp(&(b.txid.clone(), b.vout)));
+    Ok((tip_height, utxos))
+}
+
+fn rebuild_wallet_utxos_via_daemon_snapshot(
+    addrs: &[String],
+    daemon_rpc_port: u16,
+) -> Result<(i64, Vec<super::Utxo>), String> {
+    let body = json!({ "addresses": addrs }).to_string();
+    let resp = super::http_post_local(
+        "127.0.0.1",
+        daemon_rpc_port,
+        "/wallet_utxos",
+        "application/json",
+        body.as_bytes(),
+    )?;
+    let value: serde_json::Value = serde_json::from_str(&resp)
+        .map_err(|e| format!("wallet_utxo_snapshot_invalid_json: {}", e))?;
+    parse_wallet_utxo_snapshot_response(&value)
+}
+
 fn wallet_refresh_error_code(detail: &str) -> &'static str {
     if detail.starts_with("connect_failed:")
         || detail.starts_with("write_failed:")
@@ -2189,6 +2305,24 @@ fn rebuild_wallet_utxos_via_blocks_from(
     sync_wallet_utxos_via_blocks_from(addrs, daemon_rpc_port, 0, &[])
 }
 
+fn rebuild_wallet_utxos_with_pruned_fallback(
+    addrs: &[String],
+    daemon_rpc_port: u16,
+) -> Result<(i64, Vec<super::Utxo>), String> {
+    match rebuild_wallet_utxos_via_daemon_snapshot(addrs, daemon_rpc_port) {
+        Ok(snapshot) => Ok(snapshot),
+        Err(snapshot_err)
+            if snapshot_err.starts_with("connect_failed:")
+                || snapshot_err.starts_with("write_failed:")
+                || snapshot_err.starts_with("read_failed:")
+                || snapshot_err.starts_with("http_invalid:") =>
+        {
+            Err(snapshot_err)
+        }
+        Err(_) => rebuild_wallet_utxos_via_blocks_from(addrs, daemon_rpc_port),
+    }
+}
+
 fn sync_wallet_utxos_via_blocks_from(
     addrs: &[String],
     daemon_rpc_port: u16,
@@ -2342,7 +2476,7 @@ fn refresh_wallet_utxos_runtime(
 
     let full_rebuild = wallet_needs_full_utxo_rebuild(current_utxos, cur_h, last_sync_height);
     if full_rebuild {
-        match rebuild_wallet_utxos_via_blocks_from(addrs, daemon_rpc_port) {
+        match rebuild_wallet_utxos_with_pruned_fallback(addrs, daemon_rpc_port) {
             Ok(v) => return Ok(v),
             Err(e) => {
                 if let Some(prune_below) =
@@ -2361,12 +2495,21 @@ fn refresh_wallet_utxos_runtime(
     }
 
     if cur_h > last_sync_height {
-        return sync_wallet_utxos_via_blocks_from(
+        return match sync_wallet_utxos_via_blocks_from(
             addrs,
             daemon_rpc_port,
             last_sync_height.saturating_add(1),
             current_utxos,
-        );
+        ) {
+            Ok(v) => Ok(v),
+            Err(e)
+                if e.starts_with("wallet_pruned_history_gap:")
+                    || e.starts_with("daemon_pruned_wallet_rescan_incomplete:") =>
+            {
+                rebuild_wallet_utxos_with_pruned_fallback(addrs, daemon_rpc_port).or(Err(e))
+            }
+            Err(e) => Err(e),
+        };
     }
 
     Ok((cur_h, current_utxos.to_vec()))

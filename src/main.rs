@@ -1434,8 +1434,9 @@ fn main() {
 mod tests {
     use super::{
         build_http_request, clear_wallet_sensitive_state, load_wallet_db_to_state, read_pid_file,
-        prepare_wallet_runtime_files, remove_pid_file_if_matches, save_wallet_sync_state,
-                validate_conf_network_name, validate_conf_wallet_rpc_settings, wallet_rpc_bind_warning, Args, Cmd, validate_wallet_state_addresses,
+        remove_pid_file_if_matches, save_wallet_sync_state, validate_conf_network_name,
+        validate_conf_wallet_rpc_settings, wallet_rpc_bind_warning, Args, Cmd,
+        validate_wallet_state_addresses,
         wallet_rpc_settings, PidFileGuard, Utxo, WalletState,
     };
     use crate::{PendingInput, PendingTx, ReservedInput};

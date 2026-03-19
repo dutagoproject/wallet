@@ -859,11 +859,11 @@ fn human_error_message(raw: &str) -> Option<String> {
     if lower.contains("connect_failed") {
         return Some("cannot reach wallet service".to_string());
     }
-    if lower.contains("read_failed") || lower.contains("write_failed") {
-        return Some("wallet service connection was interrupted".to_string());
-    }
     if lower.contains("wallet_open_failed") {
         return Some("could not open wallet file".to_string());
+    }
+    if lower.contains("read_failed") || lower.contains("write_failed") {
+        return Some("wallet service connection was interrupted".to_string());
     }
     if lower.contains("wallet_locked") {
         return Some("wallet is locked".to_string());
@@ -1000,13 +1000,34 @@ fn http_request_json(
         .write_all(req.as_bytes())
         .map_err(|e| format!("write_failed: {}", e))?;
 
-    let mut buf = Vec::new();
-    stream
-        .read_to_end(&mut buf)
-        .map_err(|e| format!("read_failed: {}", e))?;
+    let buf = read_http_response_bytes(&mut stream)?;
 
     let resp = String::from_utf8_lossy(&buf).to_string();
     parse_http_response(&resp)
+}
+
+fn read_http_response_bytes<R: Read>(reader: &mut R) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e)
+                if !buf.is_empty()
+                    && matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::BrokenPipe
+                    ) =>
+            {
+                break;
+            }
+            Err(e) => return Err(format!("read_failed: {}", e)),
+        }
+    }
+    Ok(buf)
 }
 
 fn parse_http_response(resp: &str) -> Result<String, String> {
@@ -1082,7 +1103,8 @@ fn decode_chunked_body(body: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        amount_text, format_response, history_amount_and_fee, resolve_wallet_path, Args, Cmd,
+        amount_text, format_response, history_amount_and_fee, human_error_message,
+        parse_http_response, read_http_response_bytes, resolve_wallet_path, Args, Cmd,
     };
     use clap::Parser;
     use serde_json::json;
@@ -1131,6 +1153,42 @@ mod tests {
             "decimals": 8
         });
         assert_eq!(amount_text(&item, "amount", "amount_dut"), "0.00000001 DUTA");
+    }
+
+    #[test]
+    fn partial_http_response_still_surfaces_error_body_after_connection_reset() {
+        struct ResetAfterBody {
+            body: Vec<u8>,
+            pos: usize,
+        }
+        impl std::io::Read for ResetAfterBody {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.pos >= self.body.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "connection reset by peer",
+                    ));
+                }
+                let n = std::cmp::min(buf.len(), self.body.len() - self.pos);
+                buf[..n].copy_from_slice(&self.body[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+
+        let mut reader = ResetAfterBody {
+            body: b"HTTP/1.1 400 Bad Request\r\nContent-Length: 75\r\n\r\n{\"ok\":false,\"error\":\"wallet_open_failed\",\"detail\":\"db_meta_read_failed\"}".to_vec(),
+            pos: 0,
+        };
+        let resp = read_http_response_bytes(&mut reader).unwrap();
+        let parsed = parse_http_response(&String::from_utf8_lossy(&resp)).unwrap_err();
+        assert!(parsed.contains("HTTP 400"));
+        assert!(parsed.contains("wallet_open_failed"));
+        assert!(parsed.contains("db_meta_read_failed"));
+        assert_eq!(
+            human_error_message(&parsed),
+            Some("could not open wallet file".to_string())
+        );
     }
 
     #[test]

@@ -375,6 +375,36 @@ fn pid_is_alive(pid: u32) -> bool {
     }
 }
 
+fn pid_matches_wallet_process(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+
+    #[cfg(windows)]
+    {
+        return std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.to_ascii_lowercase().contains("dutawalletd"))
+            .unwrap_or(false);
+    }
+
+    #[cfg(not(windows))]
+    {
+        let cmdline_path = format!("/proc/{}/cmdline", pid);
+        fs::read(&cmdline_path)
+            .ok()
+            .map(|bytes| {
+                String::from_utf8_lossy(&bytes)
+                    .to_ascii_lowercase()
+                    .contains("dutawalletd")
+            })
+            .unwrap_or(false)
+    }
+}
+
 fn read_pid_file(path: &str) -> Result<Option<u32>, String> {
     let raw = match fs::read_to_string(path) {
         Ok(v) => v,
@@ -429,7 +459,7 @@ fn stop_wallet_daemon(data_dir: &str) -> Result<(), String> {
         return Err(format!("wallet_not_running: missing_pid_file={}", pid_path));
     };
 
-    if !pid_is_alive(pid) {
+    if !pid_is_alive(pid) || !pid_matches_wallet_process(pid) {
         let _ = fs::remove_file(&pid_path);
         return Err(format!(
             "wallet_not_running: stale_pid={} removed_pid_file={}",
@@ -457,7 +487,7 @@ fn wallet_daemon_status(data_dir: &str, rpc_addr: &str) -> Result<i32, String> {
     let pid = read_pid_file(&pid_path)?;
     let rpc_reachable = TcpStream::connect(rpc_addr).is_ok();
     match pid {
-        Some(pid) if pid_is_alive(pid) => {
+        Some(pid) if pid_is_alive(pid) && pid_matches_wallet_process(pid) => {
             console_line("WALLET", ANSI_GREEN, "dutawalletd running");
             console_kv("PROC", ANSI_CYAN, "pid", pid.to_string());
             console_kv("RPC", ANSI_BLUE, "bind", rpc_addr);
@@ -1179,7 +1209,7 @@ fn spawn_daemon_wallet(data_dir: &str, rpc_addr: &str) -> Result<u32, String> {
     let pid_path = format!("{}/dutawalletd.pid", data_dir.trim_end_matches('/'));
     match read_pid_file(&pid_path) {
         Ok(Some(existing_pid)) => {
-            if pid_is_alive(existing_pid) {
+            if pid_is_alive(existing_pid) && pid_matches_wallet_process(existing_pid) {
                 return Err(format!(
                     "wallet_daemon_already_running: pid={}",
                     existing_pid
@@ -1785,6 +1815,20 @@ mod tests {
 
         let _ = std::fs::remove_file(&pid_path);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_matches_wallet_process_rejects_foreign_live_pid() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        assert!(pid_is_alive(pid));
+        assert!(!pid_matches_wallet_process(pid));
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[cfg(unix)]

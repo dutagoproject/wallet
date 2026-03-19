@@ -174,6 +174,20 @@ mod tests {
     }
 
     #[test]
+    fn wallet_history_incomplete_error_mentions_prune_boundary_when_known() {
+        let err = super::wallet_history_incomplete_error(Some(303));
+        assert!(err.contains("wallet_history_incomplete_on_pruned_daemon"));
+        assert!(err.contains("prune_below=303"));
+    }
+
+    #[test]
+    fn wallet_history_incomplete_error_without_boundary_still_fail_closes() {
+        let err = super::wallet_history_incomplete_error(None);
+        assert!(err.contains("wallet_history_incomplete_on_pruned_daemon"));
+        assert!(!err.contains("prune_below="));
+    }
+
+    #[test]
     fn empty_wallet_with_known_anchor_does_not_force_full_rebuild() {
         assert!(!wallet_needs_full_utxo_rebuild(&[], 1500, 1185));
         assert!(wallet_needs_full_utxo_rebuild(&[], 1500, 0));
@@ -1266,6 +1280,16 @@ fn blocks_from_pruned_error(from: i64, prune_below: Option<i64>) -> String {
     }
 }
 
+fn wallet_history_incomplete_error(prune_below: Option<i64>) -> String {
+    match prune_below {
+        Some(height) => format!(
+            "wallet_history_incomplete_on_pruned_daemon: prune_below={} action=use_unpruned_daemon_for_full_history",
+            height
+        ),
+        None => "wallet_history_incomplete_on_pruned_daemon: action=use_unpruned_daemon_for_full_history".to_string(),
+    }
+}
+
 fn parse_prune_below_from_blocks_from_error(detail: &str) -> Option<i64> {
     detail
         .split("prune_below=")
@@ -1273,6 +1297,14 @@ fn parse_prune_below_from_blocks_from_error(detail: &str) -> Option<i64> {
         .and_then(|tail| tail.split_whitespace().next())
         .and_then(|value| value.parse::<i64>().ok())
         .filter(|value| *value >= 0)
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct WalletHistoryScan {
+    height: i64,
+    txs: Vec<(String, i64, i64, String, i64, i64, bool, Vec<serde_json::Value>)>,
+    truncated: bool,
+    prune_below: Option<i64>,
 }
 
 fn advance_history_scan_from_pruned_boundary(from: i64, prune_below: Option<i64>) -> Option<i64> {
@@ -2145,10 +2177,10 @@ fn sync_pending_txs_with_chain_and_mempool(
         let needs_chain_probe =
             pending_chain_probe_required(wallet_addrs, pending_txs, &mempool_txids);
         if needs_chain_probe {
-            if let Ok((_cur_h, scanned_confirmed)) =
+            if let Ok(scan) =
                 scan_wallet_txs_via_blocks_from(wallet_addrs, daemon_rpc_port)
             {
-                if prune_confirmed_pending_txs(pending_txs, &scanned_confirmed) {
+                if prune_confirmed_pending_txs(pending_txs, &scan.txs) {
                     changed = true;
                 }
             }
@@ -2645,13 +2677,7 @@ fn classify_wallet_history_tx(
 fn scan_wallet_txs_via_blocks_from(
     addrs: &[String],
     daemon_rpc_port: u16,
-) -> Result<
-    (
-        i64,
-        Vec<(String, i64, i64, String, i64, i64, bool, Vec<serde_json::Value>)>,
-    ),
-    String,
-> {
+) -> Result<WalletHistoryScan, String> {
     let addr_set: HashSet<&str> = addrs.iter().map(|s| s.as_str()).collect();
     let cur_h = daemon_tip_height_with_retry(daemon_rpc_port, 0)?;
 
@@ -2659,6 +2685,8 @@ fn scan_wallet_txs_via_blocks_from(
         Vec::new();
     let mut from: i64 = 0;
     let limit: i64 = 256;
+    let mut truncated = false;
+    let mut prune_below = None;
 
     loop {
         let v = daemon_blocks_from_with_retry(daemon_rpc_port, from, limit)?;
@@ -2670,6 +2698,8 @@ fn scan_wallet_txs_via_blocks_from(
                 from,
                 v.get("prune_below").and_then(|x| x.as_i64()),
             ) {
+                truncated = true;
+                prune_below = v.get("prune_below").and_then(|x| x.as_i64());
                 from = next_from;
                 continue;
             }
@@ -2717,7 +2747,12 @@ fn scan_wallet_txs_via_blocks_from(
             .then_with(|| b.2.cmp(&a.2))
             .then_with(|| a.0.cmp(&b.0))
     });
-    Ok((cur_h, out))
+    Ok(WalletHistoryScan {
+        height: cur_h,
+        txs: out,
+        truncated,
+        prune_below,
+    })
 }
 
 fn new_wallet_keypair_from_entropy(
@@ -3763,13 +3798,11 @@ pub(crate) fn handle_request(
                         )
                     };
 
-                    let txcount = match scan_wallet_txs_via_blocks_from(&addrs, daemon_rpc_port) {
-                        Ok((_cur_h, txs)) => {
-                            let merged = merge_pending_wallet_txs(txs, &pending_txs);
-                            merged.len()
-                        }
-                        Err(_) => pending_txs.len(),
-                    };
+                    let history_scan = scan_wallet_txs_via_blocks_from(&addrs, daemon_rpc_port).ok();
+                    let txcount = history_scan
+                        .as_ref()
+                        .filter(|scan| !scan.truncated)
+                        .map(|scan| merge_pending_wallet_txs(scan.txs.clone(), &pending_txs).len());
 
                     let result = json!({
                         "walletname": wallet_public_name(&wallet_path),
@@ -3792,6 +3825,9 @@ pub(crate) fn handle_request(
                         "height": snapshot.height,
                         "utxos": snapshot.utxos,
                         "pending_txs": snapshot.pending_txs,
+                        "wallet_history_complete": history_scan.as_ref().map(|scan| !scan.truncated).unwrap_or(false),
+                        "wallet_history_pruned": history_scan.as_ref().map(|scan| scan.truncated).unwrap_or(false),
+                        "wallet_history_prune_below": history_scan.as_ref().and_then(|scan| scan.prune_below),
                         "unit": DISPLAY_UNIT,
                         "display_unit": DISPLAY_UNIT,
                         "base_unit": BASE_UNIT,
@@ -4057,7 +4093,7 @@ pub(crate) fn handle_request(
                         (ws.wallet_path.clone(), addrs, ws.pending_txs.clone())
                     };
 
-                    let (cur_h, txs) =
+                    let scan =
                         match scan_wallet_txs_via_blocks_from(&addrs, daemon_rpc_port) {
                             Ok(t) => t,
                             Err(e) => {
@@ -4069,6 +4105,20 @@ pub(crate) fn handle_request(
                                 return;
                             }
                         };
+                    if scan.truncated {
+                        super::respond_json(
+                            request,
+                            tiny_http::StatusCode(502),
+                            rpc_response_err(
+                                id,
+                                -32603,
+                                &wallet_history_incomplete_error(scan.prune_below),
+                            ),
+                        );
+                        return;
+                    }
+                    let cur_h = scan.height;
+                    let txs = scan.txs;
                     let mut pending_txs = pending_txs;
                     sync_pending_txs_with_chain_and_mempool(
                         &wallet_path,
@@ -4164,7 +4214,7 @@ pub(crate) fn handle_request(
                         (ws.wallet_path.clone(), addrs, ws.pending_txs.clone())
                     };
 
-                    let (cur_h, txs) =
+                    let scan =
                         match scan_wallet_txs_via_blocks_from(&addrs, daemon_rpc_port) {
                             Ok(t) => t,
                             Err(e) => {
@@ -4176,6 +4226,20 @@ pub(crate) fn handle_request(
                                 return;
                             }
                         };
+                    if scan.truncated {
+                        super::respond_json(
+                            request,
+                            tiny_http::StatusCode(502),
+                            rpc_response_err(
+                                id,
+                                -32603,
+                                &wallet_history_incomplete_error(scan.prune_below),
+                            ),
+                        );
+                        return;
+                    }
+                    let cur_h = scan.height;
+                    let txs = scan.txs;
                     let mut pending_txs = pending_txs;
                     sync_pending_txs_with_chain_and_mempool(
                         &wallet_path,

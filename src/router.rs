@@ -199,6 +199,119 @@ mod tests {
     }
 
     #[test]
+    fn persist_runtime_reserved_inputs_keeps_runtime_state_when_save_fails() {
+        let ws = super::super::WalletState {
+            wallet_path: "wallet.json".to_string(),
+            primary_address: "dut4bf13a86a0eaf1a76ad927521d8ca032e3c16d53".to_string(),
+            keys: Default::default(),
+            pubkeys: Default::default(),
+            utxos: vec![super::super::Utxo {
+                value: 200_000_000,
+                height: 12,
+                coinbase: false,
+                address: "dut4bf13a86a0eaf1a76ad927521d8ca032e3c16d53".to_string(),
+                txid: "aa".repeat(32),
+                vout: 0,
+            }],
+            pending_txs: vec![],
+            reserved_inputs: vec![],
+            last_sync_height: 12,
+            seed_hex: None,
+            next_index: 0,
+            is_db: false,
+            locked: false,
+            db_passphrase: None,
+        };
+        {
+            let mut g = super::super::wallet_lock_or_recover();
+            *g = Some(ws.clone());
+        }
+
+        let next_reserved = vec![super::super::ReservedInput {
+            txid: "bb".repeat(32),
+            vout: 1,
+            timestamp: 1_700_000_000,
+        }];
+        let err = super::persist_runtime_reserved_inputs(
+            &ws.wallet_path,
+            &ws.utxos,
+            13,
+            &next_reserved,
+        )
+        .unwrap_err();
+        assert!(!err.is_empty());
+
+        let g = super::super::wallet_lock_or_recover();
+        let current = g.as_ref().unwrap();
+        assert_eq!(current.last_sync_height, 12);
+        assert!(current.reserved_inputs.is_empty());
+    }
+
+    #[test]
+    fn persist_runtime_full_state_keeps_runtime_state_when_save_fails() {
+        let ws = super::super::WalletState {
+            wallet_path: "wallet.json".to_string(),
+            primary_address: "dut4bf13a86a0eaf1a76ad927521d8ca032e3c16d53".to_string(),
+            keys: Default::default(),
+            pubkeys: Default::default(),
+            utxos: vec![super::super::Utxo {
+                value: 200_000_000,
+                height: 12,
+                coinbase: false,
+                address: "dut4bf13a86a0eaf1a76ad927521d8ca032e3c16d53".to_string(),
+                txid: "aa".repeat(32),
+                vout: 0,
+            }],
+            pending_txs: vec![],
+            reserved_inputs: vec![],
+            last_sync_height: 12,
+            seed_hex: None,
+            next_index: 0,
+            is_db: false,
+            locked: false,
+            db_passphrase: None,
+        };
+        {
+            let mut g = super::super::wallet_lock_or_recover();
+            *g = Some(ws.clone());
+        }
+
+        let next_pending = vec![super::super::PendingTx {
+            txid: "cc".repeat(32),
+            category: "send".to_string(),
+            amount: -100_000,
+            fee: 10_000,
+            change: 90_000,
+            timestamp: 1_700_000_000,
+            details: vec![],
+            spent_inputs: vec![super::super::PendingInput {
+                txid: "aa".repeat(32),
+                vout: 0,
+            }],
+        }];
+        let next_reserved = vec![super::super::ReservedInput {
+            txid: "aa".repeat(32),
+            vout: 0,
+            timestamp: 1_700_000_000,
+        }];
+        let err = super::persist_runtime_full_state(
+            &ws.wallet_path,
+            &ws.utxos,
+            13,
+            &next_pending,
+            &next_reserved,
+        )
+        .unwrap_err();
+        assert!(!err.is_empty());
+
+        let g = super::super::wallet_lock_or_recover();
+        let current = g.as_ref().unwrap();
+        assert_eq!(current.last_sync_height, 12);
+        assert!(current.pending_txs.is_empty());
+        assert!(current.reserved_inputs.is_empty());
+    }
+
+    #[test]
     fn wallet_health_response_keeps_closed_wallet_healthy() {
         let (status, body) = wallet_health_response(false, Ok((0,)));
         assert_eq!(status, tiny_http::StatusCode(200));
@@ -1875,15 +1988,45 @@ fn persist_runtime_reserved_inputs(
     cur_h: i64,
     reserved_inputs: &[super::ReservedInput],
 ) -> Result<(), String> {
-    {
-        let mut g = super::wallet_lock_or_recover();
-        if let Some(ws) = g.as_mut() {
-            ws.utxos = utxos.to_vec();
-            ws.last_sync_height = cur_h;
-            ws.reserved_inputs = reserved_inputs.to_vec();
-        }
+    super::save_wallet_sync_state(wallet_path, utxos, cur_h, reserved_inputs)?;
+    let mut g = super::wallet_lock_or_recover();
+    if let Some(ws) = g.as_mut() {
+        ws.utxos = utxos.to_vec();
+        ws.last_sync_height = cur_h;
+        ws.reserved_inputs = reserved_inputs.to_vec();
     }
-    super::save_wallet_sync_state(wallet_path, utxos, cur_h, reserved_inputs)
+    Ok(())
+}
+
+fn restore_runtime_sync_state(
+    utxos: &[super::Utxo],
+    cur_h: i64,
+    reserved_inputs: &[super::ReservedInput],
+) {
+    let mut g = super::wallet_lock_or_recover();
+    if let Some(ws) = g.as_mut() {
+        ws.utxos = utxos.to_vec();
+        ws.last_sync_height = cur_h;
+        ws.reserved_inputs = reserved_inputs.to_vec();
+    }
+}
+
+fn persist_runtime_full_state(
+    wallet_path: &str,
+    utxos: &[super::Utxo],
+    cur_h: i64,
+    pending_txs: &[super::PendingTx],
+    reserved_inputs: &[super::ReservedInput],
+) -> Result<(), String> {
+    super::save_wallet_full_state(wallet_path, utxos, cur_h, pending_txs, reserved_inputs)?;
+    let mut g = super::wallet_lock_or_recover();
+    if let Some(ws) = g.as_mut() {
+        ws.utxos = utxos.to_vec();
+        ws.last_sync_height = cur_h;
+        ws.pending_txs = pending_txs.to_vec();
+        ws.reserved_inputs = reserved_inputs.to_vec();
+    }
+    Ok(())
 }
 
 fn prune_stale_reserved_inputs(
@@ -2337,16 +2480,7 @@ fn reconcile_pending_and_reserved_state(
                 state_changed = true;
             }
             if state_changed {
-                {
-                    let mut g = super::wallet_lock_or_recover();
-                    if let Some(ws) = g.as_mut() {
-                        ws.pending_txs = active_pending.clone();
-                        ws.reserved_inputs = reserved_inputs.clone();
-                        ws.utxos = utxos.to_vec();
-                        ws.last_sync_height = cur_h;
-                    }
-                }
-                if let Err(e) = super::save_wallet_full_state(
+                if let Err(e) = persist_runtime_full_state(
                     wallet_path,
                     utxos,
                     cur_h,
@@ -5643,6 +5777,7 @@ pub(crate) fn handle_request(
                         cur_h,
                         &reserved_inputs_after_select,
                     ) {
+                        restore_runtime_sync_state(&utxos, cur_h, &reserved_inputs);
                         super::respond_json(
                             request,
                             tiny_http::StatusCode(500),
@@ -5844,21 +5979,11 @@ pub(crate) fn handle_request(
                     // Persist to disk and update in-memory together.
                     let persist_result = super::save_wallet_full_state(
                         &wallet_path,
-                        &new_utxos,
-                        cur_h,
-                        &pending_after,
-                        &reserved_inputs_after_select,
-                    );
-
-                    {
-                        let mut g = super::wallet_lock_or_recover();
-                        if let Some(ws) = g.as_mut() {
-                            ws.utxos = new_utxos.clone();
-                            ws.last_sync_height = cur_h;
-                            ws.pending_txs = pending_after.clone();
-                            ws.reserved_inputs = reserved_inputs_after_select.clone();
-                        }
-                    }
+                    &new_utxos,
+                    cur_h,
+                    &pending_after,
+                    &reserved_inputs_after_select,
+                );
 
                     let body = send_success_body(
                         &txid,
@@ -8446,6 +8571,7 @@ pub(crate) fn handle_request(
                 cur_h,
                 &reserved_inputs_after_select,
             ) {
+                restore_runtime_sync_state(&utxos, cur_h, &reserved_inputs);
                 super::respond_json(
                     request,
                     tiny_http::StatusCode(500),
@@ -8582,22 +8708,13 @@ pub(crate) fn handle_request(
                 pending
             };
             release_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected);
-            let persist_result = super::save_wallet_full_state(
+            let persist_result = persist_runtime_full_state(
                 &wallet_path,
                 &new_utxos,
                 cur_h,
                 &pending_after,
                 &reserved_inputs_after_select,
             );
-            {
-                let mut g = super::wallet_lock_or_recover();
-                if let Some(ws) = g.as_mut() {
-                    ws.utxos = new_utxos.clone();
-                    ws.last_sync_height = cur_h;
-                    ws.pending_txs = pending_after.clone();
-                    ws.reserved_inputs = reserved_inputs_after_select.clone();
-                }
-            }
             if let Err(e) = persist_result {
                 super::respond_json(
                     request,
@@ -9109,6 +9226,7 @@ pub(crate) fn handle_request(
                 cur_h,
                 &reserved_inputs_after_select,
             ) {
+                restore_runtime_sync_state(&utxos, cur_h, &reserved_inputs);
                 super::respond_json(
                     request,
                     tiny_http::StatusCode(500),
@@ -9289,23 +9407,13 @@ pub(crate) fn handle_request(
             };
             release_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected);
 
-                    let persist_result = super::save_wallet_full_state(
+                    let persist_result = persist_runtime_full_state(
                         &wallet_path,
                         &new_utxos,
                         cur_h,
                         &pending_after,
                         &reserved_inputs_after_select,
                     );
-
-                    {
-                        let mut g = super::wallet_lock_or_recover();
-                        if let Some(ws) = g.as_mut() {
-                            ws.utxos = new_utxos.clone();
-                            ws.last_sync_height = cur_h;
-                            ws.pending_txs = pending_after.clone();
-                            ws.reserved_inputs = reserved_inputs_after_select.clone();
-                        }
-                    }
 
                     if let Err(e) = persist_result {
                         wwlog!(

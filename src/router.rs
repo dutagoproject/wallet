@@ -3,12 +3,24 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use zeroize::Zeroize;
 use duta_core::amount::{
-    format_dut_i64, parse_duta_to_dut_i64, BASE_UNIT, DEFAULT_DUST_CHANGE_DUT,
+    parse_duta_to_dut_i64, BASE_UNIT, DEFAULT_DUST_CHANGE_DUT,
     DEFAULT_MAX_WALLET_FEE_DUT, DEFAULT_MIN_RELAY_FEE_PER_KB_DUT, DEFAULT_WALLET_FEE_DUT,
     DISPLAY_UNIT, DUTA_DECIMALS,
 };
 
 const MAX_WALLET_SEND_INPUTS: usize = 64;
+
+fn format_dut_i64(amount_dut: i64) -> String {
+    let scale = 10i128.pow(DUTA_DECIMALS as u32);
+    let magnitude = (amount_dut as i128).abs();
+    let whole = magnitude / scale;
+    let frac = magnitude % scale;
+    let sign = if amount_dut < 0 { "-" } else { "" };
+    format!(
+        "{sign}{whole}.{frac:0width$}",
+        width = DUTA_DECIMALS as usize
+    )
+}
 
 fn status_for_body_err(detail: &str) -> tiny_http::StatusCode {
     if detail.starts_with("body_too_large") {
@@ -315,8 +327,12 @@ mod tests {
     fn send_success_body_marks_persist_success() {
         let body = send_success_body("tx123", 50, 1, 9, 2, 123, Ok(()));
         assert_eq!(body.get("ok").and_then(|x| x.as_bool()), Some(true));
-        assert_eq!(body.get("amount").and_then(|x| x.as_str()), Some("0.0000005"));
+        assert_eq!(body.get("amount").and_then(|x| x.as_str()), Some("0.00000050"));
         assert_eq!(body.get("amount_dut").and_then(|x| x.as_i64()), Some(50));
+        assert_eq!(body.get("fee").and_then(|x| x.as_str()), Some("0.00000001"));
+        assert_eq!(body.get("fee_dut").and_then(|x| x.as_i64()), Some(1));
+        assert_eq!(body.get("change").and_then(|x| x.as_str()), Some("0.00000009"));
+        assert_eq!(body.get("change_dut").and_then(|x| x.as_i64()), Some(9));
         assert_eq!(body.get("unit").and_then(|x| x.as_str()), Some("DUTA"));
         assert_eq!(
             body.get("display_unit").and_then(|x| x.as_str()),
@@ -810,15 +826,15 @@ mod tests {
         assert_eq!(body.get("detail").and_then(|v| v.as_str()), Some("confirmed_spendable_utxos_exhausted_or_reserved"));
         assert_eq!(body.get("need").and_then(|v| v.as_str()), Some("0.00150001"));
         assert_eq!(body.get("need_dut").and_then(|v| v.as_i64()), Some(150_001));
-        assert_eq!(body.get("have").and_then(|v| v.as_str()), Some("0"));
+        assert_eq!(body.get("have").and_then(|v| v.as_str()), Some("0.00000000"));
         assert_eq!(body.get("have_dut").and_then(|v| v.as_i64()), Some(0));
-        assert_eq!(body.get("fee").and_then(|v| v.as_str()), Some("0.0001"));
+        assert_eq!(body.get("fee").and_then(|v| v.as_str()), Some("0.00010000"));
         assert_eq!(body.get("fee_dut").and_then(|v| v.as_i64()), Some(10_000));
         assert_eq!(body.get("spendable_utxos").and_then(|v| v.as_u64()), Some(0));
         assert_eq!(body.get("reserved_outpoints").and_then(|v| v.as_u64()), Some(20));
-        assert_eq!(body.get("pending_send").and_then(|v| v.as_str()), Some("0.0230002"));
+        assert_eq!(body.get("pending_send").and_then(|v| v.as_str()), Some("0.02300020"));
         assert_eq!(body.get("pending_send_dut").and_then(|v| v.as_i64()), Some(2_300_020));
-        assert_eq!(body.get("pending_change").and_then(|v| v.as_str()), Some("919.9769998"));
+        assert_eq!(body.get("pending_change").and_then(|v| v.as_str()), Some("919.97699980"));
         assert_eq!(body.get("pending_change_dut").and_then(|v| v.as_i64()), Some(91_997_699_980));
         assert_eq!(body.get("unit").and_then(|v| v.as_str()), Some("DUTA"));
         assert_eq!(body.get("base_unit").and_then(|v| v.as_str()), Some("dut"));
@@ -828,18 +844,18 @@ mod tests {
     fn fee_error_bodies_expose_display_and_raw_amounts() {
         let low = super::fee_too_low_body(10_000, 40_000, 3567);
         assert_eq!(low.get("error").and_then(|v| v.as_str()), Some("fee_too_low"));
-        assert_eq!(low.get("fee").and_then(|v| v.as_str()), Some("0.0001"));
+        assert_eq!(low.get("fee").and_then(|v| v.as_str()), Some("0.00010000"));
         assert_eq!(low.get("fee_dut").and_then(|v| v.as_i64()), Some(10_000));
-        assert_eq!(low.get("min_fee").and_then(|v| v.as_str()), Some("0.0004"));
+        assert_eq!(low.get("min_fee").and_then(|v| v.as_str()), Some("0.00040000"));
         assert_eq!(low.get("min_fee_dut").and_then(|v| v.as_i64()), Some(40_000));
         assert_eq!(low.get("size").and_then(|v| v.as_u64()), Some(3567));
         assert_eq!(low.get("unit").and_then(|v| v.as_str()), Some("DUTA"));
 
         let high = super::fee_too_high_body(2_000_000_000, 1_000_000_000);
         assert_eq!(high.get("error").and_then(|v| v.as_str()), Some("fee_too_high"));
-        assert_eq!(high.get("fee").and_then(|v| v.as_str()), Some("20"));
+        assert_eq!(high.get("fee").and_then(|v| v.as_str()), Some("20.00000000"));
         assert_eq!(high.get("fee_dut").and_then(|v| v.as_i64()), Some(2_000_000_000));
-        assert_eq!(high.get("max_fee").and_then(|v| v.as_str()), Some("10"));
+        assert_eq!(high.get("max_fee").and_then(|v| v.as_str()), Some("10.00000000"));
         assert_eq!(high.get("max_fee_dut").and_then(|v| v.as_i64()), Some(1_000_000_000));
         assert_eq!(high.get("unit").and_then(|v| v.as_str()), Some("DUTA"));
     }
@@ -856,14 +872,23 @@ mod tests {
         assert_eq!(body.get("error").and_then(|v| v.as_str()), Some("too_many_inputs"));
         assert_eq!(body.get("need").and_then(|v| v.as_str()), Some("0.00150001"));
         assert_eq!(body.get("need_dut").and_then(|v| v.as_i64()), Some(150_001));
-        assert_eq!(body.get("have").and_then(|v| v.as_str()), Some("0.0005"));
+        assert_eq!(body.get("have").and_then(|v| v.as_str()), Some("0.00050000"));
         assert_eq!(body.get("have_dut").and_then(|v| v.as_i64()), Some(50_000));
-        assert_eq!(body.get("fee").and_then(|v| v.as_str()), Some("0.0001"));
+        assert_eq!(body.get("fee").and_then(|v| v.as_str()), Some("0.00010000"));
         assert_eq!(body.get("fee_dut").and_then(|v| v.as_i64()), Some(10_000));
-        assert_eq!(body.get("pending_send").and_then(|v| v.as_str()), Some("0.0012"));
-        assert_eq!(body.get("pending_change").and_then(|v| v.as_str()), Some("0.89"));
-        assert_eq!(body.get("reserved").and_then(|v| v.as_str()), Some("450"));
+        assert_eq!(body.get("pending_send").and_then(|v| v.as_str()), Some("0.00120000"));
+        assert_eq!(body.get("pending_change").and_then(|v| v.as_str()), Some("0.89000000"));
+        assert_eq!(body.get("reserved").and_then(|v| v.as_str()), Some("450.00000000"));
         assert_eq!(body.get("unit").and_then(|v| v.as_str()), Some("DUTA"));
+    }
+
+    #[test]
+    fn wallet_display_amounts_keep_fixed_eight_decimals_while_raw_stays_intact() {
+        let body = super::fee_too_high_body(50_000_000, 100_000_000);
+        assert_eq!(body.get("fee").and_then(|v| v.as_str()), Some("0.50000000"));
+        assert_eq!(body.get("fee_dut").and_then(|v| v.as_i64()), Some(50_000_000));
+        assert_eq!(body.get("max_fee").and_then(|v| v.as_str()), Some("1.00000000"));
+        assert_eq!(body.get("max_fee_dut").and_then(|v| v.as_i64()), Some(100_000_000));
     }
 
     #[test]

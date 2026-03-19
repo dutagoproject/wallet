@@ -4,7 +4,8 @@
 //!   RUSTFLAGS="-Dwarnings" cargo build --release -p dutawalletd --bin duta-wallet-cli
 
 use clap::{Parser, Subcommand};
-use duta_core::amount::{format_dut_i64, parse_duta_to_dut_i64, DISPLAY_UNIT};
+use duta_core::amount::{parse_duta_to_dut_i64, DISPLAY_UNIT};
+use duta_core::amount::DUTA_DECIMALS;
 use duta_core::netparams::Network;
 use serde_json::json;
 use std::io::{Read, Write};
@@ -18,6 +19,18 @@ const ANSI_BG_BLUE: &str = "\x1b[44m";
 const ANSI_BG_GREEN: &str = "\x1b[42m";
 const ANSI_BG_YELLOW: &str = "\x1b[43m";
 const ANSI_BG_RED: &str = "\x1b[41m";
+
+fn format_dut_i64(amount_dut: i64) -> String {
+    let scale = 10i128.pow(DUTA_DECIMALS as u32);
+    let magnitude = (amount_dut as i128).abs();
+    let whole = magnitude / scale;
+    let frac = magnitude % scale;
+    let sign = if amount_dut < 0 { "-" } else { "" };
+    format!(
+        "{sign}{whole}.{frac:0width$}",
+        width = DUTA_DECIMALS as usize
+    )
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "duta-wallet-cli", about = "DUTA wallet CLI (RPC client)")]
@@ -1105,8 +1118,8 @@ mod tests {
             "fee_dut": 10000
         });
         let (amount_text, fee_text) = history_amount_and_fee(&item);
-        assert_eq!(amount_text, "0 DUTA");
-        assert_eq!(fee_text.as_deref(), Some("fee 0.0001 DUTA"));
+        assert_eq!(amount_text, "0.00000000 DUTA");
+        assert_eq!(fee_text.as_deref(), Some("fee 0.00010000 DUTA"));
     }
 
     #[test]
@@ -1129,7 +1142,7 @@ mod tests {
             "base_unit": "dut",
             "decimals": 8
         });
-        assert_eq!(amount_text(&item, "amount", "amount_dut"), "598 DUTA");
+        assert_eq!(amount_text(&item, "amount", "amount_dut"), "598.00000000 DUTA");
     }
 
     #[test]
@@ -1158,6 +1171,20 @@ mod tests {
         );
         assert!(out.contains("balance: 18720.76996788 DUTA"));
         assert!(out.contains("spendable: 15960.76996788 DUTA"));
+        assert!(out.contains("reserved: 0.00000000 DUTA"));
+        assert!(out.contains("pending send: 0.00000000 DUTA"));
+        assert!(out.contains("pending change: 0.00000000 DUTA"));
+    }
+
+    #[test]
+    fn amount_text_keeps_fixed_eight_decimal_places() {
+        let item = json!({
+            "amount_dut": 50_000_000,
+            "unit": "DUTA",
+            "base_unit": "dut",
+            "decimals": 8
+        });
+        assert_eq!(amount_text(&item, "amount", "amount_dut"), "0.50000000 DUTA");
     }
 
     #[test]

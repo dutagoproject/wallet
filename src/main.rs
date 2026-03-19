@@ -962,6 +962,17 @@ fn write_pid_file(data_dir: &str, name: &str) -> std::io::Result<()> {
     durable_write_string(&path, &format!("{}\n", pid)).map_err(std::io::Error::other)
 }
 
+fn prepare_wallet_runtime_files(data_dir: &str) -> Result<PidFileGuard, String> {
+    write_pid_file(data_dir, "dutawalletd.pid")
+        .map_err(|e| format!("wallet_write_pid_failed: {}", e))?;
+    let pid_guard = PidFileGuard::new(data_dir, "dutawalletd.pid");
+    if let Err(e) = walletlog::init(data_dir) {
+        remove_pid_file_if_matches(&pid_guard.path, pid_guard.pid);
+        return Err(format!("wallet_log_init_failed: {}", e));
+    }
+    Ok(pid_guard)
+}
+
 struct PidFileGuard {
     path: String,
     pid: u32,
@@ -1312,25 +1323,24 @@ fn main() {
         }
         return;
     }
-    if let Err(e) = write_pid_file(&data_dir, "dutawalletd.pid") {
-        eprintln!("dutawalletd: write pid failed: {}", e);
-    }
-    let _pid_guard = PidFileGuard::new(&data_dir, "dutawalletd.pid");
+    let _pid_guard = match prepare_wallet_runtime_files(&data_dir) {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("dutawalletd: {}", e);
+            std::process::exit(1);
+        }
+    };
     install_pid_cleanup_handlers(&data_dir, "dutawalletd.pid");
 
-    if let Err(e) = walletlog::init(&data_dir) {
-        eprintln!("wallet_rpc: LOG_INIT_FAIL data={} err={}", data_dir, e);
-    } else {
-        std::panic::set_hook(Box::new(|info| {
-            wedlog!("wallet_rpc: PANIC {}", info);
-        }));
-        wdlog!(
-            "wallet_rpc: START data={} stdout_log={}/dutawalletd.stdout.log stderr_log={}/dutawalletd.stderr.log",
-            data_dir,
-            data_dir,
-            data_dir
-        );
-    }
+    std::panic::set_hook(Box::new(|info| {
+        wedlog!("wallet_rpc: PANIC {}", info);
+    }));
+    wdlog!(
+        "wallet_rpc: START data={} stdout_log={}/dutawalletd.stdout.log stderr_log={}/dutawalletd.stderr.log",
+        data_dir,
+        data_dir,
+        data_dir
+    );
 
     print_wallet_startup_banner(net, &data_dir, &rpc_addr, daemon_rpc_port);
     if let Some(msg) = startup_bind_warning.as_deref() {
@@ -1350,9 +1360,9 @@ fn main() {
 mod tests {
     use super::{
         build_http_request, clear_wallet_sensitive_state, load_wallet_db_to_state, read_pid_file,
-        remove_pid_file_if_matches, save_wallet_sync_state, wallet_rpc_bind_warning,
-        Args, Cmd, validate_wallet_state_addresses, wallet_rpc_settings, PidFileGuard, Utxo,
-        WalletState,
+        prepare_wallet_runtime_files, remove_pid_file_if_matches, save_wallet_sync_state,
+        wallet_rpc_bind_warning, Args, Cmd, validate_wallet_state_addresses,
+        wallet_rpc_settings, PidFileGuard, Utxo, WalletState,
     };
     use crate::{PendingInput, PendingTx, ReservedInput};
     use clap::Parser;
@@ -1671,6 +1681,33 @@ mod tests {
         assert!(pid_path.exists());
 
         let _ = std::fs::remove_file(&pid_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_wallet_runtime_files_fails_closed_on_readonly_datadir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "duta-wallet-readonly-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let err = match prepare_wallet_runtime_files(dir.to_str().unwrap()) {
+            Ok(_) => panic!("readonly datadir should fail"),
+            Err(err) => err,
+        };
+        assert!(err.contains("wallet_write_pid_failed") || err.contains("wallet_log_init_failed"));
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

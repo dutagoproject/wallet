@@ -790,6 +790,46 @@ mod tests {
     }
 
     #[test]
+    fn restore_pending_sends_from_mempool_rehydrates_missing_wallet_send() {
+        let mut pending = Vec::new();
+        let utxos = vec![super::super::Utxo {
+            value: 9_980_000,
+            height: 200,
+            coinbase: false,
+            address: "dutc5dbcd5eba5cd240b4f3f86423f5ff05a4c010fc".to_string(),
+            txid: "00addf91840ef913aa22ddcfcb108358daeb190685776764ee9cb89b34675476".to_string(),
+            vout: 1,
+        }];
+        let changed = super::restore_pending_sends_from_mempool(
+            &mut pending,
+            &utxos,
+            &json!({
+                "txids": ["bbbf6d1b60f8964cbe88aafb8ddecdeda0a00086f761d2cca8da66e27b8bfdbd"],
+                "txs": {
+                    "bbbf6d1b60f8964cbe88aafb8ddecdeda0a00086f761d2cca8da66e27b8bfdbd": {
+                        "vin": [{
+                            "txid": "00addf91840ef913aa22ddcfcb108358daeb190685776764ee9cb89b34675476",
+                            "vout": 1
+                        }],
+                        "vout": [
+                            {"addr":"dut4f954f0c9411709829375e1dd9a9af127a0fe351","value":5_000_000},
+                            {"addr":"dutc5dbcd5eba5cd240b4f3f86423f5ff05a4c010fc","value":4_970_000}
+                        ]
+                    }
+                }
+            }),
+            123,
+        );
+        assert!(changed);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].txid, "bbbf6d1b60f8964cbe88aafb8ddecdeda0a00086f761d2cca8da66e27b8bfdbd");
+        assert_eq!(pending[0].amount, -5_010_000);
+        assert_eq!(pending[0].fee, 10_000);
+        assert_eq!(pending[0].change, 4_970_000);
+        assert_eq!(pending[0].spent_inputs.len(), 1);
+    }
+
+    #[test]
     fn selected_inputs_conflict_with_reserved_detects_pending_mempool_conflict() {
         let selected = vec![OwnedInput {
             utxo: super::super::Utxo {
@@ -1859,12 +1899,16 @@ fn collect_mempool_spent_outpoints(v: &serde_json::Value) -> HashSet<(String, u3
 
 fn daemon_mempool_state(
     daemon_rpc_port: u16,
-) -> Result<(HashSet<String>, HashSet<(String, u32)>), String> {
+) -> Result<(serde_json::Value, HashSet<String>, HashSet<(String, u32)>), String> {
     let body = super::http_get_local("127.0.0.1", daemon_rpc_port, "/mempool")
         .map_err(|e| format!("mempool_fetch_failed:{e}"))?;
     let v: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| format!("mempool_invalid_json:{e}"))?;
-    Ok((collect_mempool_txids(&v), collect_mempool_spent_outpoints(&v)))
+    Ok((
+        v.clone(),
+        collect_mempool_txids(&v),
+        collect_mempool_spent_outpoints(&v),
+    ))
 }
 
 fn prune_inactive_pending_txs(
@@ -1880,6 +1924,125 @@ fn prune_inactive_pending_txs(
         mempool_txids.contains(&p.txid) || pending_tx_is_recent(p, now_secs)
     });
     before != pending.len()
+}
+
+fn wallet_owned_addresses(utxos: &[super::Utxo]) -> HashSet<String> {
+    let mut addrs: HashSet<String> = utxos
+        .iter()
+        .filter(|u| !u.address.is_empty())
+        .map(|u| u.address.clone())
+        .collect();
+    let g = super::wallet_lock_or_recover();
+    if let Some(ws) = g.as_ref() {
+        if !ws.primary_address.is_empty() {
+            addrs.insert(ws.primary_address.clone());
+        }
+        addrs.extend(ws.pubkeys.keys().cloned());
+        addrs.extend(ws.keys.keys().cloned());
+    }
+    addrs
+}
+
+fn restore_pending_sends_from_mempool(
+    pending: &mut Vec<super::PendingTx>,
+    utxos: &[super::Utxo],
+    mempool: &serde_json::Value,
+    now_secs: i64,
+) -> bool {
+    let Some(txs) = mempool.get("txs").and_then(|x| x.as_object()) else {
+        return false;
+    };
+    let known_addrs = wallet_owned_addresses(utxos);
+    let utxo_by_outpoint: HashMap<(String, u32), &super::Utxo> = utxos
+        .iter()
+        .map(|u| ((u.txid.clone(), u.vout), u))
+        .collect();
+    let existing_txids: HashSet<String> = pending.iter().map(|p| p.txid.clone()).collect();
+    let mut changed = false;
+
+    for (txid, tx) in txs {
+        if existing_txids.contains(txid) {
+            continue;
+        }
+        let Some(vins) = tx.get("vin").and_then(|x| x.as_array()) else {
+            continue;
+        };
+        let mut spent_inputs = Vec::new();
+        let mut owned_input_total = 0i64;
+        for vin in vins {
+            let prev_txid = vin.get("txid").and_then(|x| x.as_str()).unwrap_or("");
+            let prev_vout = vin.get("vout").and_then(|x| x.as_u64()).unwrap_or(u32::MAX as u64);
+            if prev_txid.is_empty() || prev_vout > u32::MAX as u64 {
+                continue;
+            }
+            if let Some(utxo) = utxo_by_outpoint.get(&(prev_txid.to_string(), prev_vout as u32)) {
+                owned_input_total = owned_input_total.saturating_add(utxo.value);
+                spent_inputs.push(super::PendingInput {
+                    txid: prev_txid.to_string(),
+                    vout: prev_vout as u32,
+                });
+            }
+        }
+        if spent_inputs.is_empty() || owned_input_total <= 0 {
+            continue;
+        }
+
+        let Some(vouts) = tx.get("vout").and_then(|x| x.as_array()) else {
+            continue;
+        };
+        let mut total_output = 0i64;
+        let mut external_outputs: Vec<(String, i64)> = Vec::new();
+        let mut owned_change = 0i64;
+        for vout in vouts {
+            let addr = vout
+                .get("address")
+                .and_then(|x| x.as_str())
+                .or_else(|| vout.get("addr").and_then(|x| x.as_str()))
+                .unwrap_or("")
+                .to_string();
+            let value = vout.get("value").and_then(|x| x.as_i64()).unwrap_or(0);
+            if value <= 0 {
+                continue;
+            }
+            total_output = total_output.saturating_add(value);
+            if known_addrs.contains(&addr) {
+                owned_change = owned_change.saturating_add(value);
+            } else {
+                external_outputs.push((addr, value));
+            }
+        }
+        if external_outputs.is_empty() {
+            continue;
+        }
+        let fee = owned_input_total.saturating_sub(total_output);
+        if fee < 0 {
+            continue;
+        }
+        let sent_total: i64 = external_outputs.iter().map(|(_, value)| *value).sum();
+        let mut details: Vec<serde_json::Value> = external_outputs
+            .iter()
+            .map(|(addr, value)| amount_detail_json("send", addr, -*value))
+            .collect();
+        if fee > 0 {
+            details.push(amount_detail_json("fee", "", -fee));
+        }
+        if owned_change > 0 {
+            details.push(amount_detail_json("receive", "change", owned_change));
+        }
+        pending.push(super::PendingTx {
+            txid: txid.clone(),
+            category: "send".to_string(),
+            amount: -(sent_total.saturating_add(fee)),
+            fee,
+            change: owned_change,
+            timestamp: now_secs,
+            details,
+            spent_inputs,
+        });
+        changed = true;
+    }
+
+    changed
 }
 
 fn pending_balance_stats(
@@ -2108,8 +2271,11 @@ fn reconcile_pending_and_reserved_state(
     reserved_outpoints.extend(explicit_reserved_outpoints(reserved_inputs));
 
     match pending_mempool_state_or_err(wallet_path, active_pending, daemon_rpc_port)? {
-        Some((mempool_txids, mempool_reserved)) => {
+        Some((mempool, mempool_txids, mempool_reserved)) => {
             let mut state_changed = false;
+            if restore_pending_sends_from_mempool(active_pending, utxos, &mempool, now_secs) {
+                state_changed = true;
+            }
             if prune_inactive_pending_txs(active_pending, &mempool_txids, now_secs) {
                 state_changed = true;
             }
@@ -2196,7 +2362,7 @@ fn sync_pending_txs_with_chain_and_mempool(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    if let Ok((mempool_txids, _)) = daemon_mempool_state(daemon_rpc_port) {
+            if let Ok((_, mempool_txids, _)) = daemon_mempool_state(daemon_rpc_port) {
         let needs_chain_probe =
             pending_chain_probe_required(wallet_addrs, pending_txs, &mempool_txids);
         if needs_chain_probe {
@@ -2237,7 +2403,7 @@ fn pending_mempool_state_or_err(
     wallet_path: &str,
     pending_txs: &[super::PendingTx],
     daemon_rpc_port: u16,
-) -> Result<Option<(HashSet<String>, HashSet<(String, u32)>)>, String> {
+) -> Result<Option<(serde_json::Value, HashSet<String>, HashSet<(String, u32)>)>, String> {
     match daemon_mempool_state(daemon_rpc_port) {
         Ok(state) => Ok(Some(state)),
         Err(e) => {
@@ -2262,7 +2428,7 @@ fn pending_mempool_visibility_required(pending_txs: &[super::PendingTx]) -> bool
 fn send_mempool_state_or_err(
     wallet_path: &str,
     daemon_rpc_port: u16,
-) -> Result<(HashSet<String>, HashSet<(String, u32)>), String> {
+) -> Result<(serde_json::Value, HashSet<String>, HashSet<(String, u32)>), String> {
     daemon_mempool_state(daemon_rpc_port).map_err(|e| {
         wwlog!(
             "wallet_rpc: mempool_send_probe_failed wallet={} err={}",
@@ -4021,7 +4187,7 @@ pub(crate) fn handle_request(
                     let mut active_pending = pending_txs;
                     let mut reserved_outpoints = pending_reserved_outpoints(&active_pending);
                     match pending_mempool_state_or_err(&wallet_path, &active_pending, daemon_rpc_port) {
-                        Ok(Some((mempool_txids, mempool_reserved))) => {
+                        Ok(Some((_, mempool_txids, mempool_reserved))) => {
                             if prune_inactive_pending_txs(&mut active_pending, &mempool_txids, now_secs) {
                                 {
                                     let mut g = super::wallet_lock_or_recover();
@@ -5261,7 +5427,7 @@ pub(crate) fn handle_request(
                         return;
                     }
 
-                    let (_mempool_txids_pre_submit, mempool_reserved_pre_submit) =
+                    let (_, _mempool_txids_pre_submit, mempool_reserved_pre_submit) =
                         match send_mempool_state_or_err(&wallet_path, daemon_rpc_port) {
                             Ok(state) => state,
                             Err(e) => {
@@ -8176,7 +8342,7 @@ pub(crate) fn handle_request(
                 return;
             }
 
-            let (_mempool_txids_pre_submit, mempool_reserved_pre_submit) =
+            let (_, _mempool_txids_pre_submit, mempool_reserved_pre_submit) =
                 match send_mempool_state_or_err(&wallet_path, daemon_rpc_port) {
                     Ok(state) => state,
                     Err(e) => {
@@ -8824,7 +8990,7 @@ pub(crate) fn handle_request(
                 }
             }
 
-            let (_mempool_txids_pre_submit, mempool_reserved_pre_submit) =
+            let (_, _mempool_txids_pre_submit, mempool_reserved_pre_submit) =
                 match send_mempool_state_or_err(&wallet_path, daemon_rpc_port) {
                     Ok(state) => state,
                     Err(e) => {

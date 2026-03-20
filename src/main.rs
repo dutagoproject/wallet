@@ -1570,7 +1570,7 @@ mod tests {
     use duta_core::address::{pkh_from_pubkey, pkh_to_address_for_network};
     use duta_core::netparams::{Conf, Network};
     use ed25519_dalek::SigningKey;
-    use crate::walletdb::WalletDb;
+    use crate::walletdb::{WalletDb, WALLET_DB_SCHEMA_VERSION};
     use std::collections::BTreeMap;
     use std::fs;
 
@@ -1759,6 +1759,36 @@ mod tests {
 
         let err = load_wallet_db_to_state(&path).unwrap_err();
         assert_eq!(err, "wallet_primary_address_unknown");
+    }
+
+    #[test]
+    fn load_wallet_db_to_state_rejects_future_wallet_schema_versions() {
+        let mut p = std::env::temp_dir();
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        p.push(format!("duta-wallet-schema-too-new-{}.db", uniq));
+        let path = p.to_string_lossy().to_string();
+
+        let _db = WalletDb::create_new(&path, "strong-pass-123", &[5u8; 32], 1).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(k,v) VALUES('schema_version', ?1)",
+            rusqlite::params![WALLET_DB_SCHEMA_VERSION + 1],
+        )
+        .unwrap();
+        drop(conn);
+
+        let err = load_wallet_db_to_state(&path).unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "wallet_schema_too_new: have={} supported={}",
+                WALLET_DB_SCHEMA_VERSION + 1,
+                WALLET_DB_SCHEMA_VERSION
+            )
+        );
     }
 
     #[test]

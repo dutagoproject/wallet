@@ -193,6 +193,12 @@ impl WalletDb {
                 r.get(0)
             })
             .map_err(|e| format!("db_meta_read_failed: {e}"))?;
+        if schema_version > WALLET_DB_SCHEMA_VERSION {
+            return Err(format!(
+                "wallet_schema_too_new: have={} supported={}",
+                schema_version, WALLET_DB_SCHEMA_VERSION
+            ));
+        }
         let salt: Vec<u8> = self
             .conn
             .query_row("SELECT v FROM meta WHERE k='salt'", [], |r| r.get(0))
@@ -756,7 +762,9 @@ impl WalletDb {
 #[cfg(test)]
 mod tests {
     use super::WalletDb;
+    use super::WALLET_DB_SCHEMA_VERSION;
     use hex;
+    use rusqlite::params;
 
     fn temp_wallet_path(tag: &str) -> String {
         let mut p = std::env::temp_dir();
@@ -880,6 +888,28 @@ mod tests {
         assert_eq!(got[0].txid, "aa".repeat(32));
         assert_eq!(got[0].vout, 7);
         assert_eq!(got[0].timestamp, 1234);
+    }
+
+    #[test]
+    fn read_meta_rejects_wallet_schema_versions_from_future_binaries() {
+        let path = temp_wallet_path("schema-too-new");
+        let db = WalletDb::create_new(&path, "strong-pass-123", &[3u8; 32], 1).unwrap();
+        db.conn
+            .execute(
+                "INSERT OR REPLACE INTO meta(k,v) VALUES('schema_version', ?1)",
+                params![WALLET_DB_SCHEMA_VERSION + 1],
+            )
+            .unwrap();
+
+        let err = db.read_meta().unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "wallet_schema_too_new: have={} supported={}",
+                WALLET_DB_SCHEMA_VERSION + 1,
+                WALLET_DB_SCHEMA_VERSION
+            )
+        );
     }
 
     #[test]

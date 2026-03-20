@@ -237,6 +237,13 @@ pub(crate) struct PendingTx {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct SubmittedTxRecovery {
+    pub(crate) pending_tx: PendingTx,
+    pub(crate) change_address: String,
+    pub(crate) change_vout: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct PendingInput {
     #[serde(default)]
     pub(crate) txid: String,
@@ -485,7 +492,7 @@ fn stop_wallet_daemon(data_dir: &str) -> Result<(), String> {
 fn wallet_daemon_status(data_dir: &str, rpc_addr: &str) -> Result<i32, String> {
     let pid_path = format!("{}/dutawalletd.pid", data_dir.trim_end_matches('/'));
     let pid = read_pid_file(&pid_path)?;
-    let rpc_reachable = TcpStream::connect(rpc_addr).is_ok();
+    let rpc_reachable = matches!(http_call(rpc_addr, "GET", "/health", None), Ok((200, _)));
     match pid {
         Some(pid) if pid_is_alive(pid) && pid_matches_wallet_process(pid) => {
             console_line("WALLET", ANSI_GREEN, "dutawalletd running");
@@ -703,7 +710,12 @@ fn read_http_response(stream: &mut TcpStream, deadline_secs: u64) -> Result<Vec<
     Ok(buf)
 }
 
-pub(crate) fn http_get_local(host: &str, port: u16, path: &str) -> Result<String, String> {
+pub(crate) fn http_get_local_with_deadline(
+    host: &str,
+    port: u16,
+    path: &str,
+    deadline_secs: u64,
+) -> Result<String, String> {
     let mut stream =
         TcpStream::connect((host, port)).map_err(|e| format!("connect_failed: {}", e))?;
     stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
@@ -716,9 +728,13 @@ pub(crate) fn http_get_local(host: &str, port: u16, path: &str) -> Result<String
         .write_all(req.as_bytes())
         .map_err(|e| format!("write_failed: {}", e))?;
 
-    let buf = read_http_response(&mut stream, 20)?;
+    let buf = read_http_response(&mut stream, deadline_secs)?;
     let body = decode_http_body(&buf)?;
     Ok(String::from_utf8_lossy(&body).to_string())
+}
+
+pub(crate) fn http_get_local(host: &str, port: u16, path: &str) -> Result<String, String> {
+    http_get_local_with_deadline(host, port, path, 20)
 }
 
 pub(crate) fn http_post_local(
@@ -906,6 +922,20 @@ pub(crate) fn save_wallet_sync_state(
     db.update_sync_state(utxos, last_sync_height, reserved_inputs)
 }
 
+pub(crate) fn save_wallet_sync_state_with_recovery(
+    path: &str,
+    utxos: &[Utxo],
+    last_sync_height: i64,
+    reserved_inputs: &[ReservedInput],
+    recovery: Option<&SubmittedTxRecovery>,
+) -> Result<(), String> {
+    if !(path.ends_with(".db") || path.ends_with(".dat")) {
+        return Err("legacy_plaintext_wallet_disabled_use_db_wallet".to_string());
+    }
+    let db = walletdb::WalletDb::open(path)?;
+    db.update_sync_state_with_recovery(utxos, last_sync_height, reserved_inputs, recovery)
+}
+
 pub(crate) fn save_wallet_pending_txs(path: &str, pending_txs: &[PendingTx]) -> Result<(), String> {
     if !(path.ends_with(".db") || path.ends_with(".dat")) {
         return Err("legacy_plaintext_wallet_disabled_use_db_wallet".to_string());
@@ -926,6 +956,27 @@ pub(crate) fn save_wallet_full_state(
     }
     let db = walletdb::WalletDb::open(path)?;
     db.update_full_state(utxos, last_sync_height, pending_txs, reserved_inputs)
+}
+
+pub(crate) fn save_wallet_full_state_with_recovery(
+    path: &str,
+    utxos: &[Utxo],
+    last_sync_height: i64,
+    pending_txs: &[PendingTx],
+    reserved_inputs: &[ReservedInput],
+    recovery: Option<&SubmittedTxRecovery>,
+) -> Result<(), String> {
+    if !(path.ends_with(".db") || path.ends_with(".dat")) {
+        return Err("legacy_plaintext_wallet_disabled_use_db_wallet".to_string());
+    }
+    let db = walletdb::WalletDb::open(path)?;
+    db.update_full_state_with_recovery(
+        utxos,
+        last_sync_height,
+        pending_txs,
+        reserved_inputs,
+        recovery,
+    )
 }
 
 fn start_wallet_rpc(rpc_addr: String, daemon_rpc_port: u16, net: String) -> Result<(), String> {
@@ -1952,8 +2003,33 @@ mod tests {
         dir.push(format!("duta-wallet-status-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let rc = super::wallet_daemon_status(dir.to_str().unwrap(), &addr.to_string()).unwrap();
-        assert_eq!(rc, 0);
+        assert_eq!(rc, 1);
         drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wallet_status_accepts_real_health_endpoint_without_pid_file() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 31\r\nConnection: close\r\n\r\n{\"ok\":true,\"wallet_open\":false}";
+                let _ = stream.write_all(resp);
+            }
+        });
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("duta-wallet-status-health-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rc = super::wallet_daemon_status(dir.to_str().unwrap(), &addr.to_string()).unwrap();
+        assert_eq!(rc, 0);
+        let _ = handle.join();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

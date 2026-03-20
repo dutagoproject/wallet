@@ -513,9 +513,23 @@ impl WalletDb {
         last_sync_height: i64,
         reserved_inputs: &[crate::ReservedInput],
     ) -> Result<(), String> {
+        self.update_sync_state_with_recovery(utxos, last_sync_height, reserved_inputs, None)
+    }
+
+    pub(crate) fn update_sync_state_with_recovery(
+        &self,
+        utxos: &[crate::Utxo],
+        last_sync_height: i64,
+        reserved_inputs: &[crate::ReservedInput],
+        recovery: Option<&crate::SubmittedTxRecovery>,
+    ) -> Result<(), String> {
         let body = serde_json::to_vec(utxos).map_err(|e| format!("db_utxos_encode_failed: {e}"))?;
         let reserved_body = serde_json::to_vec(reserved_inputs)
             .map_err(|e| format!("db_reserved_inputs_encode_failed: {e}"))?;
+        let recovery_body = recovery
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|e| format!("db_submitted_tx_recovery_encode_failed: {e}"))?;
         self.conn
             .execute("BEGIN IMMEDIATE TRANSACTION", [])
             .map_err(|e| format!("db_tx_begin_failed: {e}"))?;
@@ -539,6 +553,21 @@ impl WalletDb {
                     params![reserved_body],
                 )
                 .map_err(|e| format!("db_meta_write_failed: {e}"))?;
+            match recovery_body.as_ref() {
+                Some(body) => {
+                    self.conn
+                        .execute(
+                            "INSERT OR REPLACE INTO meta(k,v) VALUES('submitted_tx_recovery_json', ?1)",
+                            params![body],
+                        )
+                        .map_err(|e| format!("db_meta_write_failed: {e}"))?;
+                }
+                None => {
+                    self.conn
+                        .execute("DELETE FROM meta WHERE k='submitted_tx_recovery_json'", [])
+                        .map_err(|e| format!("db_meta_write_failed: {e}"))?;
+                }
+            }
             self.conn
                 .execute("COMMIT", [])
                 .map_err(|e| format!("db_tx_commit_failed: {e}"))?;
@@ -603,6 +632,23 @@ impl WalletDb {
         serde_json::from_slice(&raw).map_err(|e| format!("db_reserved_inputs_invalid: {e}"))
     }
 
+    pub(crate) fn read_submitted_tx_recovery(
+        &self,
+    ) -> Result<Option<crate::SubmittedTxRecovery>, String> {
+        let raw: Vec<u8> = match self.conn.query_row(
+            "SELECT v FROM meta WHERE k='submitted_tx_recovery_json'",
+            [],
+            |r| r.get(0),
+        ) {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(format!("db_meta_read_failed: {e}")),
+        };
+        serde_json::from_slice(&raw)
+            .map(Some)
+            .map_err(|e| format!("db_submitted_tx_recovery_invalid: {e}"))
+    }
+
     pub(crate) fn update_pending_txs(&self, pending_txs: &[crate::PendingTx]) -> Result<(), String> {
         let body = serde_json::to_vec(pending_txs)
             .map_err(|e| format!("db_pending_txs_encode_failed: {e}"))?;
@@ -622,12 +668,33 @@ impl WalletDb {
         pending_txs: &[crate::PendingTx],
         reserved_inputs: &[crate::ReservedInput],
     ) -> Result<(), String> {
+        self.update_full_state_with_recovery(
+            utxos,
+            last_sync_height,
+            pending_txs,
+            reserved_inputs,
+            None,
+        )
+    }
+
+    pub(crate) fn update_full_state_with_recovery(
+        &self,
+        utxos: &[crate::Utxo],
+        last_sync_height: i64,
+        pending_txs: &[crate::PendingTx],
+        reserved_inputs: &[crate::ReservedInput],
+        recovery: Option<&crate::SubmittedTxRecovery>,
+    ) -> Result<(), String> {
         let utxos_body =
             serde_json::to_vec(utxos).map_err(|e| format!("db_utxos_encode_failed: {e}"))?;
         let pending_body = serde_json::to_vec(pending_txs)
             .map_err(|e| format!("db_pending_txs_encode_failed: {e}"))?;
         let reserved_body = serde_json::to_vec(reserved_inputs)
             .map_err(|e| format!("db_reserved_inputs_encode_failed: {e}"))?;
+        let recovery_body = recovery
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|e| format!("db_submitted_tx_recovery_encode_failed: {e}"))?;
         self.conn
             .execute("BEGIN IMMEDIATE TRANSACTION", [])
             .map_err(|e| format!("db_tx_begin_failed: {e}"))?;
@@ -657,6 +724,21 @@ impl WalletDb {
                     params![reserved_body],
                 )
                 .map_err(|e| format!("db_meta_write_failed: {e}"))?;
+            match recovery_body.as_ref() {
+                Some(body) => {
+                    self.conn
+                        .execute(
+                            "INSERT OR REPLACE INTO meta(k,v) VALUES('submitted_tx_recovery_json', ?1)",
+                            params![body],
+                        )
+                        .map_err(|e| format!("db_meta_write_failed: {e}"))?;
+                }
+                None => {
+                    self.conn
+                        .execute("DELETE FROM meta WHERE k='submitted_tx_recovery_json'", [])
+                        .map_err(|e| format!("db_meta_write_failed: {e}"))?;
+                }
+            }
             self.conn
                 .execute("COMMIT", [])
                 .map_err(|e| format!("db_tx_commit_failed: {e}"))?;
@@ -846,5 +928,45 @@ mod tests {
         let got_reserved = reopened.read_reserved_inputs().unwrap();
         assert_eq!(got_reserved.len(), 1);
         assert_eq!(got_reserved[0].txid, "11".repeat(32));
+    }
+
+    #[test]
+    fn submitted_tx_recovery_round_trips_and_clears_with_full_state_update() {
+        let path = temp_wallet_path("submitted-recovery");
+        let db = WalletDb::create_new(&path, "strong-pass-123", &[4u8; 32], 1).unwrap();
+        let recovery = crate::SubmittedTxRecovery {
+            pending_tx: crate::PendingTx {
+                txid: "ab".repeat(32),
+                category: "send".to_string(),
+                amount: -101,
+                fee: 1,
+                change: 9,
+                timestamp: 1234,
+                details: vec![serde_json::json!({"category":"send","address":"dut1dest","amount_dut":-100})],
+                spent_inputs: vec![crate::PendingInput {
+                    txid: "cd".repeat(32),
+                    vout: 2,
+                }],
+            },
+            change_address: "dut1change".to_string(),
+            change_vout: 1,
+        };
+
+        db.update_sync_state_with_recovery(&[], 77, &[], Some(&recovery))
+            .unwrap();
+
+        let reopened = WalletDb::open(&path).unwrap();
+        let got = reopened
+            .read_submitted_tx_recovery()
+            .unwrap()
+            .expect("recovery");
+        assert_eq!(got.pending_tx.txid, "ab".repeat(32));
+        assert_eq!(got.pending_tx.spent_inputs.len(), 1);
+        assert_eq!(got.change_address, "dut1change");
+
+        reopened
+            .update_full_state_with_recovery(&[], 78, &[], &[], None)
+            .unwrap();
+        assert!(reopened.read_submitted_tx_recovery().unwrap().is_none());
     }
 }

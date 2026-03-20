@@ -68,10 +68,12 @@ mod tests {
         insufficient_funds_body, net_from_wallet_path, prune_confirmed_pending_txs,
         parse_prune_below_from_blocks_from_error, query_param, relay_fee_for_tx_bytes,
         retry_from_pruned_boundary_for_empty_wallet,
+        rpc_response_refresh_err,
         require_non_empty_passphrase, resolve_owned_input, select_inputs_for_need,
         send_success_body, should_probe_daemon_utxo_presence, sign_send_tx, simulate_send_plan,
         status_for_body_err, tx_output_address, wallet_health_response, wallet_needs_full_utxo_rebuild,
-        wallet_public_name, wallet_refresh_error_code, wallet_state_network, OwnedInput,
+        wallet_public_name, wallet_refresh_error_code, wallet_state_network,
+        validate_wallet_tip_against_state, OwnedInput,
         PendingBalanceStats, WalletSigner, MAX_WALLET_SEND_INPUTS,
     };
     use duta_core::netparams::Network;
@@ -176,6 +178,7 @@ mod tests {
             wallet_refresh_error_code("read_failed: timed out"),
             "daemon_unreachable"
         );
+        assert_eq!(wallet_refresh_error_code("read_timeout"), "daemon_unreachable");
         assert_eq!(
             wallet_refresh_error_code("daemon_pruned_wallet_rescan_incomplete: from=0"),
             "wallet_state_refresh_failed"
@@ -196,6 +199,30 @@ mod tests {
         assert_eq!(body["ok"], json!(false));
         assert_eq!(body["wallet_open"], json!(true));
         assert_eq!(body["error"], json!("daemon_unreachable"));
+    }
+
+    #[test]
+    fn rpc_response_refresh_err_prefixes_transport_failures_with_actionable_code() {
+        let body = rpc_response_refresh_err(json!(1), -18, "connect_failed: connection refused");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            parsed["error"]["message"],
+            json!("daemon_unreachable: connect_failed: connection refused")
+        );
+    }
+
+    #[test]
+    fn rpc_response_refresh_err_prefixes_state_failures_with_actionable_code() {
+        let body = rpc_response_refresh_err(
+            json!(1),
+            -18,
+            "daemon_tip_regressed_below_wallet_state: tip_height=0",
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            parsed["error"]["message"],
+            json!("wallet_state_refresh_failed: daemon_tip_regressed_below_wallet_state: tip_height=0")
+        );
     }
 
     #[test]
@@ -356,6 +383,26 @@ mod tests {
         assert!(err.contains("last_sync_height=308"));
         assert!(err.contains("tracked_utxos=308"));
         assert!(err.contains("max_utxo_height=308"));
+    }
+
+    #[test]
+    fn validate_wallet_tip_against_state_keeps_empty_wallet_at_genesis_healthy() {
+        assert_eq!(validate_wallet_tip_against_state(0, &[], 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn validate_wallet_tip_against_state_fail_closes_tracked_wallet_below_tip() {
+        let utxos = vec![super::super::Utxo {
+            value: 1,
+            height: 5,
+            coinbase: false,
+            address: "dut1x".to_string(),
+            txid: "aa".repeat(32),
+            vout: 0,
+        }];
+        let err = validate_wallet_tip_against_state(0, &utxos, 5).unwrap_err();
+        assert!(err.contains("daemon_tip_regressed_below_wallet_state"));
+        assert!(err.contains("tracked_utxos=1"));
     }
 
     #[test]
@@ -991,6 +1038,130 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_pending_state_finalizes_submitted_recovery_from_mempool() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let mut db_path = std::env::temp_dir();
+        db_path.push(format!(
+            "duta-wallet-reconcile-recovery-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let wallet_path = db_path.to_string_lossy().to_string();
+        let db = super::super::walletdb::WalletDb::create_new(
+            &wallet_path,
+            "strong-pass-123",
+            &[5u8; 32],
+            1,
+        )
+        .unwrap();
+        let recovery = super::super::SubmittedTxRecovery {
+            pending_tx: super::super::PendingTx {
+                txid: "ef".repeat(32),
+                category: "send".to_string(),
+                amount: -101,
+                fee: 1,
+                change: 9,
+                timestamp: 77,
+                details: vec![serde_json::json!({"category":"send","address":"dut1dest","amount_dut":-100})],
+                spent_inputs: vec![super::super::PendingInput {
+                    txid: "ab".repeat(32),
+                    vout: 0,
+                }],
+            },
+            change_address: "dut1change".to_string(),
+            change_vout: 1,
+        };
+        db.update_sync_state_with_recovery(
+            &[super::super::Utxo {
+                value: 110,
+                height: 77,
+                coinbase: false,
+                address: "dut1owned".to_string(),
+                txid: "ab".repeat(32),
+                vout: 0,
+            }],
+            77,
+            &[super::super::ReservedInput {
+                txid: "ab".repeat(32),
+                vout: 0,
+                timestamp: 77,
+            }],
+            Some(&recovery),
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf);
+                let body = serde_json::json!({
+                    "txids": [recovery.pending_tx.txid],
+                    "txs": {
+                        recovery.pending_tx.txid: {
+                            "vin": [{"txid":"ab".repeat(32),"vout":0}],
+                            "vout": [
+                                {"address":"dut1dest","value":100},
+                                {"address":"dut1change","value":9}
+                            ]
+                        }
+                    }
+                })
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let mut utxos = vec![super::super::Utxo {
+            value: 110,
+            height: 77,
+            coinbase: false,
+            address: "dut1owned".to_string(),
+            txid: "ab".repeat(32),
+            vout: 0,
+        }];
+        let mut pending = Vec::new();
+        let mut reserved = vec![super::super::ReservedInput {
+            txid: "ab".repeat(32),
+            vout: 0,
+            timestamp: 77,
+        }];
+        let reserved_outpoints = super::reconcile_pending_and_reserved_state(
+            &wallet_path,
+            &mut utxos,
+            77,
+            &mut pending,
+            &mut reserved,
+            port,
+        )
+        .unwrap();
+
+        assert!(reserved_outpoints.contains(&("ab".repeat(32), 0)));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].txid, "ef".repeat(32));
+        assert_eq!(utxos.len(), 1);
+        assert_eq!(utxos[0].txid, "ef".repeat(32));
+        assert_eq!(utxos[0].vout, 1);
+        assert!(reserved.is_empty());
+        assert!(super::read_submitted_tx_recovery(&wallet_path).unwrap().is_none());
+
+        let _ = handle.join();
+        let _ = std::fs::remove_file(&wallet_path);
+    }
+
+    #[test]
     fn selected_inputs_conflict_with_reserved_detects_pending_mempool_conflict() {
         let selected = vec![OwnedInput {
             utxo: super::super::Utxo {
@@ -1514,6 +1685,24 @@ fn daemon_tip_regressed_below_wallet_state_error(
     )
 }
 
+fn validate_wallet_tip_against_state(
+    cur_h: i64,
+    current_utxos: &[super::Utxo],
+    last_sync_height: i64,
+) -> Result<i64, String> {
+    let full_rebuild = wallet_needs_full_utxo_rebuild(current_utxos, cur_h, last_sync_height);
+    if cur_h <= 0 && full_rebuild {
+        let max_utxo_height = current_utxos.iter().map(|u| u.height).max().unwrap_or(0);
+        return Err(daemon_tip_regressed_below_wallet_state_error(
+            cur_h,
+            last_sync_height,
+            current_utxos.len(),
+            max_utxo_height,
+        ));
+    }
+    Ok(cur_h)
+}
+
 fn parse_prune_below_from_blocks_from_error(detail: &str) -> Option<i64> {
     detail
         .split("prune_below=")
@@ -1719,6 +1908,7 @@ fn wallet_refresh_error_code(detail: &str) -> &'static str {
     if detail.starts_with("connect_failed:")
         || detail.starts_with("write_failed:")
         || detail.starts_with("read_failed:")
+        || detail.starts_with("read_timeout")
         || detail.starts_with("http_invalid:")
     {
         "daemon_unreachable"
@@ -1982,6 +2172,17 @@ fn release_selected_reserved_inputs(
     reserved_inputs.retain(|input| !selected_keys.contains(&(input.txid.clone(), input.vout)));
 }
 
+fn release_reserved_inputs_for_pending_inputs(
+    reserved_inputs: &mut Vec<super::ReservedInput>,
+    spent_inputs: &[super::PendingInput],
+) {
+    let spent_keys: HashSet<(String, u32)> = spent_inputs
+        .iter()
+        .map(|input| (input.txid.clone(), input.vout))
+        .collect();
+    reserved_inputs.retain(|input| !spent_keys.contains(&(input.txid.clone(), input.vout)));
+}
+
 fn persist_runtime_reserved_inputs(
     wallet_path: &str,
     utxos: &[super::Utxo],
@@ -1989,6 +2190,29 @@ fn persist_runtime_reserved_inputs(
     reserved_inputs: &[super::ReservedInput],
 ) -> Result<(), String> {
     super::save_wallet_sync_state(wallet_path, utxos, cur_h, reserved_inputs)?;
+    let mut g = super::wallet_lock_or_recover();
+    if let Some(ws) = g.as_mut() {
+        ws.utxos = utxos.to_vec();
+        ws.last_sync_height = cur_h;
+        ws.reserved_inputs = reserved_inputs.to_vec();
+    }
+    Ok(())
+}
+
+fn persist_runtime_reserved_inputs_with_recovery(
+    wallet_path: &str,
+    utxos: &[super::Utxo],
+    cur_h: i64,
+    reserved_inputs: &[super::ReservedInput],
+    recovery: Option<&super::SubmittedTxRecovery>,
+) -> Result<(), String> {
+    super::save_wallet_sync_state_with_recovery(
+        wallet_path,
+        utxos,
+        cur_h,
+        reserved_inputs,
+        recovery,
+    )?;
     let mut g = super::wallet_lock_or_recover();
     if let Some(ws) = g.as_mut() {
         ws.utxos = utxos.to_vec();
@@ -2027,6 +2251,42 @@ fn persist_runtime_full_state(
         ws.reserved_inputs = reserved_inputs.to_vec();
     }
     Ok(())
+}
+
+fn persist_runtime_full_state_with_recovery(
+    wallet_path: &str,
+    utxos: &[super::Utxo],
+    cur_h: i64,
+    pending_txs: &[super::PendingTx],
+    reserved_inputs: &[super::ReservedInput],
+    recovery: Option<&super::SubmittedTxRecovery>,
+) -> Result<(), String> {
+    super::save_wallet_full_state_with_recovery(
+        wallet_path,
+        utxos,
+        cur_h,
+        pending_txs,
+        reserved_inputs,
+        recovery,
+    )?;
+    let mut g = super::wallet_lock_or_recover();
+    if let Some(ws) = g.as_mut() {
+        ws.utxos = utxos.to_vec();
+        ws.last_sync_height = cur_h;
+        ws.pending_txs = pending_txs.to_vec();
+        ws.reserved_inputs = reserved_inputs.to_vec();
+    }
+    Ok(())
+}
+
+fn read_submitted_tx_recovery(
+    wallet_path: &str,
+) -> Result<Option<super::SubmittedTxRecovery>, String> {
+    if !(wallet_path.ends_with(".db") || wallet_path.ends_with(".dat")) {
+        return Ok(None);
+    }
+    let db = super::walletdb::WalletDb::open(wallet_path)?;
+    db.read_submitted_tx_recovery()
 }
 
 fn prune_stale_reserved_inputs(
@@ -2448,7 +2708,7 @@ fn simulate_send_plan(
 
 fn reconcile_pending_and_reserved_state(
     wallet_path: &str,
-    utxos: &[super::Utxo],
+    utxos: &mut Vec<super::Utxo>,
     cur_h: i64,
     active_pending: &mut Vec<super::PendingTx>,
     reserved_inputs: &mut Vec<super::ReservedInput>,
@@ -2460,10 +2720,76 @@ fn reconcile_pending_and_reserved_state(
         .as_secs() as i64;
     let mut reserved_outpoints = pending_reserved_outpoints(active_pending);
     reserved_outpoints.extend(explicit_reserved_outpoints(reserved_inputs));
+    let submitted_recovery = read_submitted_tx_recovery(wallet_path)?;
 
     match pending_mempool_state_or_err(wallet_path, active_pending, daemon_rpc_port)? {
         Some((mempool, mempool_txids, mempool_reserved)) => {
             let mut state_changed = false;
+            if let Some(recovery) = submitted_recovery.as_ref() {
+                let recovery_txid = recovery.pending_tx.txid.clone();
+                if mempool_txids.contains(&recovery_txid) {
+                    active_pending.retain(|pending| pending.txid != recovery_txid);
+                    active_pending.push(recovery.pending_tx.clone());
+                    utxos.retain(|utxo| {
+                        !recovery
+                            .pending_tx
+                            .spent_inputs
+                            .iter()
+                            .any(|spent| spent.txid == utxo.txid && spent.vout == utxo.vout)
+                    });
+                    if recovery.pending_tx.change > 0
+                        && !utxos.iter().any(|utxo| {
+                            utxo.txid == recovery_txid && utxo.vout == recovery.change_vout
+                        })
+                    {
+                        utxos.push(super::Utxo {
+                            value: recovery.pending_tx.change,
+                            height: 0,
+                            coinbase: false,
+                            address: recovery.change_address.clone(),
+                            txid: recovery_txid.clone(),
+                            vout: recovery.change_vout,
+                        });
+                    }
+                    release_reserved_inputs_for_pending_inputs(
+                        reserved_inputs,
+                        &recovery.pending_tx.spent_inputs,
+                    );
+                    persist_runtime_full_state_with_recovery(
+                        wallet_path,
+                        utxos,
+                        cur_h,
+                        active_pending,
+                        reserved_inputs,
+                        None,
+                    )?;
+                    state_changed = true;
+                } else {
+                    let owned_addrs: Vec<String> =
+                        wallet_owned_addresses(utxos).into_iter().collect();
+                    let confirmed = if owned_addrs.is_empty() {
+                        false
+                    } else {
+                        scan_wallet_txs_via_blocks_from(&owned_addrs, daemon_rpc_port)
+                            .map(|scan| scan.txs.iter().any(|entry| entry.0 == recovery_txid))
+                            .unwrap_or(false)
+                    };
+                    if confirmed {
+                        release_reserved_inputs_for_pending_inputs(
+                            reserved_inputs,
+                            &recovery.pending_tx.spent_inputs,
+                        );
+                    }
+                    persist_runtime_reserved_inputs_with_recovery(
+                        wallet_path,
+                        utxos,
+                        cur_h,
+                        reserved_inputs,
+                        None,
+                    )?;
+                    state_changed = true;
+                }
+            }
             if restore_pending_sends_from_mempool(active_pending, utxos, &mempool, now_secs) {
                 state_changed = true;
             }
@@ -2920,19 +3246,12 @@ fn refresh_wallet_utxos_runtime(
         return Ok((cur_h, current_utxos.to_vec()));
     }
 
-    let full_rebuild = wallet_needs_full_utxo_rebuild(current_utxos, cur_h, last_sync_height);
     if cur_h <= 0 {
-        if full_rebuild {
-            let max_utxo_height = current_utxos.iter().map(|u| u.height).max().unwrap_or(0);
-            return Err(daemon_tip_regressed_below_wallet_state_error(
-                cur_h,
-                last_sync_height,
-                current_utxos.len(),
-                max_utxo_height,
-            ));
-        }
+        validate_wallet_tip_against_state(cur_h, current_utxos, last_sync_height)?;
         return Ok((cur_h, current_utxos.to_vec()));
     }
+
+    let full_rebuild = wallet_needs_full_utxo_rebuild(current_utxos, cur_h, last_sync_height);
 
     if full_rebuild {
         match rebuild_wallet_utxos_with_pruned_fallback(addrs, daemon_rpc_port) {
@@ -3257,6 +3576,11 @@ fn sighash(txv: &serde_json::Value) -> Result<[u8; 32], String> {
     Ok(duta_core::hash::sha3_256(&b).0)
 }
 
+fn txid_from_value(v: &serde_json::Value) -> Result<String, String> {
+    let b = canonical_json_bytes(v)?;
+    Ok(duta_core::hash::sha3_256_hex(&b))
+}
+
 fn relay_fee_for_tx_bytes(tx_bytes: usize) -> i64 {
     let kb = (tx_bytes.saturating_add(999) / 1000).max(1);
     i64::try_from((kb as u64).saturating_mul(DEFAULT_MIN_RELAY_FEE_PER_KB_DUT))
@@ -3561,6 +3885,14 @@ fn rpc_response_err(id: serde_json::Value, code: i32, message: &str) -> String {
     json!({"result": serde_json::Value::Null, "error": {"code": code, "message": message}, "id": id}).to_string()
 }
 
+fn rpc_response_refresh_err(id: serde_json::Value, code: i32, detail: &str) -> String {
+    rpc_response_err(
+        id,
+        code,
+        &format!("{}: {}", wallet_refresh_error_code(detail), detail),
+    )
+}
+
 fn unlock_db_wallet_state(ws: &mut super::WalletState, passphrase: &str) -> Result<(), String> {
     super::clear_wallet_sensitive_state(ws);
     let db = super::walletdb::WalletDb::open(&ws.wallet_path)?;
@@ -3662,9 +3994,15 @@ fn derive_next_address_for_wallet(
 }
 
 /// Snapshot + (optional) auto-sync wallet UTXOs if empty by scanning daemon /blocks_from.
-fn daemon_tip_height_with_retry(daemon_rpc_port: u16, fallback_height: i64) -> Result<i64, String> {
-    for attempt in 0..3 {
-        let tip_body = super::http_get_local("127.0.0.1", daemon_rpc_port, "/tip")?;
+fn daemon_tip_height_with_retry_opts(
+    daemon_rpc_port: u16,
+    fallback_height: i64,
+    deadline_secs: u64,
+    attempts: usize,
+) -> Result<i64, String> {
+    for attempt in 0..attempts.max(1) {
+        let tip_body =
+            super::http_get_local_with_deadline("127.0.0.1", daemon_rpc_port, "/tip", deadline_secs)?;
         let tip_v: serde_json::Value =
             serde_json::from_str(&tip_body).map_err(|e| format!("tip_invalid_json: {}", e))?;
 
@@ -3703,6 +4041,20 @@ fn daemon_tip_height_with_retry(daemon_rpc_port: u16, fallback_height: i64) -> R
     }
 
     Err("tip_height_unavailable".to_string())
+}
+
+fn daemon_tip_height_with_retry(daemon_rpc_port: u16, fallback_height: i64) -> Result<i64, String> {
+    daemon_tip_height_with_retry_opts(daemon_rpc_port, fallback_height, 20, 3)
+}
+
+fn wallet_health_snapshot(daemon_rpc_port: u16) -> Result<i64, String> {
+    let (utxos, last_sync_height) = {
+        let g = super::wallet_lock_or_recover();
+        let ws = g.as_ref().ok_or_else(|| "wallet_not_open".to_string())?;
+        (ws.utxos.clone(), ws.last_sync_height)
+    };
+    let cur_h = daemon_tip_height_with_retry_opts(daemon_rpc_port, last_sync_height, 5, 1)?;
+    validate_wallet_tip_against_state(cur_h, &utxos, last_sync_height)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -3748,7 +4100,7 @@ fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<WalletBalanceSnapshot
     );
     let reserved_outpoints = reconcile_pending_and_reserved_state(
         &wallet_path,
-        &utxos,
+        &mut utxos,
         cur_h,
         &mut active_pending,
         &mut reserved_inputs,
@@ -3909,8 +4261,8 @@ pub(crate) fn handle_request(
                 drop(g);
 
                 let (status, body) = if wallet_open {
-                    match wallet_balance_snapshot(daemon_rpc_port) {
-                        Ok(snapshot) => wallet_health_response(true, Ok((snapshot.height,))),
+                    match wallet_health_snapshot(daemon_rpc_port) {
+                        Ok(height) => wallet_health_response(true, Ok((height,))),
                         Err(e) => wallet_health_response(true, Err(e)),
                     }
                 } else {
@@ -4158,7 +4510,7 @@ pub(crate) fn handle_request(
                                 super::respond_json(
                                     request,
                                     tiny_http::StatusCode(400),
-                                    rpc_response_err(id, -18, &e),
+                                    rpc_response_refresh_err(id, -18, &e),
                                 );
                                 return;
                             }
@@ -4241,7 +4593,7 @@ pub(crate) fn handle_request(
                                 super::respond_json(
                                     request,
                                     tiny_http::StatusCode(400),
-                                    rpc_response_err(id, -18, &e),
+                                    rpc_response_refresh_err(id, -18, &e),
                                 );
                                 return;
                             }
@@ -4345,7 +4697,7 @@ pub(crate) fn handle_request(
                                 super::respond_json(
                                     request,
                                     tiny_http::StatusCode(400),
-                                    rpc_response_err(id, -18, &e),
+                                    rpc_response_refresh_err(id, -18, &e),
                                 );
                                 return;
                             }
@@ -4875,7 +5227,7 @@ pub(crate) fn handle_request(
                     let mut reserved_inputs = reserved_inputs;
                     let reserved_outpoints = match reconcile_pending_and_reserved_state(
                         &wallet_path,
-                        &utxos,
+                        &mut utxos,
                         cur_h,
                         &mut active_pending,
                         &mut reserved_inputs,
@@ -5130,7 +5482,7 @@ pub(crate) fn handle_request(
                     let mut reserved_inputs = reserved_inputs;
                     let reserved_outpoints = match reconcile_pending_and_reserved_state(
                         &wallet_path,
-                        &utxos,
+                        &mut utxos,
                         cur_h,
                         &mut active_pending,
                         &mut reserved_inputs,
@@ -5470,7 +5822,7 @@ pub(crate) fn handle_request(
                         return;
                     }
                     // Need daemon height for maturity calculation.
-                    let (cur_h, utxos) = match refresh_wallet_utxos_runtime(
+                    let (cur_h, mut utxos) = match refresh_wallet_utxos_runtime(
                         &addrs,
                         daemon_rpc_port,
                         &utxos,
@@ -5522,7 +5874,7 @@ pub(crate) fn handle_request(
                     let mut reserved_inputs = reserved_inputs;
                     let reserved_outpoints = match reconcile_pending_and_reserved_state(
                         &wallet_path,
-                        &utxos,
+                        &mut utxos,
                         cur_h,
                         &mut active_pending,
                         &mut reserved_inputs,
@@ -5751,7 +6103,55 @@ pub(crate) fn handle_request(
                         }
                     }
 
-                    let submit = json!({"tx": tx});
+                    let txid = match txid_from_value(&tx) {
+                        Ok(txid) => txid,
+                        Err(e) => {
+                            let d = format!("txid_compute_failed: {}", e);
+                            super::respond_json(
+                                request,
+                                tiny_http::StatusCode(500),
+                                json!({"error":"wallet_sign_failed","detail":d}).to_string(),
+                            );
+                            return;
+                        }
+                    };
+                    let spent_inputs: Vec<super::PendingInput> = selected
+                        .iter()
+                        .map(|s| super::PendingInput {
+                            txid: s.utxo.txid.clone(),
+                            vout: s.utxo.vout,
+                        })
+                        .collect();
+                    let recovery = super::SubmittedTxRecovery {
+                        pending_tx: super::PendingTx {
+                            txid: txid.clone(),
+                            category: "send".to_string(),
+                            amount: -(amount.saturating_add(final_fee)),
+                            fee: final_fee,
+                            change: final_change,
+                            timestamp: now_secs,
+                            details: {
+                                let mut details =
+                                    vec![amount_detail_json("send", &to_addr, -amount)];
+                                if final_fee > 0 {
+                                    details.push(amount_detail_json("fee", "", -final_fee));
+                                }
+                                if final_change > 0 {
+                                    details.push(amount_detail_json(
+                                        "receive",
+                                        "change",
+                                        final_change,
+                                    ));
+                                }
+                                details
+                            },
+                            spent_inputs: spent_inputs.clone(),
+                        },
+                        change_address: change_addr.clone(),
+                        change_vout: if final_change > 0 { 1 } else { 0 },
+                    };
+
+                    let submit = json!({"txid": txid, "tx": tx});
                     let submit_body = match serde_json::to_vec(&submit) {
                         Ok(b) => b,
                         Err(e) => {
@@ -5771,11 +6171,12 @@ pub(crate) fn handle_request(
                         &selected,
                         now_secs,
                     );
-                    if let Err(e) = persist_runtime_reserved_inputs(
+                    if let Err(e) = persist_runtime_reserved_inputs_with_recovery(
                         &wallet_path,
                         &utxos,
                         cur_h,
                         &reserved_inputs_after_select,
+                        Some(&recovery),
                     ) {
                         restore_runtime_sync_state(&utxos, cur_h, &reserved_inputs);
                         super::respond_json(
@@ -5795,20 +6196,15 @@ pub(crate) fn handle_request(
                     ) {
                         Ok(b) => b,
                         Err(e) => {
-                            release_selected_reserved_inputs(
-                                &mut reserved_inputs_after_select,
-                                &selected,
-                            );
-                            let _ = persist_runtime_reserved_inputs(
-                                &wallet_path,
-                                &utxos,
-                                cur_h,
-                                &reserved_inputs_after_select,
-                            );
                             super::respond_json(
                                 request,
                                 tiny_http::StatusCode(502),
-                                json!({"error":"daemon_unreachable","detail":e}).to_string(),
+                                json!({
+                                    "error":"daemon_submit_ambiguous",
+                                    "detail":e,
+                                    "txid":recovery.pending_tx.txid
+                                })
+                                .to_string(),
                             );
                             return;
                         }
@@ -5817,21 +6213,16 @@ pub(crate) fn handle_request(
                     let resp_v: serde_json::Value = match serde_json::from_str(&resp_body) {
                         Ok(v) => v,
                         Err(e) => {
-                            release_selected_reserved_inputs(
-                                &mut reserved_inputs_after_select,
-                                &selected,
-                            );
-                            let _ = persist_runtime_reserved_inputs(
-                                &wallet_path,
-                                &utxos,
-                                cur_h,
-                                &reserved_inputs_after_select,
-                            );
                             let d = format!("daemon_invalid_json: {}", e);
                             super::respond_json(
                                 request,
                                 tiny_http::StatusCode(502),
-                                json!({"error":"daemon_bad_response","detail":d}).to_string(),
+                                json!({
+                                    "error":"daemon_submit_ambiguous",
+                                    "detail":d,
+                                    "txid":recovery.pending_tx.txid
+                                })
+                                .to_string(),
                             );
                             return;
                         }
@@ -5844,11 +6235,12 @@ pub(crate) fn handle_request(
                                 &mut reserved_inputs_after_select,
                                 &selected,
                             );
-                            let _ = persist_runtime_reserved_inputs(
+                            let _ = persist_runtime_reserved_inputs_with_recovery(
                                 &wallet_path,
                                 &utxos,
                                 cur_h,
                                 &reserved_inputs_after_select,
+                                None,
                             );
                             super::respond_json(
                                 request,
@@ -5865,11 +6257,12 @@ pub(crate) fn handle_request(
                                 &mut reserved_inputs_after_select,
                                 &selected,
                             );
-                            let _ = persist_runtime_reserved_inputs(
+                            let _ = persist_runtime_reserved_inputs_with_recovery(
                                 &wallet_path,
                                 &utxos,
                                 cur_h,
                                 &reserved_inputs_after_select,
+                                None,
                             );
                             if let Err(e) = refresh_wallet_utxos_after_submit_conflict(
                                 &wallet_path,
@@ -5895,11 +6288,12 @@ pub(crate) fn handle_request(
                             &mut reserved_inputs_after_select,
                             &selected,
                         );
-                        let _ = persist_runtime_reserved_inputs(
+                        let _ = persist_runtime_reserved_inputs_with_recovery(
                             &wallet_path,
                             &utxos,
                             cur_h,
                             &reserved_inputs_after_select,
+                            None,
                         );
                         super::respond_json(
                             request,
@@ -5908,19 +6302,6 @@ pub(crate) fn handle_request(
                         );
                         return;
                     }
-
-                    let txid = resp_v
-                        .get("txid")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let spent_inputs: Vec<super::PendingInput> = selected
-                        .iter()
-                        .map(|s| super::PendingInput {
-                            txid: s.utxo.txid.clone(),
-                            vout: s.utxo.vout,
-                        })
-                        .collect();
 
                     // Update wallet utxos: remove spent, add change UTXO (unconfirmed).
                     let mut new_utxos: Vec<super::Utxo> = utxos
@@ -5932,7 +6313,7 @@ pub(crate) fn handle_request(
                         })
                         .collect();
 
-                    if final_change > 0 && !txid.is_empty() {
+                    if final_change > 0 {
                         new_utxos.push(super::Utxo {
                             value: final_change,
                             height: 0,
@@ -5976,14 +6357,23 @@ pub(crate) fn handle_request(
                     };
                     release_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected);
 
+                    if std::env::var("DUTA_WALLET_TEST_CRASH_AFTER_SUBMIT")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
+                    {
+                        std::process::abort();
+                    }
+
                     // Persist to disk and update in-memory together.
-                    let persist_result = super::save_wallet_full_state(
+                    let persist_result = persist_runtime_full_state_with_recovery(
                         &wallet_path,
-                    &new_utxos,
-                    cur_h,
-                    &pending_after,
-                    &reserved_inputs_after_select,
-                );
+                        &new_utxos,
+                        cur_h,
+                        &pending_after,
+                        &reserved_inputs_after_select,
+                        None,
+                    );
 
                     let body = send_success_body(
                         &txid,
@@ -6866,7 +7256,7 @@ pub(crate) fn handle_request(
                 return;
             }
 
-            let (cur_h, utxos) = match refresh_wallet_utxos_runtime(
+            let (cur_h, mut utxos) = match refresh_wallet_utxos_runtime(
                 &addrs,
                 daemon_rpc_port,
                 &utxos,
@@ -7678,7 +8068,7 @@ pub(crate) fn handle_request(
             let mut reserved_inputs = reserved_inputs;
             let reserved_outpoints = match reconcile_pending_and_reserved_state(
                 &wallet_path,
-                &utxos,
+                &mut utxos,
                 cur_h,
                 &mut active_pending,
                 &mut reserved_inputs,
@@ -7935,7 +8325,7 @@ pub(crate) fn handle_request(
             let mut reserved_inputs = reserved_inputs;
             let reserved_outpoints = match reconcile_pending_and_reserved_state(
                 &wallet_path,
-                &utxos,
+                &mut utxos,
                 cur_h,
                 &mut active_pending,
                 &mut reserved_inputs,
@@ -8347,7 +8737,7 @@ pub(crate) fn handle_request(
             let mut reserved_inputs = reserved_inputs;
             let reserved_outpoints = match reconcile_pending_and_reserved_state(
                 &wallet_path,
-                &utxos,
+                &mut utxos,
                 cur_h,
                 &mut active_pending,
                 &mut reserved_inputs,
@@ -8551,7 +8941,51 @@ pub(crate) fn handle_request(
                 return;
             }
 
-            let submit_body = match serde_json::to_vec(&json!({"tx": tx})) {
+            let txid = match txid_from_value(&tx) {
+                Ok(txid) => txid,
+                Err(e) => {
+                    super::respond_json(
+                        request,
+                        tiny_http::StatusCode(500),
+                        json!({"error":"wallet_sign_failed","detail":format!("txid_compute_failed: {}", e)}).to_string(),
+                    );
+                    return;
+                }
+            };
+            let spent_inputs: Vec<super::PendingInput> = selected
+                .iter()
+                .map(|s| super::PendingInput {
+                    txid: s.utxo.txid.clone(),
+                    vout: s.utxo.vout,
+                })
+                .collect();
+            let recovery = super::SubmittedTxRecovery {
+                pending_tx: super::PendingTx {
+                    txid: txid.clone(),
+                    category: "send".to_string(),
+                    amount: -(total_amount.saturating_add(final_fee)),
+                    fee: final_fee,
+                    change: final_change,
+                    timestamp: now_secs,
+                    details: {
+                        let mut details: Vec<serde_json::Value> = recipients
+                            .iter()
+                            .map(|(to_addr, amount)| amount_detail_json("send", to_addr, -*amount))
+                            .collect();
+                        if final_fee > 0 {
+                            details.push(amount_detail_json("fee", "", -final_fee));
+                        }
+                        if final_change > 0 {
+                            details.push(amount_detail_json("receive", "change", final_change));
+                        }
+                        details
+                    },
+                    spent_inputs: spent_inputs.clone(),
+                },
+                change_address: change_addr.clone(),
+                change_vout,
+            };
+            let submit_body = match serde_json::to_vec(&json!({"txid": txid, "tx": tx})) {
                 Ok(b) => b,
                 Err(e) => {
                     super::respond_json(
@@ -8565,11 +8999,12 @@ pub(crate) fn handle_request(
 
             let mut reserved_inputs_after_select = reserved_inputs.clone();
             append_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected, now_secs);
-            if let Err(e) = persist_runtime_reserved_inputs(
+            if let Err(e) = persist_runtime_reserved_inputs_with_recovery(
                 &wallet_path,
                 &utxos,
                 cur_h,
                 &reserved_inputs_after_select,
+                Some(&recovery),
             ) {
                 restore_runtime_sync_state(&utxos, cur_h, &reserved_inputs);
                 super::respond_json(
@@ -8589,18 +9024,11 @@ pub(crate) fn handle_request(
             ) {
                 Ok(b) => b,
                 Err(e) => {
-                    release_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected);
-                    let _ = persist_runtime_reserved_inputs(
-                        &wallet_path,
-                        &utxos,
-                        cur_h,
-                        &reserved_inputs_after_select,
-                    );
                     respond_http_error_detail(
                         request,
                         tiny_http::StatusCode(502),
-                        "daemon_unreachable",
-                        e,
+                        "daemon_submit_ambiguous",
+                        format!("{}; txid={}", e, recovery.pending_tx.txid),
                     );
                     return;
                 }
@@ -8609,17 +9037,14 @@ pub(crate) fn handle_request(
             let resp_v: serde_json::Value = match serde_json::from_str(&resp_body) {
                 Ok(v) => v,
                 Err(e) => {
-                    release_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected);
-                    let _ = persist_runtime_reserved_inputs(
-                        &wallet_path,
-                        &utxos,
-                        cur_h,
-                        &reserved_inputs_after_select,
-                    );
                     super::respond_json(
                         request,
                         tiny_http::StatusCode(502),
-                        json!({"error":"daemon_bad_response","detail":format!("daemon_invalid_json: {}", e)}).to_string(),
+                        json!({
+                            "error":"daemon_submit_ambiguous",
+                            "detail":format!("daemon_invalid_json: {}", e),
+                            "txid": recovery.pending_tx.txid
+                        }).to_string(),
                     );
                     return;
                 }
@@ -8627,11 +9052,12 @@ pub(crate) fn handle_request(
 
             if resp_v.get("ok").and_then(|x| x.as_bool()) != Some(true) {
                 release_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected);
-                let _ = persist_runtime_reserved_inputs(
+                let _ = persist_runtime_reserved_inputs_with_recovery(
                     &wallet_path,
                     &utxos,
                     cur_h,
                     &reserved_inputs_after_select,
+                    None,
                 );
                 super::respond_json(
                     request,
@@ -8656,19 +9082,12 @@ pub(crate) fn handle_request(
                 );
                 return;
             }
-
-            let txid = resp_v
-                .get("txid")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string();
-            let spent_inputs: Vec<super::PendingInput> = selected
-                .iter()
-                .map(|s| super::PendingInput {
-                    txid: s.utxo.txid.clone(),
-                    vout: s.utxo.vout,
-                })
-                .collect();
+            if std::env::var("DUTA_WALLET_TEST_CRASH_AFTER_SUBMIT")
+                .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false)
+            {
+                std::process::abort();
+            }
             let mut new_utxos: Vec<super::Utxo> = utxos
                 .into_iter()
                 .filter(|u| {
@@ -8708,12 +9127,13 @@ pub(crate) fn handle_request(
                 pending
             };
             release_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected);
-            let persist_result = persist_runtime_full_state(
+            let persist_result = persist_runtime_full_state_with_recovery(
                 &wallet_path,
                 &new_utxos,
                 cur_h,
                 &pending_after,
                 &reserved_inputs_after_select,
+                None,
             );
             if let Err(e) = persist_result {
                 super::respond_json(
@@ -8984,7 +9404,7 @@ pub(crate) fn handle_request(
             let mut reserved_inputs = reserved_inputs;
             let reserved_outpoints = match reconcile_pending_and_reserved_state(
                 &wallet_path,
-                &utxos,
+                &mut utxos,
                 cur_h,
                 &mut active_pending,
                 &mut reserved_inputs,
@@ -9204,7 +9624,49 @@ pub(crate) fn handle_request(
                 return;
             }
 
-            let submit = json!({"tx": tx});
+            let txid = match txid_from_value(&tx) {
+                Ok(txid) => txid,
+                Err(e) => {
+                    let d = format!("txid_compute_failed: {}", e);
+                    super::respond_json(
+                        request,
+                        tiny_http::StatusCode(500),
+                        json!({"error":"wallet_sign_failed","detail":d}).to_string(),
+                    );
+                    return;
+                }
+            };
+            let spent_inputs: Vec<super::PendingInput> = selected
+                .iter()
+                .map(|s| super::PendingInput {
+                    txid: s.utxo.txid.clone(),
+                    vout: s.utxo.vout,
+                })
+                .collect();
+            let recovery = super::SubmittedTxRecovery {
+                pending_tx: super::PendingTx {
+                    txid: txid.clone(),
+                    category: "send".to_string(),
+                    amount: -(amount.saturating_add(final_fee)),
+                    fee: final_fee,
+                    change: final_change,
+                    timestamp: now_secs,
+                    details: {
+                        let mut details = vec![amount_detail_json("send", &to_addr, -amount)];
+                        if final_fee > 0 {
+                            details.push(amount_detail_json("fee", "", -final_fee));
+                        }
+                        if final_change > 0 {
+                            details.push(amount_detail_json("receive", "change", final_change));
+                        }
+                        details
+                    },
+                    spent_inputs: spent_inputs.clone(),
+                },
+                change_address: change_addr.clone(),
+                change_vout: 1,
+            };
+            let submit = json!({"txid": txid, "tx": tx});
             let submit_body = match serde_json::to_vec(&submit) {
                 Ok(b) => b,
                 Err(e) => {
@@ -9220,11 +9682,12 @@ pub(crate) fn handle_request(
 
             let mut reserved_inputs_after_select = reserved_inputs.clone();
             append_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected, now_secs);
-            if let Err(e) = persist_runtime_reserved_inputs(
+            if let Err(e) = persist_runtime_reserved_inputs_with_recovery(
                 &wallet_path,
                 &utxos,
                 cur_h,
                 &reserved_inputs_after_select,
+                Some(&recovery),
             ) {
                 restore_runtime_sync_state(&utxos, cur_h, &reserved_inputs);
                 super::respond_json(
@@ -9244,18 +9707,11 @@ pub(crate) fn handle_request(
             ) {
                 Ok(b) => b,
                 Err(e) => {
-                    release_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected);
-                    let _ = persist_runtime_reserved_inputs(
-                        &wallet_path,
-                        &utxos,
-                        cur_h,
-                        &reserved_inputs_after_select,
-                    );
                     respond_http_error_detail(
                         request,
                         tiny_http::StatusCode(502),
-                        "daemon_unreachable",
-                        e,
+                        "daemon_submit_ambiguous",
+                        format!("{}; txid={}", e, recovery.pending_tx.txid),
                     );
                     return;
                 }
@@ -9264,18 +9720,11 @@ pub(crate) fn handle_request(
             let resp_v: serde_json::Value = match serde_json::from_str(&resp_body) {
                 Ok(v) => v,
                 Err(e) => {
-                    release_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected);
-                    let _ = persist_runtime_reserved_inputs(
-                        &wallet_path,
-                        &utxos,
-                        cur_h,
-                        &reserved_inputs_after_select,
-                    );
                     let d = format!("daemon_invalid_json: {}", e);
                     super::respond_json(
                         request,
                         tiny_http::StatusCode(502),
-                        json!({"error":"daemon_bad_response","detail":d}).to_string(),
+                        json!({"error":"daemon_submit_ambiguous","detail":d,"txid":recovery.pending_tx.txid}).to_string(),
                     );
                     return;
                 }
@@ -9285,11 +9734,12 @@ pub(crate) fn handle_request(
                 // Pass through fee-floor errors as 422 so clients don't treat it as a gateway failure.
                 if resp_v.get("error").and_then(|x| x.as_str()) == Some("fee_too_low") {
                     release_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected);
-                    let _ = persist_runtime_reserved_inputs(
+                    let _ = persist_runtime_reserved_inputs_with_recovery(
                         &wallet_path,
                         &utxos,
                         cur_h,
                         &reserved_inputs_after_select,
+                        None,
                     );
                     super::respond_json(request, tiny_http::StatusCode(422), resp_v.to_string());
                     return;
@@ -9299,11 +9749,12 @@ pub(crate) fn handle_request(
                     Some("input_not_found" | "double_spend")
                 ) {
                     release_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected);
-                    let _ = persist_runtime_reserved_inputs(
+                    let _ = persist_runtime_reserved_inputs_with_recovery(
                         &wallet_path,
                         &utxos,
                         cur_h,
                         &reserved_inputs_after_select,
+                        None,
                     );
                     if let Err(e) = refresh_wallet_utxos_after_submit_conflict(
                         &wallet_path,
@@ -9326,11 +9777,12 @@ pub(crate) fn handle_request(
                     return;
                 }
                 release_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected);
-                let _ = persist_runtime_reserved_inputs(
+                let _ = persist_runtime_reserved_inputs_with_recovery(
                     &wallet_path,
                     &utxos,
                     cur_h,
                     &reserved_inputs_after_select,
+                    None,
                 );
                 super::respond_json(
                     request,
@@ -9339,19 +9791,12 @@ pub(crate) fn handle_request(
                 );
                 return;
             }
-
-            let txid = resp_v
-                .get("txid")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string();
-            let spent_inputs: Vec<super::PendingInput> = selected
-                .iter()
-                .map(|s| super::PendingInput {
-                    txid: s.utxo.txid.clone(),
-                    vout: s.utxo.vout,
-                })
-                .collect();
+            if std::env::var("DUTA_WALLET_TEST_CRASH_AFTER_SUBMIT")
+                .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false)
+            {
+                std::process::abort();
+            }
 
             // Update wallet utxos: remove spent, add change UTXO (unconfirmed).
             let mut new_utxos: Vec<super::Utxo> = utxos
@@ -9407,12 +9852,13 @@ pub(crate) fn handle_request(
             };
             release_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected);
 
-                    let persist_result = persist_runtime_full_state(
+                    let persist_result = persist_runtime_full_state_with_recovery(
                         &wallet_path,
                         &new_utxos,
                         cur_h,
                         &pending_after,
                         &reserved_inputs_after_select,
+                        None,
                     );
 
                     if let Err(e) = persist_result {

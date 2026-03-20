@@ -856,6 +856,12 @@ fn format_error(raw: &str) -> String {
 
 fn human_error_message(raw: &str) -> Option<String> {
     let lower = raw.to_ascii_lowercase();
+    if lower.contains("daemon_unreachable") {
+        return Some("node is not reachable right now".to_string());
+    }
+    if lower.contains("wallet_state_refresh_failed") {
+        return Some("wallet could not refresh its balance yet".to_string());
+    }
     if lower.contains("connect_failed") {
         return Some("cannot reach wallet service".to_string());
     }
@@ -873,12 +879,6 @@ fn human_error_message(raw: &str) -> Option<String> {
     }
     if lower.contains("passphrase_too_short") {
         return Some("passphrase is too short".to_string());
-    }
-    if lower.contains("daemon_unreachable") {
-        return Some("node is not reachable right now".to_string());
-    }
-    if lower.contains("wallet_state_refresh_failed") {
-        return Some("wallet could not refresh its balance yet".to_string());
     }
     if lower.contains("insufficient_funds") {
         return Some("not enough spendable balance".to_string());
@@ -1188,6 +1188,24 @@ mod tests {
         assert_eq!(
             human_error_message(&parsed),
             Some("could not open wallet file".to_string())
+        );
+    }
+
+    #[test]
+    fn daemon_unreachable_beats_nested_connect_failed_detail() {
+        let raw = r#"HTTP 400: {"error":{"code":-18,"message":"daemon_unreachable: connect_failed: Connection refused (os error 111)"}}"#;
+        assert_eq!(
+            human_error_message(raw),
+            Some("node is not reachable right now".to_string())
+        );
+    }
+
+    #[test]
+    fn wallet_refresh_failure_beats_nested_connect_failed_detail() {
+        let raw = r#"HTTP 400: {"error":{"code":-18,"message":"wallet_state_refresh_failed: connect_failed: Connection refused (os error 111)"}}"#;
+        assert_eq!(
+            human_error_message(raw),
+            Some("wallet could not refresh its balance yet".to_string())
         );
     }
 

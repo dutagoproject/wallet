@@ -193,6 +193,9 @@ enum Cmd {
     /// POST /rpc {"method":"getwalletinfo"}
     Getwalletinfo,
 
+    /// POST /rpc {"method":"walletdoctor"}
+    Doctor,
+
     /// POST /rpc {"method":"listtransactions","params":[count, skip]}
     #[command(visible_alias = "listtransactions")]
     History {
@@ -214,8 +217,28 @@ fn main() {
     let (host, port) = resolve_rpc(&args);
     let cmd = args.cmd.clone();
 
+    if matches!(cmd, Cmd::Health) {
+        match http_get_response(&host, port, "/health") {
+            Ok((status, body)) => {
+                println!("{}", format_response(&cmd, &body));
+                let ok = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| json_bool(&v, &["ok"]))
+                    .unwrap_or((200..300).contains(&status));
+                if !ok {
+                    std::process::exit(1);
+                }
+                return;
+            }
+            Err(e) => {
+                eprintln!("{}", format_error(&e));
+                std::process::exit(1);
+            }
+        }
+    }
+
     let res = match args.cmd {
-        Cmd::Health => http_get_json(&host, port, "/health"),
+        Cmd::Health => unreachable!("health handled above"),
         Cmd::Info => http_get_json(&host, port, "/info"),
 
         Cmd::Createwallet {
@@ -363,6 +386,12 @@ fn main() {
             port,
             "/rpc",
             json!({"jsonrpc":"2.0","id":1,"method":"getwalletinfo","params":{}}),
+        ),
+        Cmd::Doctor => http_post_json(
+            &host,
+            port,
+            "/rpc",
+            json!({"jsonrpc":"2.0","id":1,"method":"walletdoctor","params":{}}),
         ),
 
         Cmd::History { count, skip } => {
@@ -517,13 +546,22 @@ fn json_str<'a>(v: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> {
 fn format_wallet_health(v: &serde_json::Value, body: &str) -> String {
     let wallet_open = json_bool(v, &["wallet_open"]).unwrap_or(false);
     let height = json_i64(v, &["height"]).unwrap_or(0);
+    let wallet_state = json_str(v, &["wallet_state"]).unwrap_or(if wallet_open {
+        "open"
+    } else {
+        "closed"
+    });
+    let pending = json_i64(v, &["pending_txs"]).unwrap_or(0);
+    let last_sync_height = json_i64(v, &["last_sync_height"]).unwrap_or(0);
     if json_bool(v, &["ok"]) == Some(true) {
         if wallet_open {
             format!(
-                "{}\n{}\n{}",
+                "{}\n{}\n{}\n{}\n{}",
                 ok_line("wallet service is online"),
-                info_line("wallet: open"),
-                info_line(format!("height: {height}"))
+                info_line(format!("wallet: {wallet_state}")),
+                info_line(format!("height: {height}")),
+                info_line(format!("last sync height: {last_sync_height}")),
+                info_line(format!("pending txs: {pending}"))
             )
         } else {
             format!(
@@ -535,10 +573,15 @@ fn format_wallet_health(v: &serde_json::Value, body: &str) -> String {
     } else if wallet_open {
         let error = json_str(v, &["error"]).unwrap_or("wallet_unhealthy");
         let detail = json_str(v, &["detail"]).unwrap_or(body);
+        let backend = json_str(v, &["backend_status"]).unwrap_or("unknown");
         format!(
-            "{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             err_line("wallet service degraded"),
-            wait_line("wallet: open"),
+            wait_line(format!("wallet: {wallet_state}")),
+            wait_line(format!("height: {height}")),
+            wait_line(format!("last sync height: {last_sync_height}")),
+            wait_line(format!("pending txs: {pending}")),
+            wait_line(format!("backend: {backend}")),
             err_line(format!("error: {error}")),
             info_line(format!("detail: {detail}"))
         )
@@ -662,6 +705,62 @@ fn format_response(cmd: &Cmd, body: &str) -> String {
                 wait_line(format!(
                     "pending txs: {}",
                     json_i64(&result, &["pending_txs"]).unwrap_or(0)
+                ))
+            )
+        }
+        Cmd::Doctor => {
+            let result = json_field(&v, &["result"]).cloned().unwrap_or_else(|| json!({}));
+            format!(
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                info_line(format!(
+                    "wallet: {}",
+                    json_str(&result, &["walletname"]).unwrap_or("wallet")
+                )),
+                info_line(format!(
+                    "db health: {}",
+                    json_str(&result, &["db_health"]).unwrap_or("unknown")
+                )),
+                info_line(format!(
+                    "status: {}",
+                    if json_bool(&result, &["wallet_unlocked"]).unwrap_or(false) {
+                        "unlocked"
+                    } else {
+                        "locked"
+                    }
+                )),
+                info_line(format!("balance: {}", amount_text(&result, "balance", "balance_dut"))),
+                info_line(format!(
+                    "spendable: {}",
+                    amount_text(&result, "spendable_balance", "spendable_balance_dut")
+                )),
+                info_line(format!(
+                    "reserved balance: {}",
+                    amount_text(&result, "reserved_balance", "reserved_balance_dut")
+                )),
+                info_line(format!(
+                    "pending send/change: {} / {}",
+                    amount_text(&result, "pending_send", "pending_send_dut"),
+                    amount_text(&result, "pending_change", "pending_change_dut")
+                )),
+                info_line(format!(
+                    "pending txs: {}",
+                    json_i64(&result, &["pending_txs"]).unwrap_or(0)
+                )),
+                info_line(format!(
+                    "reserved inputs: {}",
+                    json_i64(&result, &["reserved_inputs"]).unwrap_or(0)
+                )),
+                info_line(format!(
+                    "last sync height: {}",
+                    json_i64(&result, &["last_sync_height"]).unwrap_or(0)
+                )),
+                info_line(format!(
+                    "next index: {}",
+                    json_i64(&result, &["next_index"]).unwrap_or(0)
+                )),
+                info_line(format!(
+                    "backend: {}",
+                    json_str(&result, &["backend_status"]).unwrap_or("unknown")
                 ))
             )
         }
@@ -971,6 +1070,10 @@ fn http_get_json(host: &str, port: u16, path: &str) -> Result<String, String> {
     http_request_json("GET", host, port, path, None)
 }
 
+fn http_get_response(host: &str, port: u16, path: &str) -> Result<(u16, String), String> {
+    http_request_response("GET", host, port, path, None)
+}
+
 fn http_post_json(
     host: &str,
     port: u16,
@@ -1025,6 +1128,21 @@ fn http_request_json(
     path: &str,
     body: Option<String>,
 ) -> Result<String, String> {
+    let (code, body) = http_request_response(method, host, port, path, body)?;
+    if (200..300).contains(&code) {
+        Ok(body)
+    } else {
+        Err(format!("HTTP {}: {}", code, body))
+    }
+}
+
+fn http_request_response(
+    method: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    body: Option<String>,
+) -> Result<(u16, String), String> {
     let mut stream = TcpStream::connect((host, port))
         .map_err(|e| format!("connect_failed: {}:{}: {}", host, port, e))?;
 
@@ -1050,7 +1168,7 @@ fn http_request_json(
     let buf = read_http_response_bytes(&mut stream)?;
 
     let resp = String::from_utf8_lossy(&buf).to_string();
-    parse_http_response(&resp)
+    parse_http_response_any_status(&resp)
 }
 
 fn read_http_response_bytes<R: Read>(reader: &mut R) -> Result<Vec<u8>, String> {
@@ -1077,7 +1195,17 @@ fn read_http_response_bytes<R: Read>(reader: &mut R) -> Result<Vec<u8>, String> 
     Ok(buf)
 }
 
+#[cfg(test)]
 fn parse_http_response(resp: &str) -> Result<String, String> {
+    let (code, body) = parse_http_response_any_status(resp)?;
+    if (200..300).contains(&code) {
+        Ok(body)
+    } else {
+        Err(format!("HTTP {}: {}", code, body))
+    }
+}
+
+fn parse_http_response_any_status(resp: &str) -> Result<(u16, String), String> {
     let (head, body) = match resp.split_once("\r\n\r\n") {
         Some(x) => x,
         None => return Err("invalid_http_response".to_string()),
@@ -1090,22 +1218,19 @@ fn parse_http_response(resp: &str) -> Result<String, String> {
         .and_then(|x| x.parse().ok())
         .unwrap_or(0);
 
-    if (200..300).contains(&code) {
-        let chunked_header = head.lines().any(|line| {
-            let mut parts = line.splitn(2, ':');
-            let name = parts.next().unwrap_or("").trim();
-            let value = parts.next().unwrap_or("").trim();
-            name.eq_ignore_ascii_case("Transfer-Encoding")
-                && value.eq_ignore_ascii_case("chunked")
-        });
-        if chunked_header || looks_like_chunked_body(body) {
-            decode_chunked_body(body)
-        } else {
-            Ok(body.to_string())
-        }
+    let chunked_header = head.lines().any(|line| {
+        let mut parts = line.splitn(2, ':');
+        let name = parts.next().unwrap_or("").trim();
+        let value = parts.next().unwrap_or("").trim();
+        name.eq_ignore_ascii_case("Transfer-Encoding")
+            && value.eq_ignore_ascii_case("chunked")
+    });
+    let body = if chunked_header || looks_like_chunked_body(body) {
+        decode_chunked_body(body)?
     } else {
-        Err(format!("HTTP {}: {}", code, body))
-    }
+        body.to_string()
+    };
+    Ok((code, body))
 }
 
 fn looks_like_chunked_body(body: &str) -> bool {
@@ -1151,7 +1276,8 @@ fn decode_chunked_body(body: &str) -> Result<String, String> {
 mod tests {
     use super::{
         amount_text, format_response, history_amount_and_fee, human_error_message,
-        parse_http_response, read_http_response_bytes, resolve_wallet_path, Args, Cmd,
+        parse_http_response, parse_http_response_any_status, read_http_response_bytes,
+        resolve_wallet_path, Args, Cmd,
     };
     use clap::Parser;
     use serde_json::json;
@@ -1239,6 +1365,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_http_response_any_status_keeps_503_json_body() {
+        let (code, body) = parse_http_response_any_status(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n\r\n{\"ok\":false,\"wallet_open\":true,\"wallet_state\":\"locked\",\"backend_status\":\"unreachable\",\"error\":\"daemon_unreachable\"}",
+        )
+        .expect("parsed");
+        assert_eq!(code, 503);
+        assert!(body.contains("\"wallet_state\":\"locked\""));
+        assert!(body.contains("\"backend_status\":\"unreachable\""));
+    }
+
+    #[test]
     fn daemon_unreachable_beats_nested_connect_failed_detail() {
         let raw = r#"HTTP 400: {"error":{"code":-18,"message":"daemon_unreachable: connect_failed: Connection refused (os error 111)"}}"#;
         assert_eq!(
@@ -1310,23 +1447,62 @@ mod tests {
     fn health_formats_open_wallet_height() {
         let out = format_response(
             &Cmd::Health,
-            r#"{"ok":true,"wallet_open":true,"height":42}"#,
+            r#"{"ok":true,"wallet_open":true,"wallet_state":"unlocked","height":42,"last_sync_height":41,"pending_txs":2}"#,
         );
         assert!(out.contains("wallet service is online"));
-        assert!(out.contains("wallet: open"));
+        assert!(out.contains("wallet: unlocked"));
         assert!(out.contains("height: 42"));
+        assert!(out.contains("last sync height: 41"));
+        assert!(out.contains("pending txs: 2"));
     }
 
     #[test]
     fn health_formats_backend_degradation_actionably() {
         let out = format_response(
             &Cmd::Health,
-            r#"{"ok":false,"wallet_open":true,"error":"daemon_unreachable","detail":"connect_failed: connection refused"}"#,
+            r#"{"ok":false,"wallet_open":true,"wallet_state":"locked","height":42,"last_sync_height":41,"pending_txs":2,"backend_status":"timeout","error":"daemon_unreachable","detail":"connect_failed: connection refused"}"#,
         );
         assert!(out.contains("wallet service degraded"));
-        assert!(out.contains("wallet: open"));
+        assert!(out.contains("wallet: locked"));
+        assert!(out.contains("backend: timeout"));
         assert!(out.contains("error: daemon_unreachable"));
         assert!(out.contains("detail: connect_failed: connection refused"));
+    }
+
+    #[test]
+    fn doctor_formats_wallet_state_summary() {
+        let out = format_response(
+            &Cmd::Doctor,
+            &json!({
+                "result": {
+                    "walletname": "ops",
+                    "db_health": "open",
+                    "wallet_unlocked": false,
+                    "balance": "1.00000000",
+                    "balance_dut": 100000000i64,
+                    "spendable_balance": "0.50000000",
+                    "spendable_balance_dut": 50000000i64,
+                    "reserved_balance": "0.10000000",
+                    "reserved_balance_dut": 10000000i64,
+                    "pending_send": "0.20000000",
+                    "pending_send_dut": 20000000i64,
+                    "pending_change": "0.05000000",
+                    "pending_change_dut": 5000000i64,
+                    "pending_txs": 2,
+                    "reserved_inputs": 3,
+                    "last_sync_height": 77,
+                    "next_index": 9,
+                    "backend_status": "ok"
+                }
+            })
+            .to_string(),
+        );
+        assert!(out.contains("wallet: ops"));
+        assert!(out.contains("db health: open"));
+        assert!(out.contains("status: locked"));
+        assert!(out.contains("pending txs: 2"));
+        assert!(out.contains("reserved inputs: 3"));
+        assert!(out.contains("next index: 9"));
     }
 
     #[test]

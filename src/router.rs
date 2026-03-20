@@ -30,31 +30,80 @@ fn status_for_body_err(detail: &str) -> tiny_http::StatusCode {
     }
 }
 
+fn wallet_backend_status(error_code: &str, detail: &str) -> &'static str {
+    if error_code.contains("timeout")
+        || detail.contains("read_timeout")
+        || detail.contains("timed out")
+    {
+        "timeout"
+    } else {
+        "unreachable"
+    }
+}
+
 fn wallet_health_response(
     wallet_open: bool,
+    wallet_locked: bool,
+    pending_txs: usize,
+    last_sync_height: i64,
+    next_index: u32,
     refresh: Result<(i64,), String>,
 ) -> (tiny_http::StatusCode, serde_json::Value) {
+    let wallet_state = if !wallet_open {
+        "closed"
+    } else if wallet_locked {
+        "locked"
+    } else {
+        "unlocked"
+    };
     if wallet_open {
         match refresh {
             Ok((height,)) => (tiny_http::StatusCode(200), json!({
                 "ok": true,
                 "wallet_open": true,
+                "wallet_locked": wallet_locked,
+                "wallet_unlocked": !wallet_locked,
+                "wallet_state": wallet_state,
+                "pending_txs": pending_txs,
+                "last_sync_height": last_sync_height,
+                "next_index": next_index,
+                "backend_status": "ok",
                 "height": height,
             })),
-            Err(e) => (
-                tiny_http::StatusCode(503),
-                json!({
+            Err(e) => {
+                let error_code = wallet_refresh_error_code(&e);
+                (
+                    tiny_http::StatusCode(503),
+                    json!({
                     "ok": false,
                     "wallet_open": true,
-                    "error": wallet_refresh_error_code(&e),
+                    "wallet_locked": wallet_locked,
+                    "wallet_unlocked": !wallet_locked,
+                    "wallet_state": wallet_state,
+                    "pending_txs": pending_txs,
+                    "last_sync_height": last_sync_height,
+                    "next_index": next_index,
+                    "error": error_code,
+                    "backend_status": wallet_backend_status(error_code, &e),
                     "detail": e,
                 }),
-            ),
+            )
+            }
         }
     } else {
         (
             tiny_http::StatusCode(200),
-            json!({"ok": true, "wallet_open": false}),
+            json!({
+                "ok": true,
+                "wallet_open": false,
+                "wallet_locked": true,
+                "wallet_unlocked": false,
+                "wallet_state": wallet_state,
+                "pending_txs": 0,
+                "last_sync_height": 0,
+                "next_index": 0,
+                "backend_status": "closed"
+            }),
         )
     }
 }
@@ -255,12 +304,36 @@ mod tests {
     fn wallet_health_response_marks_open_wallet_with_dead_backend_unhealthy() {
         let (status, body) = wallet_health_response(
             true,
+            true,
+            2,
+            41,
+            9,
             Err("connect_failed: connection refused".to_string()),
         );
         assert_eq!(status, tiny_http::StatusCode(503));
         assert_eq!(body["ok"], json!(false));
         assert_eq!(body["wallet_open"], json!(true));
+        assert_eq!(body["wallet_locked"], json!(true));
+        assert_eq!(body["pending_txs"], json!(2));
+        assert_eq!(body["last_sync_height"], json!(41));
         assert_eq!(body["error"], json!("daemon_unreachable"));
+        assert_eq!(body["backend_status"], json!("unreachable"));
+    }
+
+    #[test]
+    fn wallet_health_response_marks_backend_timeout_distinctly() {
+        let (status, body) = wallet_health_response(
+            true,
+            false,
+            0,
+            12,
+            3,
+            Err("read_timeout".to_string()),
+        );
+        assert_eq!(status, tiny_http::StatusCode(503));
+        assert_eq!(body["error"], json!("daemon_unreachable"));
+        assert_eq!(body["backend_status"], json!("timeout"));
+        assert_eq!(body["wallet_state"], json!("unlocked"));
     }
 
     #[test]
@@ -404,9 +477,11 @@ mod tests {
 
     #[test]
     fn wallet_health_response_keeps_closed_wallet_healthy() {
-        let (status, body) = wallet_health_response(false, Ok((0,)));
+        let (status, body) = wallet_health_response(false, true, 0, 0, 0, Ok((0,)));
         assert_eq!(status, tiny_http::StatusCode(200));
-        assert_eq!(body, json!({"ok": true, "wallet_open": false}));
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["wallet_open"], json!(false));
+        assert_eq!(body["wallet_state"], json!("closed"));
     }
 
     #[test]
@@ -2938,6 +3013,13 @@ fn reconcile_pending_and_reserved_state(
             if let Some(recovery) = submitted_recovery.as_ref() {
                 let recovery_txid = recovery.pending_tx.txid.clone();
                 if mempool_txids.contains(&recovery_txid) {
+                    wdlog!(
+                        "wallet_rpc: pending_recovery_restored wallet={} txid={} source=mempool change_dut={} spent_inputs={}",
+                        wallet_public_name(wallet_path),
+                        recovery_txid,
+                        recovery.pending_tx.change,
+                        recovery.pending_tx.spent_inputs.len()
+                    );
                     active_pending.retain(|pending| pending.txid != recovery_txid);
                     active_pending.push(recovery.pending_tx.clone());
                     utxos.retain(|utxo| {
@@ -2985,6 +3067,12 @@ fn reconcile_pending_and_reserved_state(
                             .unwrap_or(false)
                     };
                     if confirmed {
+                        wdlog!(
+                            "wallet_rpc: pending_recovery_cleared wallet={} txid={} source=chain_confirmed spent_inputs={}",
+                            wallet_public_name(wallet_path),
+                            recovery_txid,
+                            recovery.pending_tx.spent_inputs.len()
+                        );
                         release_reserved_inputs_for_pending_inputs(
                             reserved_inputs,
                             &recovery.pending_tx.spent_inputs,
@@ -4474,16 +4562,40 @@ pub(crate) fn handle_request(
                 respond_method_not_allowed(request);
             } else {
                 let g = super::wallet_lock_or_recover();
-                let wallet_open = g.is_some();
+                let (wallet_open, wallet_locked, pending_txs, last_sync_height, next_index) =
+                    match g.as_ref() {
+                        Some(ws) => (
+                            true,
+                            ws.is_db && ws.locked,
+                            ws.pending_txs.len(),
+                            ws.last_sync_height,
+                            ws.next_index,
+                        ),
+                        None => (false, true, 0usize, 0i64, 0u32),
+                    };
                 drop(g);
 
                 let (status, body) = if wallet_open {
                     match wallet_health_snapshot(daemon_rpc_port) {
-                        Ok(height) => wallet_health_response(true, Ok((height,))),
-                        Err(e) => wallet_health_response(true, Err(e)),
+                        Ok(height) => wallet_health_response(
+                            true,
+                            wallet_locked,
+                            pending_txs,
+                            last_sync_height,
+                            next_index,
+                            Ok((height,)),
+                        ),
+                        Err(e) => wallet_health_response(
+                            true,
+                            wallet_locked,
+                            pending_txs,
+                            last_sync_height,
+                            next_index,
+                            Err(e),
+                        ),
                     }
                 } else {
-                    wallet_health_response(false, Ok((0,)))
+                    wallet_health_response(false, true, 0, 0, 0, Ok((0,)))
                 };
                 super::respond_json(request, status, body.to_string());
             }
@@ -4505,6 +4617,15 @@ pub(crate) fn handle_request(
                 });
 
                 if wallet_open {
+                    let g = super::wallet_lock_or_recover();
+                    if let Some(ws) = g.as_ref() {
+                        body["wallet_locked"] = json!(ws.is_db && ws.locked);
+                        body["wallet_unlocked"] = json!(!(ws.is_db && ws.locked));
+                        body["last_sync_height"] = json!(ws.last_sync_height);
+                        body["next_index"] = json!(ws.next_index);
+                        body["reserved_inputs"] = json!(ws.reserved_inputs.len());
+                    }
+                    drop(g);
                     match wallet_balance_snapshot(daemon_rpc_port) {
                         Ok(snapshot) => {
                             body["balance"] = amount_json_value(snapshot.balance_dut);
@@ -4530,6 +4651,10 @@ pub(crate) fn handle_request(
                         Err(e) => {
                             body["wallet_state_refresh_error"] =
                                 json!(wallet_refresh_error_code(&e));
+                            body["backend_status"] = json!(wallet_backend_status(
+                                wallet_refresh_error_code(&e),
+                                &e
+                            ));
                             body["wallet_state_refresh_detail"] = json!(e);
                         }
                     }
@@ -4804,6 +4929,70 @@ pub(crate) fn handle_request(
                         "decimals": DUTA_DECIMALS
                     });
 
+                    super::respond_json(
+                        request,
+                        tiny_http::StatusCode(200),
+                        rpc_response_ok(id, result),
+                    );
+                }
+
+                "walletdoctor" => {
+                    let snapshot = wallet_balance_snapshot(daemon_rpc_port).ok();
+                    let g = super::wallet_lock_or_recover();
+                    let ws = match g.as_ref() {
+                        Some(w) => w,
+                        None => {
+                            super::respond_json(
+                                request,
+                                tiny_http::StatusCode(400),
+                                rpc_response_err(id, -18, "wallet_not_open"),
+                            );
+                            return;
+                        }
+                    };
+                    let reserved_inputs = ws.reserved_inputs.len();
+                    let reserved_total = ws
+                        .utxos
+                        .iter()
+                        .filter(|u| {
+                            ws.reserved_inputs
+                                .iter()
+                                .any(|r| r.txid == u.txid && r.vout == u.vout)
+                        })
+                        .map(|u| u.value)
+                        .sum::<i64>();
+                    let result = json!({
+                        "walletname": wallet_public_name(&ws.wallet_path),
+                        "wallet_path": ws.wallet_path,
+                        "wallet_open": true,
+                        "wallet_locked": ws.is_db && ws.locked,
+                        "wallet_unlocked": !(ws.is_db && ws.locked),
+                        "db_backed": ws.is_db,
+                        "db_health": if ws.is_db { "open" } else { "legacy" },
+                        "next_index": ws.next_index,
+                        "last_sync_height": ws.last_sync_height,
+                        "pending_txs": ws.pending_txs.len(),
+                        "pending_txids": ws.pending_txs.iter().map(|tx| tx.txid.clone()).collect::<Vec<_>>(),
+                        "reserved_inputs": reserved_inputs,
+                        "reserved": format_dut_i64(reserved_total),
+                        "reserved_dut": reserved_total,
+                        "address_count": if !ws.pubkeys.is_empty() { ws.pubkeys.len() } else { ws.keys.len() },
+                        "primary_address": ws.primary_address,
+                        "balance": snapshot.as_ref().map(|s| format_dut_i64(s.balance_dut)).unwrap_or_else(|| "unknown".to_string()),
+                        "balance_dut": snapshot.as_ref().map(|s| s.balance_dut),
+                        "spendable_balance": snapshot.as_ref().map(|s| format_dut_i64(s.spendable_dut)).unwrap_or_else(|| "unknown".to_string()),
+                        "spendable_balance_dut": snapshot.as_ref().map(|s| s.spendable_dut),
+                        "reserved_balance": snapshot.as_ref().map(|s| format_dut_i64(s.reserved_dut)).unwrap_or_else(|| format_dut_i64(reserved_total)),
+                        "reserved_balance_dut": snapshot.as_ref().map(|s| s.reserved_dut).unwrap_or(reserved_total),
+                        "pending_send": snapshot.as_ref().map(|s| format_dut_i64(s.pending_send_dut)).unwrap_or_else(|| "unknown".to_string()),
+                        "pending_send_dut": snapshot.as_ref().map(|s| s.pending_send_dut),
+                        "pending_change": snapshot.as_ref().map(|s| format_dut_i64(s.pending_change_dut)).unwrap_or_else(|| "unknown".to_string()),
+                        "pending_change_dut": snapshot.as_ref().map(|s| s.pending_change_dut),
+                        "tip_height": snapshot.as_ref().map(|s| s.height),
+                        "utxos": snapshot.as_ref().map(|s| s.utxos).unwrap_or(ws.utxos.len()),
+                        "backend_status": if snapshot.is_some() { "ok" } else { "unreachable" },
+                        "doctor_status": if snapshot.is_some() { "ok" } else { "degraded_backend" }
+                    });
                     super::respond_json(
                         request,
                         tiny_http::StatusCode(200),
@@ -7507,7 +7696,16 @@ pub(crate) fn handle_request(
                 return;
             }
 
-            let (cur_h, mut utxos) = match refresh_wallet_utxos_runtime(
+            wdlog!(
+                "wallet_rpc: sync_start wallet={} tracked_addrs={} pending_txs={} reserved_inputs={} last_sync_height={}",
+                wallet_public_name(&wallet_path),
+                addrs.len(),
+                pending_txs.len(),
+                reserved_inputs.len(),
+                last_sync_height
+            );
+
+            let (cur_h, utxos) = match refresh_wallet_utxos_runtime(
                 &addrs,
                 daemon_rpc_port,
                 &utxos,
@@ -7580,6 +7778,15 @@ pub(crate) fn handle_request(
                 }
             }
             let pending_stats = pending_balance_stats(&utxos, &reserved_outpoints, &pending_txs);
+            wdlog!(
+                "wallet_rpc: sync_complete wallet={} tip_height={} pending_txs={} reserved_inputs={} balance_dut={} spendable_dut={}",
+                wallet_public_name(&wallet_path),
+                cur_h,
+                pending_txs.len(),
+                reserved_inputs.len(),
+                balance,
+                spendable
+            );
 
             super::respond_json(
                 request,
@@ -7624,6 +7831,11 @@ pub(crate) fn handle_request(
                 }
             };
             debug_assert!(ws.is_db, "wallet state should always be db-backed");
+            wdlog!(
+                "wallet_rpc: wallet_lock wallet={} pending_txs={}",
+                wallet_public_name(&ws.wallet_path),
+                ws.pending_txs.len()
+            );
             super::clear_wallet_sensitive_state(ws);
             ws.locked = true;
             super::respond_json(
@@ -7673,6 +7885,11 @@ pub(crate) fn handle_request(
             };
             debug_assert!(ws.is_db, "wallet state should always be db-backed");
             if let Err(e) = unlock_db_wallet_state(ws, &passphrase) {
+                wwlog!(
+                    "wallet_rpc: wallet_unlock_failed wallet={} err={}",
+                    wallet_public_name(&ws.wallet_path),
+                    e
+                );
                 let mut passphrase = passphrase;
                 passphrase.zeroize();
                 super::respond_json(
@@ -7682,6 +7899,11 @@ pub(crate) fn handle_request(
                 );
                 return;
             }
+            wdlog!(
+                "wallet_rpc: wallet_unlock wallet={} pending_txs={}",
+                wallet_public_name(&ws.wallet_path),
+                ws.pending_txs.len()
+            );
             super::respond_json(
                 request,
                 tiny_http::StatusCode(200),
@@ -9410,6 +9632,17 @@ pub(crate) fn handle_request(
                 );
                 return;
             }
+            wdlog!(
+                "wallet_rpc: sendmany wallet={} txid={} outputs={} inputs={} amount_dut={} fee_dut={} change_dut={} pending_txs={}",
+                wallet_public_name(&wallet_path),
+                txid,
+                recipients.len(),
+                selected.len(),
+                total_amount,
+                final_fee,
+                final_change,
+                pending_after.len()
+            );
             super::respond_json(
                 request,
                 tiny_http::StatusCode(200),
@@ -10157,6 +10390,17 @@ pub(crate) fn handle_request(
                     body["min_relay_fee"] = json!(format_dut_i64(min_relay_fee));
                     body["min_relay_fee_dut"] = json!(min_relay_fee);
                     body["size"] = json!(tx_size);
+                    wdlog!(
+                        "wallet_rpc: send wallet={} txid={} to={} amount_dut={} fee_dut={} change_dut={} inputs={} pending_txs={}",
+                        wallet_public_name(&wallet_path),
+                        txid,
+                        to_addr,
+                        amount,
+                        final_fee,
+                        final_change,
+                        selected.len(),
+                        pending_after.len()
+                    );
                     super::respond_json(request, tiny_http::StatusCode(200), body.to_string());
         }
 

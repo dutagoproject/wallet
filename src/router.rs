@@ -70,6 +70,7 @@ mod tests {
         replace_wallet_artifacts,
         retry_from_pruned_boundary_for_empty_wallet,
         rpc_response_refresh_err,
+        derive_next_address_for_wallet, new_wallet_keypair_from_seed,
         require_non_empty_passphrase, resolve_owned_input, select_inputs_for_need,
         send_success_body, should_probe_daemon_utxo_presence, sign_send_tx, simulate_send_plan,
         status_for_body_err, tx_output_address, wallet_health_response, wallet_needs_full_utxo_rebuild,
@@ -309,6 +310,7 @@ mod tests {
             is_db: false,
             locked: false,
             db_passphrase: None,
+            unlock_deadline: None,
         };
         {
             let mut g = super::super::wallet_lock_or_recover();
@@ -358,6 +360,7 @@ mod tests {
             is_db: false,
             locked: false,
             db_passphrase: None,
+            unlock_deadline: None,
         };
         {
             let mut g = super::super::wallet_lock_or_recover();
@@ -661,6 +664,7 @@ mod tests {
             is_db: true,
             locked: false,
             db_passphrase: None,
+            unlock_deadline: None,
         };
         assert_eq!(wallet_state_network(&ws), Network::Mainnet);
     }
@@ -686,6 +690,7 @@ mod tests {
             is_db: true,
             locked: false,
             db_passphrase: None,
+            unlock_deadline: None,
         };
         assert_eq!(wallet_state_network(&ws), Network::Testnet);
     }
@@ -706,6 +711,7 @@ mod tests {
             is_db: true,
             locked: false,
             db_passphrase: None,
+            unlock_deadline: None,
         };
         assert_eq!(wallet_state_network(&ws), Network::Stagenet);
     }
@@ -1220,6 +1226,73 @@ mod tests {
 
         let _ = handle.join();
         let _ = std::fs::remove_file(&wallet_path);
+    }
+
+    #[test]
+    fn derive_next_address_refreshes_stale_next_index_from_db() {
+        let mut db_path = std::env::temp_dir();
+        db_path.push(format!(
+            "duta-wallet-stale-next-index-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let wallet_path = db_path.to_string_lossy().to_string();
+        let seed = [9u8; 32];
+        let db = super::super::walletdb::WalletDb::create_new(
+            &wallet_path,
+            "strong-pass-123",
+            &seed,
+            1,
+        )
+        .unwrap();
+        let (addr0, sk_hex0, pub_hex0) =
+            new_wallet_keypair_from_seed(Network::Mainnet, &seed, 0);
+        let sk0 = hex::decode(sk_hex0).unwrap();
+        let mut sk_arr0 = [0u8; 32];
+        sk_arr0.copy_from_slice(&sk0);
+        db.insert_key_with_meta_atomic(
+            &addr0,
+            &pub_hex0,
+            &sk_arr0,
+            "strong-pass-123",
+            Some(1),
+            Some(&addr0),
+            None,
+        )
+        .unwrap();
+
+        let conn = rusqlite::Connection::open(&wallet_path).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(k,v) VALUES('next_index', ?1)",
+            rusqlite::params![5i64],
+        )
+        .unwrap();
+
+        let mut pubkeys = BTreeMap::new();
+        pubkeys.insert(addr0.clone(), pub_hex0);
+        let mut ws = super::super::WalletState {
+            wallet_path: wallet_path.clone(),
+            primary_address: addr0,
+            keys: BTreeMap::new(),
+            pubkeys,
+            utxos: Vec::new(),
+            pending_txs: Vec::new(),
+            reserved_inputs: Vec::new(),
+            last_sync_height: 0,
+            seed_hex: Some(hex::encode(seed)),
+            next_index: 1,
+            is_db: true,
+            locked: false,
+            db_passphrase: Some("strong-pass-123".to_string()),
+            unlock_deadline: None,
+        };
+        let expected_addr = new_wallet_keypair_from_seed(Network::Mainnet, &seed, 5).0;
+        let (derived_addr, _, _) = derive_next_address_for_wallet(&mut ws, None).unwrap();
+        assert_eq!(derived_addr, expected_addr);
+        assert_eq!(ws.next_index, 6);
+        let _ = fs::remove_file(wallet_path);
     }
 
     #[test]
@@ -4075,12 +4148,13 @@ fn derive_next_address_for_wallet(
             .map(|p| p.to_string())
             .or_else(|| ws.db_passphrase.clone())
             .ok_or_else(|| "missing_passphrase".to_string())?;
+        let db = super::walletdb::WalletDb::open(&ws.wallet_path)?;
+        let i = (db.read_next_index()?.max(i64::from(ws.next_index)).max(0)) as u32;
         let seed_hex = ws
             .seed_hex
             .as_ref()
             .ok_or_else(|| "wallet_seed_missing".to_string())?;
         let seed_b = hex::decode(seed_hex).map_err(|_| "wallet_seed_invalid".to_string())?;
-        let i = ws.next_index;
         let net = wallet_state_network(ws);
         let (addr, sk_hex, pub_hex) = new_wallet_keypair_from_seed(net, &seed_b, i);
         let sk_b = hex::decode(&sk_hex).map_err(|_| "wallet_key_invalid".to_string())?;
@@ -4089,7 +4163,6 @@ fn derive_next_address_for_wallet(
         }
         let mut ent = [0u8; 32];
         ent.copy_from_slice(&sk_b);
-        let db = super::walletdb::WalletDb::open(&ws.wallet_path)?;
         let next_index = i.saturating_add(1);
         let primary_address = if ws.primary_address.is_empty() {
             Some(addr.as_str())
@@ -4653,7 +4726,7 @@ pub(crate) fn handle_request(
                             }
                         };
 
-                    let (wallet_path, unlocked, keypoolsize, addrs, pending_txs) = {
+                    let (wallet_path, unlocked, unlocked_until, keypoolsize, addrs, pending_txs) = {
                         let g = super::wallet_lock_or_recover();
                         let ws = match g.as_ref() {
                             Some(w) => w,
@@ -4669,6 +4742,14 @@ pub(crate) fn handle_request(
                         (
                             ws.wallet_path.clone(),
                             !(ws.is_db && ws.locked),
+                            ws.unlock_deadline.map(|deadline| {
+                                let now = std::time::Instant::now();
+                                if deadline <= now {
+                                    0u64
+                                } else {
+                                    deadline.duration_since(now).as_secs()
+                                }
+                            }),
                             ws.pubkeys.len(),
                             if !ws.pubkeys.is_empty() {
                                 ws.pubkeys.keys().cloned().collect::<Vec<String>>()
@@ -4703,6 +4784,7 @@ pub(crate) fn handle_request(
                         "txcount": txcount,
                         "keypoolsize": keypoolsize,
                         "unlocked": unlocked,
+                        "unlocked_until": unlocked_until,
                         "height": snapshot.height,
                         "utxos": snapshot.utxos,
                         "pending_txs": snapshot.pending_txs,
@@ -5209,7 +5291,7 @@ pub(crate) fn handle_request(
                 }
 
                 "walletpassphrase" => {
-                    // params: [passphrase, timeout] (timeout ignored for now)
+                    // params: [passphrase, timeout_seconds]
                     let _passphrase = match params.get(0).and_then(|x| x.as_str()) {
                         Some(p) if !p.is_empty() => p.to_string(),
                         _ => {
@@ -5217,6 +5299,17 @@ pub(crate) fn handle_request(
                                 request,
                                 tiny_http::StatusCode(400),
                                 rpc_response_err(id, -32602, "missing_passphrase"),
+                            );
+                            return;
+                        }
+                    };
+                    let unlock_timeout_secs = match params.get(1).and_then(|x| x.as_u64()) {
+                        Some(timeout) => timeout,
+                        None => {
+                            super::respond_json(
+                                request,
+                                tiny_http::StatusCode(400),
+                                rpc_response_err(id, -32602, "missing_timeout"),
                             );
                             return;
                         }
@@ -5243,6 +5336,14 @@ pub(crate) fn handle_request(
                         );
                         return;
                     }
+                    ws.unlock_deadline = if unlock_timeout_secs == 0 {
+                        Some(std::time::Instant::now())
+                    } else {
+                        Some(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_secs(unlock_timeout_secs),
+                        )
+                    };
                     super::respond_json(
                         request,
                         tiny_http::StatusCode(200),
@@ -7033,6 +7134,7 @@ pub(crate) fn handle_request(
                     is_db: true,
                     locked: true,
                     db_passphrase: None,
+                    unlock_deadline: None,
                 });
             }
 
@@ -7194,12 +7296,12 @@ pub(crate) fn handle_request(
                             wallet_refresh_error_code(&e),
                             e,
                         );
-                        return;
-                    }
-                };
-            super::respond_json(
-                request,
-                tiny_http::StatusCode(200),
+                            return;
+                        }
+                    };
+                    super::respond_json(
+                        request,
+                        tiny_http::StatusCode(200),
                 json!({
                     "balance": format_dut_i64(snapshot.balance_dut),
                     "balance_dut": snapshot.balance_dut,

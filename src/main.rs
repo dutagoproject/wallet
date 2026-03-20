@@ -15,7 +15,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use zeroize::Zeroize;
 
 mod walletdb;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod router;
 
@@ -196,6 +196,7 @@ pub(crate) struct WalletState {
     pub(crate) is_db: bool,
     pub(crate) locked: bool,
     pub(crate) db_passphrase: Option<String>,
+    pub(crate) unlock_deadline: Option<Instant>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -273,13 +274,17 @@ pub(crate) fn wallet_send_lock() -> &'static Mutex<()> {
 }
 
 pub(crate) fn wallet_lock_or_recover() -> MutexGuard<'static, Option<WalletState>> {
-    match wallet_lock().lock() {
+    let mut guard = match wallet_lock().lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
             wwlog!("dutawalletd: mutex_poison_recovered name=wallet_state");
             poisoned.into_inner()
         }
+    };
+    if let Some(ws) = guard.as_mut() {
+        enforce_wallet_unlock_deadline(ws);
     }
+    guard
 }
 
 pub(crate) fn respond_json(
@@ -437,6 +442,8 @@ fn terminate_pid(pid: u32) -> bool {
     {
         let soft = std::process::Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
@@ -445,6 +452,8 @@ fn terminate_pid(pid: u32) -> bool {
         }
         std::process::Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
@@ -454,6 +463,8 @@ fn terminate_pid(pid: u32) -> bool {
     {
         std::process::Command::new("kill")
             .args(["-TERM", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
@@ -831,6 +842,7 @@ pub(crate) fn load_wallet_db_to_state(path: &str) -> Result<WalletState, String>
         is_db: true,
         locked: true,
         db_passphrase: None,
+        unlock_deadline: None,
     };
     validate_wallet_state_addresses(&ws)?;
     Ok(ws)
@@ -849,6 +861,21 @@ pub(crate) fn clear_wallet_sensitive_state(ws: &mut WalletState) {
         passphrase.zeroize();
     }
     ws.db_passphrase = None;
+    ws.unlock_deadline = None;
+}
+
+pub(crate) fn enforce_wallet_unlock_deadline(ws: &mut WalletState) {
+    if !ws.is_db || ws.locked {
+        return;
+    }
+    let expired = ws
+        .unlock_deadline
+        .map(|deadline| Instant::now() >= deadline)
+        .unwrap_or(false);
+    if expired {
+        clear_wallet_sensitive_state(ws);
+        ws.locked = true;
+    }
 }
 
 fn validate_wallet_key_material(
@@ -1559,9 +1586,10 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_http_request, clear_wallet_sensitive_state, load_wallet_db_to_state, read_pid_file,
-        load_runtime_conf, remove_pid_file_if_matches, save_wallet_sync_state, validate_conf_network_name,
-        validate_conf_wallet_rpc_settings, wallet_rpc_bind_warning, Args, Cmd,
+        build_http_request, clear_wallet_sensitive_state, enforce_wallet_unlock_deadline,
+        load_wallet_db_to_state, read_pid_file, load_runtime_conf, remove_pid_file_if_matches,
+        save_wallet_sync_state, validate_conf_network_name, validate_conf_wallet_rpc_settings,
+        wallet_rpc_bind_warning, Args, Cmd,
         validate_wallet_state_addresses,
         wallet_rpc_settings, PidFileGuard, Utxo, WalletState,
     };
@@ -1573,6 +1601,7 @@ mod tests {
     use crate::walletdb::{WalletDb, WALLET_DB_SCHEMA_VERSION};
     use std::collections::BTreeMap;
     use std::fs;
+    use std::time::{Duration, Instant};
 
     fn sample_wallet_state() -> WalletState {
         let signing_key = SigningKey::from_bytes(&[7u8; 32]);
@@ -1606,6 +1635,7 @@ mod tests {
             is_db: false,
             locked: false,
             db_passphrase: Some("secret-pass".to_string()),
+            unlock_deadline: None,
         }
     }
 
@@ -1651,6 +1681,19 @@ mod tests {
         assert!(ws.keys.is_empty());
         assert!(ws.seed_hex.is_none());
         assert!(ws.db_passphrase.is_none());
+    }
+
+    #[test]
+    fn expired_unlock_deadline_relocks_and_clears_sensitive_state() {
+        let mut ws = sample_wallet_state();
+        ws.is_db = true;
+        ws.unlock_deadline = Some(Instant::now() - Duration::from_secs(1));
+        enforce_wallet_unlock_deadline(&mut ws);
+        assert!(ws.locked);
+        assert!(ws.keys.is_empty());
+        assert!(ws.seed_hex.is_none());
+        assert!(ws.db_passphrase.is_none());
+        assert!(ws.unlock_deadline.is_none());
     }
 
     #[test]

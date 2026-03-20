@@ -67,6 +67,7 @@ mod tests {
         parse_wallet_utxo_snapshot_response, wallet_utxo_snapshot_retry_after_secs,
         insufficient_funds_body, net_from_wallet_path, prune_confirmed_pending_txs,
         parse_prune_below_from_blocks_from_error, query_param, relay_fee_for_tx_bytes,
+        replace_wallet_artifacts,
         retry_from_pruned_boundary_for_empty_wallet,
         rpc_response_refresh_err,
         require_non_empty_passphrase, resolve_owned_input, select_inputs_for_need,
@@ -79,12 +80,72 @@ mod tests {
     use duta_core::netparams::Network;
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::fs;
 
     #[test]
     fn db_wallet_path_only_accepts_encrypted_wallet_extensions() {
         assert!(db_wallet_path("wallet.db"));
         assert!(db_wallet_path("wallet.dat"));
         assert!(!db_wallet_path("wallet.json"));
+    }
+
+    #[test]
+    fn replace_wallet_artifacts_promotes_staged_wallet_and_sidecars() {
+        let mut dir = std::env::temp_dir();
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        dir.push(format!("duta-wallet-stage-replace-{}", uniq));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("restore.db");
+        let staged = dir.join("restore.db.importing");
+
+        fs::write(&target, b"old-db").unwrap();
+        fs::write(target.with_extension("db-wal"), b"old-wal").unwrap();
+        fs::write(target.with_extension("db-shm"), b"old-shm").unwrap();
+        fs::write(&staged, b"new-db").unwrap();
+        fs::write(staged.with_extension("importing-wal"), b"new-wal").unwrap();
+        fs::write(staged.with_extension("importing-shm"), b"new-shm").unwrap();
+
+        replace_wallet_artifacts(
+            staged.to_str().unwrap(),
+            target.to_str().unwrap(),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"new-db");
+        assert_eq!(fs::read(target.with_extension("db-wal")).unwrap(), b"new-wal");
+        assert_eq!(fs::read(target.with_extension("db-shm")).unwrap(), b"new-shm");
+        assert!(!staged.exists());
+        assert!(!staged.with_extension("importing-wal").exists());
+        assert!(!staged.with_extension("importing-shm").exists());
+    }
+
+    #[test]
+    fn replace_wallet_artifacts_keeps_original_when_staged_wallet_missing() {
+        let mut dir = std::env::temp_dir();
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        dir.push(format!("duta-wallet-stage-missing-{}", uniq));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("restore.db");
+        let staged = dir.join("restore.db.importing");
+
+        fs::write(&target, b"old-db").unwrap();
+        let err = replace_wallet_artifacts(
+            staged.to_str().unwrap(),
+            target.to_str().unwrap(),
+            true,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, "wallet_stage_missing");
+        assert_eq!(fs::read(&target).unwrap(), b"old-db");
+        assert!(!staged.exists());
     }
 
     #[test]
@@ -1577,6 +1638,82 @@ fn wallet_public_name(path: &str) -> String {
 
 fn db_wallet_path(path: &str) -> bool {
     path.ends_with(".db") || path.ends_with(".dat")
+}
+
+fn wallet_artifact_paths(path: &str) -> [String; 3] {
+    [
+        path.to_string(),
+        format!("{path}-wal"),
+        format!("{path}-shm"),
+    ]
+}
+
+fn remove_wallet_artifacts(path: &str) {
+    for artifact in wallet_artifact_paths(path) {
+        let _ = fs::remove_file(artifact);
+    }
+}
+
+fn rename_wallet_artifacts(from: &str, to: &str) -> Result<(), String> {
+    let from_paths = wallet_artifact_paths(from);
+    let to_paths = wallet_artifact_paths(to);
+    let mut renamed: Vec<(String, String)> = Vec::new();
+    for (src, dst) in from_paths.into_iter().zip(to_paths.into_iter()) {
+        if fs::metadata(&src).is_err() {
+            continue;
+        }
+        if let Err(e) = fs::rename(&src, &dst) {
+            for (rollback_src, rollback_dst) in renamed.into_iter().rev() {
+                let _ = fs::rename(&rollback_dst, &rollback_src);
+            }
+            return Err(format!(
+                "wallet_artifact_rename_failed: {} -> {}: {}",
+                src, dst, e
+            ));
+        }
+        renamed.push((src, dst));
+    }
+    Ok(())
+}
+
+fn wallet_stage_path(path: &str) -> String {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{path}.importing-{stamp}")
+}
+
+fn replace_wallet_artifacts(staged_path: &str, target_path: &str, target_exists: bool) -> Result<(), String> {
+    if fs::metadata(staged_path).is_err() {
+        return Err("wallet_stage_missing".to_string());
+    }
+
+    let backup_path = if target_exists {
+        Some(format!("{}.backup-{}", target_path, wallet_stage_path("swap")))
+    } else {
+        None
+    };
+
+    if let Some(ref backup_path) = backup_path {
+        rename_wallet_artifacts(target_path, backup_path)?;
+    }
+
+    match rename_wallet_artifacts(staged_path, target_path) {
+        Ok(()) => {
+            if let Some(backup_path) = backup_path {
+                remove_wallet_artifacts(&backup_path);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if let Some(backup_path) = backup_path {
+                let _ = rename_wallet_artifacts(&backup_path, target_path);
+            }
+            remove_wallet_artifacts(staged_path);
+            Err(e)
+        }
+    }
 }
 
 fn require_non_empty_passphrase(passphrase: &str) -> Result<(), String> {
@@ -6548,7 +6685,8 @@ pub(crate) fn handle_request(
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false);
 
-            if fs::metadata(&wallet_path).is_ok() && !overwrite {
+            let target_exists = fs::metadata(&wallet_path).is_ok();
+            if target_exists && !overwrite {
                 super::respond_json(
                     request,
                     tiny_http::StatusCode(400),
@@ -6759,7 +6897,8 @@ pub(crate) fn handle_request(
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false);
 
-            if fs::metadata(&wallet_path).is_ok() && !overwrite {
+            let target_exists = fs::metadata(&wallet_path).is_ok();
+            if target_exists && !overwrite {
                 super::respond_json(
                     request,
                     tiny_http::StatusCode(400),
@@ -6818,19 +6957,6 @@ pub(crate) fn handle_request(
                 return;
             }
 
-            let db =
-                match super::walletdb::WalletDb::create_new(&wallet_path, &passphrase, &seed, 1) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        super::respond_json(
-                            request,
-                            tiny_http::StatusCode(500),
-                            json!({"error":"wallet_import_failed","detail":e}).to_string(),
-                        );
-                        return;
-                    }
-                };
-
             let sk_b = match hex::decode(&sk_hex) {
                 Ok(b) => b,
                 Err(_) => {
@@ -6853,15 +6979,31 @@ pub(crate) fn handle_request(
             }
             let mut ent = [0u8; 32];
             ent.copy_from_slice(&sk_b);
-            if let Err(e) = db.insert_key_with_meta_atomic(
-                &addr,
-                &pub_hex,
-                &ent,
-                &passphrase,
-                None,
-                Some(&addr),
-                Some(&mnemonic_entropy),
-            ) {
+
+            let staged_wallet_path = wallet_stage_path(&wallet_path);
+            remove_wallet_artifacts(&staged_wallet_path);
+            let import_result = (|| -> Result<(), String> {
+                let db = super::walletdb::WalletDb::create_new(
+                    &staged_wallet_path,
+                    &passphrase,
+                    &seed,
+                    1,
+                )?;
+                db.insert_key_with_meta_atomic(
+                    &addr,
+                    &pub_hex,
+                    &ent,
+                    &passphrase,
+                    None,
+                    Some(&addr),
+                    Some(&mnemonic_entropy),
+                )?;
+                drop(db);
+                replace_wallet_artifacts(&staged_wallet_path, &wallet_path, target_exists)?;
+                Ok(())
+            })();
+            if let Err(e) = import_result {
+                remove_wallet_artifacts(&staged_wallet_path);
                 super::respond_json(
                     request,
                     tiny_http::StatusCode(500),

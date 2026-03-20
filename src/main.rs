@@ -774,7 +774,34 @@ pub(crate) fn load_wallet_from_path(path: &str) -> Result<WalletState, String> {
     return Err("legacy_plaintext_wallet_disabled_use_db_wallet".to_string());
 }
 
+fn cleanup_wallet_stage_files(path: &str) {
+    let target = std::path::Path::new(path);
+    let Some(parent) = target.parent() else {
+        return;
+    };
+    let Some(name) = target.file_name().and_then(|s| s.to_str()) else {
+        return;
+    };
+    let prefix = format!("{name}.importing-");
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        let Some(entry_name) = entry_path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if entry_name.starts_with(&prefix) {
+            let _ = std::fs::remove_file(entry_path);
+        }
+    }
+}
+
 pub(crate) fn load_wallet_db_to_state(path: &str) -> Result<WalletState, String> {
+    if std::fs::metadata(path).is_err() {
+        cleanup_wallet_stage_files(path);
+        return Err("wallet_not_found".to_string());
+    }
     let db = walletdb::WalletDb::open(path)?;
     let rows = db.list_keys()?;
     let next_index = db.read_next_index()?.max(0) as u32;
@@ -1653,6 +1680,42 @@ mod tests {
 
         let err = load_wallet_db_to_state(&path).unwrap_err();
         assert!(err.contains("db_utxos_invalid"));
+    }
+
+    #[test]
+    fn load_wallet_db_to_state_missing_path_fails_without_creating_file() {
+        let mut p = std::env::temp_dir();
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        p.push(format!("duta-wallet-missing-{}.db", uniq));
+        let path = p.to_string_lossy().to_string();
+
+        let err = load_wallet_db_to_state(&path).unwrap_err();
+        assert_eq!(err, "wallet_not_found");
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[test]
+    fn load_wallet_db_to_state_missing_path_cleans_stale_stage_files() {
+        let mut dir = std::env::temp_dir();
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        dir.push(format!("duta-wallet-stage-clean-{}", uniq));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("restore.db");
+        let staged = dir.join("restore.db.importing-123");
+        let staged_journal = dir.join("restore.db.importing-123-journal");
+        std::fs::write(&staged, b"stage").unwrap();
+        std::fs::write(&staged_journal, b"journal").unwrap();
+
+        let err = load_wallet_db_to_state(&path.to_string_lossy()).unwrap_err();
+        assert_eq!(err, "wallet_not_found");
+        assert!(!staged.exists());
+        assert!(!staged_journal.exists());
     }
 
     #[test]

@@ -114,10 +114,18 @@ enum Cmd {
     },
 
     /// POST /export_seed
-    Exportseed,
+    Exportseed {
+        /// Wallet passphrase for encrypted SQLite wallets
+        #[arg(long, default_value = "")]
+        passphrase: String,
+    },
 
     /// POST /export_mnemonic
-    Exportmnemonic,
+    Exportmnemonic {
+        /// Wallet passphrase for encrypted SQLite wallets
+        #[arg(long, default_value = "")]
+        passphrase: String,
+    },
 
     /// POST /import_mnemonic
     ///
@@ -247,8 +255,20 @@ fn main() {
         Cmd::Unlock { passphrase } => {
             http_post_json(&host, port, "/unlock", json!({"passphrase": passphrase}))
         }
-        Cmd::Exportseed => http_post_json(&host, port, "/export_seed", json!({})),
-        Cmd::Exportmnemonic => http_post_json(&host, port, "/export_mnemonic", json!({})),
+        Cmd::Exportseed { ref passphrase } => {
+            let mut body = json!({});
+            if !passphrase.trim().is_empty() {
+                body["passphrase"] = json!(passphrase);
+            }
+            http_post_json(&host, port, "/export_seed", body)
+        }
+        Cmd::Exportmnemonic { ref passphrase } => {
+            let mut body = json!({});
+            if !passphrase.trim().is_empty() {
+                body["passphrase"] = json!(passphrase);
+            }
+            http_post_json(&host, port, "/export_mnemonic", body)
+        }
 
         Cmd::Importmnemonic {
             ref wallet,
@@ -1292,6 +1312,40 @@ mod tests {
             Cmd::History { count, skip } => {
                 assert_eq!(count, 25);
                 assert_eq!(skip, 5);
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exportmnemonic_accepts_passphrase_flag() {
+        let parsed = Args::try_parse_from([
+            "duta-wallet-cli",
+            "exportmnemonic",
+            "--passphrase",
+            "phasec-pass-123",
+        ])
+        .expect("exportmnemonic should accept --passphrase");
+        match parsed.cmd {
+            Cmd::Exportmnemonic { passphrase } => {
+                assert_eq!(passphrase, "phasec-pass-123");
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exportseed_accepts_passphrase_flag() {
+        let parsed = Args::try_parse_from([
+            "duta-wallet-cli",
+            "exportseed",
+            "--passphrase",
+            "phasec-pass-123",
+        ])
+        .expect("exportseed should accept --passphrase");
+        match parsed.cmd {
+            Cmd::Exportseed { passphrase } => {
+                assert_eq!(passphrase, "phasec-pass-123");
             }
             other => panic!("unexpected command parsed: {other:?}"),
         }

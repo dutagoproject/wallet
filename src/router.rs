@@ -4257,13 +4257,20 @@ fn daemon_tip_height_with_retry(daemon_rpc_port: u16, fallback_height: i64) -> R
     daemon_tip_height_with_retry_opts(daemon_rpc_port, fallback_height, 20, 3)
 }
 
+const WALLET_HEALTH_BACKEND_DEADLINE_SECS: u64 = 1;
+
 fn wallet_health_snapshot(daemon_rpc_port: u16) -> Result<i64, String> {
     let (utxos, last_sync_height) = {
         let g = super::wallet_lock_or_recover();
         let ws = g.as_ref().ok_or_else(|| "wallet_not_open".to_string())?;
         (ws.utxos.clone(), ws.last_sync_height)
     };
-    let cur_h = daemon_tip_height_with_retry_opts(daemon_rpc_port, last_sync_height, 5, 1)?;
+    let cur_h = daemon_tip_height_with_retry_opts(
+        daemon_rpc_port,
+        last_sync_height,
+        WALLET_HEALTH_BACKEND_DEADLINE_SECS,
+        1,
+    )?;
     validate_wallet_tip_against_state(cur_h, &utxos, last_sync_height)
 }
 

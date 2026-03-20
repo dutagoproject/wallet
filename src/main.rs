@@ -2168,4 +2168,27 @@ mod tests {
         let _ = handle.join();
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn http_get_local_with_deadline_times_out_against_silent_backend() {
+        use std::io::Read;
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                thread::sleep(Duration::from_millis(1500));
+            }
+        });
+
+        let err = super::http_get_local_with_deadline("127.0.0.1", addr.port(), "/health", 1)
+            .unwrap_err();
+        assert_eq!(err, "read_timeout");
+        let _ = handle.join();
+    }
 }

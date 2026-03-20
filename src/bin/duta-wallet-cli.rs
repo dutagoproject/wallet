@@ -514,6 +514,39 @@ fn json_str<'a>(v: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> {
     json_field(v, path)?.as_str()
 }
 
+fn format_wallet_health(v: &serde_json::Value, body: &str) -> String {
+    let wallet_open = json_bool(v, &["wallet_open"]).unwrap_or(false);
+    let height = json_i64(v, &["height"]).unwrap_or(0);
+    if json_bool(v, &["ok"]) == Some(true) {
+        if wallet_open {
+            format!(
+                "{}\n{}\n{}",
+                ok_line("wallet service is online"),
+                info_line("wallet: open"),
+                info_line(format!("height: {height}"))
+            )
+        } else {
+            format!(
+                "{}\n{}",
+                wait_line("wallet service is online"),
+                wait_line("wallet: closed")
+            )
+        }
+    } else if wallet_open {
+        let error = json_str(v, &["error"]).unwrap_or("wallet_unhealthy");
+        let detail = json_str(v, &["detail"]).unwrap_or(body);
+        format!(
+            "{}\n{}\n{}\n{}",
+            err_line("wallet service degraded"),
+            wait_line("wallet: open"),
+            err_line(format!("error: {error}")),
+            info_line(format!("detail: {detail}"))
+        )
+    } else {
+        body.to_string()
+    }
+}
+
 fn format_response(cmd: &Cmd, body: &str) -> String {
     let v: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -521,13 +554,7 @@ fn format_response(cmd: &Cmd, body: &str) -> String {
     };
 
     match cmd {
-        Cmd::Health => {
-            if json_bool(&v, &["ok"]) == Some(true) {
-                ok_line("wallet service is online")
-            } else {
-                body.to_string()
-            }
-        }
+        Cmd::Health => format_wallet_health(&v, body),
         Cmd::Info => {
             let net = json_str(&v, &["net"]).unwrap_or("unknown");
             let rpc = json_str(&v, &["wallet_rpc"]).unwrap_or("-");
@@ -1270,6 +1297,36 @@ mod tests {
         assert!(out.contains("reserved: 0.00000000 DUTA"));
         assert!(out.contains("pending send: 0.00000000 DUTA"));
         assert!(out.contains("pending change: 0.00000000 DUTA"));
+    }
+
+    #[test]
+    fn health_formats_closed_wallet_as_waiting_state() {
+        let out = format_response(&Cmd::Health, r#"{"ok":true,"wallet_open":false}"#);
+        assert!(out.contains("wallet service is online"));
+        assert!(out.contains("wallet: closed"));
+    }
+
+    #[test]
+    fn health_formats_open_wallet_height() {
+        let out = format_response(
+            &Cmd::Health,
+            r#"{"ok":true,"wallet_open":true,"height":42}"#,
+        );
+        assert!(out.contains("wallet service is online"));
+        assert!(out.contains("wallet: open"));
+        assert!(out.contains("height: 42"));
+    }
+
+    #[test]
+    fn health_formats_backend_degradation_actionably() {
+        let out = format_response(
+            &Cmd::Health,
+            r#"{"ok":false,"wallet_open":true,"error":"daemon_unreachable","detail":"connect_failed: connection refused"}"#,
+        );
+        assert!(out.contains("wallet service degraded"));
+        assert!(out.contains("wallet: open"));
+        assert!(out.contains("error: daemon_unreachable"));
+        assert!(out.contains("detail: connect_failed: connection refused"));
     }
 
     #[test]

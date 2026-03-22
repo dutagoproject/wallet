@@ -68,9 +68,23 @@ fn print_wallet_startup_banner(net: Network, data_dir: &str, rpc_addr: &str, dae
 }
 
 fn print_wallet_startup_guidance(rpc_addr: &str) {
-    console_kv("RPC", ANSI_BLUE, "health", format!("http://{}/health", rpc_addr));
-    console_kv("RPC", ANSI_BLUE, "info", format!("http://{}/info", rpc_addr));
-    console_line("STATUS", ANSI_GREEN, "wallet rpc ready, waiting for open/unlock/sync commands");
+    console_kv(
+        "RPC",
+        ANSI_BLUE,
+        "health",
+        format!("http://{}/health", rpc_addr),
+    );
+    console_kv(
+        "RPC",
+        ANSI_BLUE,
+        "info",
+        format!("http://{}/info", rpc_addr),
+    );
+    console_line(
+        "STATUS",
+        ANSI_GREEN,
+        "wallet rpc ready, waiting for open/unlock/sync commands",
+    );
     println!();
 }
 
@@ -1037,8 +1051,13 @@ fn start_wallet_rpc(rpc_addr: String, daemon_rpc_port: u16, net: String) -> Resu
     let server = tiny_http::Server::http(&rpc_addr)
         .map_err(|e| format!("wallet_rpc_bind_failed addr={} err={}", rpc_addr, e))?;
 
+    print_wallet_startup_guidance(&rpc_addr);
     wdlog!("wallet_rpc: listening on http://{}", rpc_addr);
-    console_line("RPC", ANSI_GREEN, format!("listening on http://{}", rpc_addr));
+    console_line(
+        "RPC",
+        ANSI_GREEN,
+        format!("listening on http://{}", rpc_addr),
+    );
 
     for request in server.incoming_requests() {
         router::handle_request(request, &rpc_addr, daemon_rpc_port, &net);
@@ -1164,7 +1183,11 @@ fn install_pid_cleanup_handlers(data_dir: &str, name: &str) {
     }
 }
 
-fn wait_for_wallet_rpc_ready(rpc_addr: &str, child_pid: u32, timeout_ms: u64) -> Result<(), String> {
+fn wait_for_wallet_rpc_ready(
+    rpc_addr: &str,
+    child_pid: u32,
+    timeout_ms: u64,
+) -> Result<(), String> {
     let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
     let mut last_err = String::new();
     while std::time::Instant::now() < deadline {
@@ -1308,7 +1331,10 @@ fn validate_conf_wallet_rpc_settings(
     Ok(())
 }
 
-fn load_runtime_conf(conf_path: &str, required: bool) -> Result<duta_core::netparams::Conf, String> {
+fn load_runtime_conf(
+    conf_path: &str,
+    required: bool,
+) -> Result<duta_core::netparams::Conf, String> {
     match fs::read_to_string(conf_path) {
         Ok(s) => Ok(duta_core::netparams::Conf::parse(&s)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => {
@@ -1540,7 +1566,11 @@ fn main() {
     if args.daemon && !args.foreground && args.command.is_none() {
         match spawn_daemon_wallet(&data_dir, &rpc_addr) {
             Ok(pid) => {
-                console_line("WALLET", ANSI_GREEN, format!("dutawalletd started (pid={})", pid));
+                console_line(
+                    "WALLET",
+                    ANSI_GREEN,
+                    format!("dutawalletd started (pid={})", pid),
+                );
             }
             Err(e) => {
                 eprintln!("dutawalletd --daemon failed: {}", e);
@@ -1573,7 +1603,6 @@ fn main() {
         print_wallet_startup_warning(msg);
         wwlog!("wallet_rpc: CONFIG_WARN {}", msg);
     }
-    print_wallet_startup_guidance(&rpc_addr);
 
     if let Err(e) = start_wallet_rpc(rpc_addr, daemon_rpc_port, net_s) {
         wedlog!("wallet_rpc: {}", e);
@@ -1586,18 +1615,17 @@ fn main() {
 mod tests {
     use super::{
         build_http_request, clear_wallet_sensitive_state, enforce_wallet_unlock_deadline,
-        load_wallet_db_to_state, read_pid_file, load_runtime_conf, remove_pid_file_if_matches,
+        load_runtime_conf, load_wallet_db_to_state, read_pid_file, remove_pid_file_if_matches,
         save_wallet_sync_state, validate_conf_network_name, validate_conf_wallet_rpc_settings,
-        wallet_rpc_bind_warning, Args, Cmd,
-        validate_wallet_state_addresses,
-        wallet_rpc_settings, PidFileGuard, Utxo, WalletState,
+        validate_wallet_state_addresses, wallet_rpc_bind_warning, wallet_rpc_settings, Args, Cmd,
+        PidFileGuard, Utxo, WalletState,
     };
+    use crate::walletdb::{WalletDb, WALLET_DB_SCHEMA_VERSION};
     use crate::{PendingInput, PendingTx, ReservedInput};
     use clap::Parser;
     use duta_core::address::{pkh_from_pubkey, pkh_to_address_for_network};
     use duta_core::netparams::{Conf, Network};
     use ed25519_dalek::SigningKey;
-    use crate::walletdb::{WalletDb, WALLET_DB_SCHEMA_VERSION};
     use std::collections::BTreeMap;
     use std::fs;
     use std::time::{Duration, Instant};
@@ -1889,7 +1917,8 @@ mod tests {
             vout: 0,
             timestamp: 1_700_000_001,
         }];
-        db.update_full_state(&utxos, 77, &pending, &reserved).unwrap();
+        db.update_full_state(&utxos, 77, &pending, &reserved)
+            .unwrap();
         drop(db);
 
         let ws = load_wallet_db_to_state(&path).unwrap();
@@ -1920,8 +1949,7 @@ mod tests {
     #[test]
     fn wallet_rpc_settings_ignores_non_loopback_override() {
         let conf = Conf::parse("walletrpcbind=0.0.0.0:18084\ndaemonrpcport=18083\n");
-        let (rpc_addr, daemon_rpc_port, _) =
-            wallet_rpc_settings(Network::Testnet, &conf).unwrap();
+        let (rpc_addr, daemon_rpc_port, _) = wallet_rpc_settings(Network::Testnet, &conf).unwrap();
         assert_eq!(rpc_addr, "127.0.0.1:18084");
         assert_eq!(daemon_rpc_port, 18083);
         assert_eq!(
@@ -1967,6 +1995,14 @@ mod tests {
             validate_conf_wallet_rpc_settings(Network::Mainnet, &bad_port).unwrap_err(),
             "invalid_daemon_rpc_port: notaport"
         );
+    }
+
+    #[test]
+    fn start_wallet_rpc_fails_closed_when_bind_port_is_in_use() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let err = super::start_wallet_rpc(addr.to_string(), 18083, "testnet".to_string()).unwrap_err();
+        assert!(err.contains("wallet_rpc_bind_failed"), "unexpected err: {err}");
     }
 
     #[test]
@@ -2043,13 +2079,19 @@ mod tests {
     #[test]
     fn pid_file_guard_preserves_foreign_pid_file() {
         let mut dir = std::env::temp_dir();
-        dir.push(format!("duta-wallet-pid-guard-foreign-{}", std::process::id()));
+        dir.push(format!(
+            "duta-wallet-pid-guard-foreign-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let pid_path = dir.join("dutawalletd.pid");
         std::fs::write(&pid_path, "999999\n").unwrap();
         {
             let _guard = PidFileGuard::new(dir.to_str().unwrap(), "dutawalletd.pid");
-            assert_eq!(read_pid_file(pid_path.to_str().unwrap()).unwrap(), Some(999999));
+            assert_eq!(
+                read_pid_file(pid_path.to_str().unwrap()).unwrap(),
+                Some(999999)
+            );
         }
         assert!(pid_path.exists());
         let _ = std::fs::remove_file(&pid_path);
@@ -2083,8 +2125,8 @@ mod tests {
             .spawn()
             .expect("spawn sleep");
         let pid = child.id();
-        assert!(pid_is_alive(pid));
-        assert!(!pid_matches_wallet_process(pid));
+        assert!(super::pid_is_alive(pid));
+        assert!(!super::pid_matches_wallet_process(pid));
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -2106,7 +2148,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        let err = match prepare_wallet_runtime_files(dir.to_str().unwrap()) {
+        let err = match super::prepare_wallet_runtime_files(dir.to_str().unwrap()) {
             Ok(_) => panic!("readonly datadir should fail"),
             Err(err) => err,
         };

@@ -1,12 +1,11 @@
+use duta_core::amount::{
+    parse_duta_to_dut_i64, BASE_UNIT, DEFAULT_DUST_CHANGE_DUT, DEFAULT_MAX_WALLET_FEE_DUT,
+    DEFAULT_MIN_RELAY_FEE_PER_KB_DUT, DEFAULT_WALLET_FEE_DUT, DISPLAY_UNIT, DUTA_DECIMALS,
+};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use zeroize::Zeroize;
-use duta_core::amount::{
-    parse_duta_to_dut_i64, BASE_UNIT, DEFAULT_DUST_CHANGE_DUT,
-    DEFAULT_MAX_WALLET_FEE_DUT, DEFAULT_MIN_RELAY_FEE_PER_KB_DUT, DEFAULT_WALLET_FEE_DUT,
-    DISPLAY_UNIT, DUTA_DECIMALS,
-};
 
 const MAX_WALLET_SEND_INPUTS: usize = 64;
 
@@ -58,24 +57,10 @@ fn wallet_health_response(
     };
     if wallet_open {
         match refresh {
-            Ok((height,)) => (tiny_http::StatusCode(200), json!({
-                "ok": true,
-                "wallet_open": true,
-                "wallet_locked": wallet_locked,
-                "wallet_unlocked": !wallet_locked,
-                "wallet_state": wallet_state,
-                "pending_txs": pending_txs,
-                "last_sync_height": last_sync_height,
-                "next_index": next_index,
-                "backend_status": "ok",
-                "height": height,
-            })),
-            Err(e) => {
-                let error_code = wallet_refresh_error_code(&e);
-                (
-                    tiny_http::StatusCode(503),
-                    json!({
-                    "ok": false,
+            Ok((height,)) => (
+                tiny_http::StatusCode(200),
+                json!({
+                    "ok": true,
                     "wallet_open": true,
                     "wallet_locked": wallet_locked,
                     "wallet_unlocked": !wallet_locked,
@@ -83,11 +68,28 @@ fn wallet_health_response(
                     "pending_txs": pending_txs,
                     "last_sync_height": last_sync_height,
                     "next_index": next_index,
-                    "error": error_code,
-                    "backend_status": wallet_backend_status(error_code, &e),
-                    "detail": e,
+                    "backend_status": "ok",
+                    "height": height,
                 }),
-            )
+            ),
+            Err(e) => {
+                let error_code = wallet_refresh_error_code(&e);
+                (
+                    tiny_http::StatusCode(503),
+                    json!({
+                        "ok": false,
+                        "wallet_open": true,
+                        "wallet_locked": wallet_locked,
+                        "wallet_unlocked": !wallet_locked,
+                        "wallet_state": wallet_state,
+                        "pending_txs": pending_txs,
+                        "last_sync_height": last_sync_height,
+                        "next_index": next_index,
+                        "error": error_code,
+                        "backend_status": wallet_backend_status(error_code, &e),
+                        "detail": e,
+                    }),
+                )
             }
         }
     } else {
@@ -111,21 +113,20 @@ fn wallet_health_response(
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_utxo_sync_from_pruned_boundary, blocks_from_pruned_error, classify_wallet_history_tx, db_wallet_path,
-        decode_seed_hex_for_migration, merge_pending_wallet_txs, net_from_name,
-        parse_wallet_utxo_snapshot_response, wallet_utxo_snapshot_retry_after_secs,
-        insufficient_funds_body, net_from_wallet_path, prune_confirmed_pending_txs,
-        parse_prune_below_from_blocks_from_error, query_param, relay_fee_for_tx_bytes,
-        replace_wallet_artifacts,
-        retry_from_pruned_boundary_for_empty_wallet,
-        rpc_response_refresh_err,
-        derive_next_address_for_wallet, new_wallet_keypair_from_seed,
-        require_non_empty_passphrase, resolve_owned_input, select_inputs_for_need,
-        send_success_body, should_probe_daemon_utxo_presence, sign_send_tx, simulate_send_plan,
-        status_for_body_err, tx_output_address, wallet_health_response, wallet_needs_full_utxo_rebuild,
+        advance_utxo_sync_from_pruned_boundary, blocks_from_pruned_error,
+        classify_wallet_history_tx, db_wallet_path, decode_seed_hex_for_migration,
+        derive_next_address_for_wallet, insufficient_funds_body, merge_pending_wallet_txs,
+        net_from_name, net_from_wallet_path, new_wallet_keypair_from_seed,
+        parse_prune_below_from_blocks_from_error, parse_wallet_utxo_snapshot_response,
+        prune_confirmed_pending_txs, query_param, relay_fee_for_tx_bytes, replace_wallet_artifacts,
+        require_non_empty_passphrase, resolve_owned_input,
+        retry_from_pruned_boundary_for_empty_wallet, rpc_response_refresh_err,
+        select_inputs_for_need, send_success_body, should_probe_daemon_utxo_presence, sign_send_tx,
+        simulate_send_plan, status_for_body_err, tx_output_address,
+        validate_wallet_tip_against_state, wallet_health_response, wallet_needs_full_utxo_rebuild,
         wallet_public_name, wallet_refresh_error_code, wallet_state_network,
-        validate_wallet_tip_against_state, OwnedInput,
-        PendingBalanceStats, WalletSigner, MAX_WALLET_SEND_INPUTS,
+        wallet_utxo_snapshot_retry_after_secs, OwnedInput, PendingBalanceStats, WalletSigner,
+        MAX_WALLET_SEND_INPUTS,
     };
     use duta_core::netparams::Network;
     use serde_json::json;
@@ -158,16 +159,17 @@ mod tests {
         fs::write(staged.with_extension("importing-wal"), b"new-wal").unwrap();
         fs::write(staged.with_extension("importing-shm"), b"new-shm").unwrap();
 
-        replace_wallet_artifacts(
-            staged.to_str().unwrap(),
-            target.to_str().unwrap(),
-            true,
-        )
-        .unwrap();
+        replace_wallet_artifacts(staged.to_str().unwrap(), target.to_str().unwrap(), true).unwrap();
 
         assert_eq!(fs::read(&target).unwrap(), b"new-db");
-        assert_eq!(fs::read(target.with_extension("db-wal")).unwrap(), b"new-wal");
-        assert_eq!(fs::read(target.with_extension("db-shm")).unwrap(), b"new-shm");
+        assert_eq!(
+            fs::read(target.with_extension("db-wal")).unwrap(),
+            b"new-wal"
+        );
+        assert_eq!(
+            fs::read(target.with_extension("db-shm")).unwrap(),
+            b"new-shm"
+        );
         assert!(!staged.exists());
         assert!(!staged.with_extension("importing-wal").exists());
         assert!(!staged.with_extension("importing-shm").exists());
@@ -186,12 +188,9 @@ mod tests {
         let staged = dir.join("restore.db.importing");
 
         fs::write(&target, b"old-db").unwrap();
-        let err = replace_wallet_artifacts(
-            staged.to_str().unwrap(),
-            target.to_str().unwrap(),
-            true,
-        )
-        .unwrap_err();
+        let err =
+            replace_wallet_artifacts(staged.to_str().unwrap(), target.to_str().unwrap(), true)
+                .unwrap_err();
 
         assert_eq!(err, "wallet_stage_missing");
         assert_eq!(fs::read(&target).unwrap(), b"old-db");
@@ -252,7 +251,10 @@ mod tests {
         let owned = resolve_owned_input(18083, &utxo, &by_pkh, &by_addr)
             .expect("address-owned utxo should resolve without daemon");
 
-        let OwnedInput { utxo: got_utxo, signer: got_signer } = owned.expect("owned input");
+        let OwnedInput {
+            utxo: got_utxo,
+            signer: got_signer,
+        } = owned.expect("owned input");
         assert_eq!(got_utxo.txid, "abcd");
         assert_eq!(got_signer.addr, signer.addr);
     }
@@ -275,8 +277,14 @@ mod tests {
 
     #[test]
     fn status_for_body_err_maps_oversized_payloads_to_413() {
-        assert_eq!(status_for_body_err("body_too_large: 1048577"), tiny_http::StatusCode(413));
-        assert_eq!(status_for_body_err("invalid_json"), tiny_http::StatusCode(400));
+        assert_eq!(
+            status_for_body_err("body_too_large: 1048577"),
+            tiny_http::StatusCode(413)
+        );
+        assert_eq!(
+            status_for_body_err("invalid_json"),
+            tiny_http::StatusCode(400)
+        );
     }
 
     #[test]
@@ -289,7 +297,10 @@ mod tests {
             wallet_refresh_error_code("read_failed: timed out"),
             "daemon_unreachable"
         );
-        assert_eq!(wallet_refresh_error_code("read_timeout"), "daemon_unreachable");
+        assert_eq!(
+            wallet_refresh_error_code("read_timeout"),
+            "daemon_unreachable"
+        );
         assert_eq!(
             wallet_refresh_error_code("daemon_pruned_wallet_rescan_incomplete: from=0"),
             "wallet_state_refresh_failed"
@@ -322,14 +333,8 @@ mod tests {
 
     #[test]
     fn wallet_health_response_marks_backend_timeout_distinctly() {
-        let (status, body) = wallet_health_response(
-            true,
-            false,
-            0,
-            12,
-            3,
-            Err("read_timeout".to_string()),
-        );
+        let (status, body) =
+            wallet_health_response(true, false, 0, 12, 3, Err("read_timeout".to_string()));
         assert_eq!(status, tiny_http::StatusCode(503));
         assert_eq!(body["error"], json!("daemon_unreachable"));
         assert_eq!(body["backend_status"], json!("timeout"));
@@ -395,13 +400,9 @@ mod tests {
             vout: 1,
             timestamp: 1_700_000_000,
         }];
-        let err = super::persist_runtime_reserved_inputs(
-            &ws.wallet_path,
-            &ws.utxos,
-            13,
-            &next_reserved,
-        )
-        .unwrap_err();
+        let err =
+            super::persist_runtime_reserved_inputs(&ws.wallet_path, &ws.utxos, 13, &next_reserved)
+                .unwrap_err();
         assert!(!err.is_empty());
 
         let g = super::super::wallet_lock_or_recover();
@@ -699,15 +700,27 @@ mod tests {
 
     #[test]
     fn net_from_wallet_path_detects_network_from_path_segments() {
-        assert_eq!(net_from_wallet_path("C:/wallets/testnet/dev.db"), Network::Testnet);
-        assert_eq!(net_from_wallet_path("C:/wallets/stagenet/dev.db"), Network::Stagenet);
-        assert_eq!(net_from_wallet_path("C:/wallets/main/dev.db"), Network::Mainnet);
+        assert_eq!(
+            net_from_wallet_path("C:/wallets/testnet/dev.db"),
+            Network::Testnet
+        );
+        assert_eq!(
+            net_from_wallet_path("C:/wallets/stagenet/dev.db"),
+            Network::Stagenet
+        );
+        assert_eq!(
+            net_from_wallet_path("C:/wallets/main/dev.db"),
+            Network::Mainnet
+        );
     }
 
     #[test]
     fn wallet_public_name_keeps_filename_only() {
         assert_eq!(wallet_public_name("C:/wallets/testnet/dev.db"), "dev.db");
-        assert_eq!(wallet_public_name("/root/wallets/primary.dat"), "primary.dat");
+        assert_eq!(
+            wallet_public_name("/root/wallets/primary.dat"),
+            "primary.dat"
+        );
     }
 
     #[test]
@@ -795,11 +808,17 @@ mod tests {
     fn send_success_body_marks_persist_success() {
         let body = send_success_body("tx123", 50, 1, 9, 2, 123, Ok(()));
         assert_eq!(body.get("ok").and_then(|x| x.as_bool()), Some(true));
-        assert_eq!(body.get("amount").and_then(|x| x.as_str()), Some("0.00000050"));
+        assert_eq!(
+            body.get("amount").and_then(|x| x.as_str()),
+            Some("0.00000050")
+        );
         assert_eq!(body.get("amount_dut").and_then(|x| x.as_i64()), Some(50));
         assert_eq!(body.get("fee").and_then(|x| x.as_str()), Some("0.00000001"));
         assert_eq!(body.get("fee_dut").and_then(|x| x.as_i64()), Some(1));
-        assert_eq!(body.get("change").and_then(|x| x.as_str()), Some("0.00000009"));
+        assert_eq!(
+            body.get("change").and_then(|x| x.as_str()),
+            Some("0.00000009")
+        );
         assert_eq!(body.get("change_dut").and_then(|x| x.as_i64()), Some(9));
         assert_eq!(body.get("unit").and_then(|x| x.as_str()), Some("DUTA"));
         assert_eq!(
@@ -818,9 +837,18 @@ mod tests {
     fn amount_detail_json_exposes_display_and_base_unit_metadata() {
         let body = super::amount_detail_json("send", "dut1dest", -10_001);
         assert_eq!(body.get("category").and_then(|x| x.as_str()), Some("send"));
-        assert_eq!(body.get("address").and_then(|x| x.as_str()), Some("dut1dest"));
-        assert_eq!(body.get("amount").and_then(|x| x.as_str()), Some("-0.00010001"));
-        assert_eq!(body.get("amount_dut").and_then(|x| x.as_i64()), Some(-10_001));
+        assert_eq!(
+            body.get("address").and_then(|x| x.as_str()),
+            Some("dut1dest")
+        );
+        assert_eq!(
+            body.get("amount").and_then(|x| x.as_str()),
+            Some("-0.00010001")
+        );
+        assert_eq!(
+            body.get("amount_dut").and_then(|x| x.as_i64()),
+            Some(-10_001)
+        );
         assert_eq!(body.get("unit").and_then(|x| x.as_str()), Some("DUTA"));
         assert_eq!(
             body.get("display_unit").and_then(|x| x.as_str()),
@@ -840,9 +868,18 @@ mod tests {
         let normalized = super::normalize_history_details(&details);
         assert_eq!(normalized.len(), 1);
         let item = &normalized[0];
-        assert_eq!(item.get("category").and_then(|x| x.as_str()), Some("receive"));
-        assert_eq!(item.get("address").and_then(|x| x.as_str()), Some("dut1recv"));
-        assert_eq!(item.get("amount").and_then(|x| x.as_str()), Some("0.00000001"));
+        assert_eq!(
+            item.get("category").and_then(|x| x.as_str()),
+            Some("receive")
+        );
+        assert_eq!(
+            item.get("address").and_then(|x| x.as_str()),
+            Some("dut1recv")
+        );
+        assert_eq!(
+            item.get("amount").and_then(|x| x.as_str()),
+            Some("0.00000001")
+        );
         assert_eq!(item.get("amount_dut").and_then(|x| x.as_i64()), Some(1));
         assert_eq!(item.get("unit").and_then(|x| x.as_str()), Some("DUTA"));
         assert_eq!(
@@ -942,7 +979,10 @@ mod tests {
 
     #[test]
     fn tx_output_address_falls_back_to_legacy_addr_key() {
-        assert_eq!(tx_output_address(&json!({"addr":"dut1old","value":1})), "dut1old");
+        assert_eq!(
+            tx_output_address(&json!({"addr":"dut1old","value":1})),
+            "dut1old"
+        );
     }
 
     #[test]
@@ -970,9 +1010,11 @@ mod tests {
             }],
         );
         assert_eq!(merged.len(), 2);
-        assert!(merged.iter().any(|(txid, h, _, category, amount, fee, _, _)| {
-            txid == "pending" && *h == 0 && category == "send" && *amount == 6 && *fee == 1
-        }));
+        assert!(merged
+            .iter()
+            .any(|(txid, h, _, category, amount, fee, _, _)| {
+                txid == "pending" && *h == 0 && category == "send" && *amount == 6 && *fee == 1
+            }));
         assert_eq!(merged[0].0, "pending");
     }
 
@@ -1172,7 +1214,10 @@ mod tests {
         );
         assert!(changed);
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].txid, "bbbf6d1b60f8964cbe88aafb8ddecdeda0a00086f761d2cca8da66e27b8bfdbd");
+        assert_eq!(
+            pending[0].txid,
+            "bbbf6d1b60f8964cbe88aafb8ddecdeda0a00086f761d2cca8da66e27b8bfdbd"
+        );
         assert_eq!(pending[0].amount, -5_010_000);
         assert_eq!(pending[0].fee, 10_000);
         assert_eq!(pending[0].change, 4_970_000);
@@ -1209,7 +1254,9 @@ mod tests {
                 fee: 1,
                 change: 9,
                 timestamp: 77,
-                details: vec![serde_json::json!({"category":"send","address":"dut1dest","amount_dut":-100})],
+                details: vec![
+                    serde_json::json!({"category":"send","address":"dut1dest","amount_dut":-100}),
+                ],
                 spent_inputs: vec![super::super::PendingInput {
                     txid: "ab".repeat(32),
                     vout: 0,
@@ -1297,10 +1344,329 @@ mod tests {
         assert_eq!(utxos[0].txid, "ef".repeat(32));
         assert_eq!(utxos[0].vout, 1);
         assert!(reserved.is_empty());
-        assert!(super::read_submitted_tx_recovery(&wallet_path).unwrap().is_none());
+        assert!(super::read_submitted_tx_recovery(&wallet_path)
+            .unwrap()
+            .is_none());
 
         let _ = handle.join();
         let _ = std::fs::remove_file(&wallet_path);
+    }
+
+    #[test]
+    fn reconcile_pending_state_preserves_unproven_submitted_recovery() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let mut db_path = std::env::temp_dir();
+        db_path.push(format!(
+            "duta-wallet-reconcile-recovery-pending-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let wallet_path = db_path.to_string_lossy().to_string();
+        let db = super::super::walletdb::WalletDb::create_new(
+            &wallet_path,
+            "strong-pass-123",
+            &[6u8; 32],
+            1,
+        )
+        .unwrap();
+        let recovery = super::super::SubmittedTxRecovery {
+            pending_tx: super::super::PendingTx {
+                txid: "cd".repeat(32),
+                category: "send".to_string(),
+                amount: -101,
+                fee: 1,
+                change: 9,
+                timestamp: 1,
+                details: vec![
+                    serde_json::json!({"category":"send","address":"dut1dest","amount_dut":-100}),
+                ],
+                spent_inputs: vec![super::super::PendingInput {
+                    txid: "ab".repeat(32),
+                    vout: 0,
+                }],
+            },
+            change_address: "dut1change".to_string(),
+            change_vout: 1,
+        };
+        db.update_sync_state_with_recovery(
+            &[super::super::Utxo {
+                value: 110,
+                height: 77,
+                coinbase: false,
+                address: "dut1owned".to_string(),
+                txid: "ab".repeat(32),
+                vout: 0,
+            }],
+            77,
+            &[super::super::ReservedInput {
+                txid: "ab".repeat(32),
+                vout: 0,
+                timestamp: 1,
+            }],
+            Some(&recovery),
+        )
+        .unwrap();
+
+        let ws = super::super::WalletState {
+            wallet_path: wallet_path.clone(),
+            primary_address: "dut1owned".to_string(),
+            keys: Default::default(),
+            pubkeys: Default::default(),
+            utxos: vec![super::super::Utxo {
+                value: 110,
+                height: 77,
+                coinbase: false,
+                address: "dut1owned".to_string(),
+                txid: "ab".repeat(32),
+                vout: 0,
+            }],
+            pending_txs: vec![],
+            reserved_inputs: vec![super::super::ReservedInput {
+                txid: "ab".repeat(32),
+                vout: 0,
+                timestamp: 1,
+            }],
+            last_sync_height: 77,
+            seed_hex: None,
+            next_index: 0,
+            is_db: true,
+            locked: false,
+            db_passphrase: None,
+            unlock_deadline: None,
+        };
+        {
+            let mut g = super::super::wallet_lock_or_recover();
+            *g = Some(ws);
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            for _ in 0..3 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let body = if path.starts_with("/mempool") {
+                    serde_json::json!({"txids":[],"txs":{}}).to_string()
+                } else if path.starts_with("/tip") {
+                    serde_json::json!({"height":77}).to_string()
+                } else if path.starts_with("/blocks_from") {
+                    "[]".to_string()
+                } else {
+                    serde_json::json!({"found":true}).to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let mut utxos = vec![super::super::Utxo {
+            value: 110,
+            height: 77,
+            coinbase: false,
+            address: "dut1owned".to_string(),
+            txid: "ab".repeat(32),
+            vout: 0,
+        }];
+        let mut pending = Vec::new();
+        let mut reserved = vec![super::super::ReservedInput {
+            txid: "ab".repeat(32),
+            vout: 0,
+            timestamp: 1,
+        }];
+        let reserved_outpoints = super::reconcile_pending_and_reserved_state(
+            &wallet_path,
+            &mut utxos,
+            77,
+            &mut pending,
+            &mut reserved,
+            port,
+        )
+        .unwrap();
+
+        assert!(pending.is_empty());
+        assert!(reserved_outpoints.contains(&("ab".repeat(32), 0)));
+        assert_eq!(reserved.len(), 1);
+        assert_eq!(reserved[0].txid, "ab".repeat(32));
+        assert!(super::read_submitted_tx_recovery(&wallet_path)
+            .unwrap()
+            .is_some());
+
+        let _ = handle.join();
+        let _ = std::fs::remove_file(&wallet_path);
+    }
+
+    #[test]
+    fn wallet_info_response_body_refreshes_fields_after_reconciliation() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let mut db_path = std::env::temp_dir();
+        db_path.push(format!(
+            "duta-wallet-info-refresh-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let wallet_path = db_path.to_string_lossy().to_string();
+        let db = super::super::walletdb::WalletDb::create_new(
+            &wallet_path,
+            "strong-pass-123",
+            &[7u8; 32],
+            1,
+        )
+        .unwrap();
+        let utxo = super::super::Utxo {
+            value: 110,
+            height: 77,
+            coinbase: false,
+            address: "dut1owned".to_string(),
+            txid: "ab".repeat(32),
+            vout: 0,
+        };
+        let reserved = super::super::ReservedInput {
+            txid: "ab".repeat(32),
+            vout: 0,
+            timestamp: 1,
+        };
+        db.update_sync_state_with_recovery(&[utxo.clone()], 77, &[reserved.clone()], None)
+            .unwrap();
+        {
+            let mut g = super::super::wallet_lock_or_recover();
+            *g = Some(super::super::WalletState {
+                wallet_path: wallet_path.clone(),
+                primary_address: "dut1owned".to_string(),
+                keys: Default::default(),
+                pubkeys: Default::default(),
+                utxos: vec![utxo],
+                pending_txs: vec![],
+                reserved_inputs: vec![reserved],
+                last_sync_height: 77,
+                seed_hex: None,
+                next_index: 1,
+                is_db: true,
+                locked: true,
+                db_passphrase: Some("strong-pass-123".to_string()),
+                unlock_deadline: None,
+            });
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            for _ in 0..3 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let body = if path.starts_with("/tip") {
+                    serde_json::json!({"height":77}).to_string()
+                } else if path.starts_with("/mempool") {
+                    serde_json::json!({"txids":[],"txs":{}}).to_string()
+                } else {
+                    serde_json::json!({"found":true}).to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let body = super::wallet_info_response_body("127.0.0.1:18084", port, "testnet");
+
+        assert_eq!(body["reserved_inputs"], serde_json::json!(0));
+        assert_eq!(body["reserved_dut"], serde_json::json!(0));
+        assert_eq!(body["last_sync_height"], serde_json::json!(77));
+        let g = super::super::wallet_lock_or_recover();
+        let ws = g.as_ref().unwrap();
+        assert!(ws.reserved_inputs.is_empty());
+
+        let _ = handle.join();
+        let _ = std::fs::remove_file(&wallet_path);
+    }
+
+    #[test]
+    fn duplicate_pending_sendmany_txid_matches_identical_batch() {
+        let pending = super::super::PendingTx {
+            txid: "aa".repeat(32),
+            category: "send".to_string(),
+            amount: -120_030_000,
+            fee: 30_000,
+            change: 4_479_970_000,
+            timestamp: 1,
+            details: vec![
+                serde_json::json!({"category":"send","address":"test1","amount_dut":-10_000_000}),
+                serde_json::json!({"category":"send","address":"test2","amount_dut":-20_000_000}),
+                serde_json::json!({"category":"fee","address":"","amount_dut":-30_000}),
+                serde_json::json!({"category":"receive","address":"change","amount_dut":4_479_970_000i64}),
+            ],
+            spent_inputs: vec![],
+        };
+        let duplicate = super::duplicate_pending_sendmany_txid(
+            &[pending],
+            &[("test2".to_string(), 20_000_000), ("test1".to_string(), 10_000_000)],
+        );
+        assert_eq!(duplicate, Some("aa".repeat(32)));
+    }
+
+    #[test]
+    fn duplicate_pending_sendmany_txid_ignores_non_identical_batch() {
+        let pending = super::super::PendingTx {
+            txid: "bb".repeat(32),
+            category: "send".to_string(),
+            amount: -120_030_000,
+            fee: 30_000,
+            change: 4_479_970_000,
+            timestamp: 1,
+            details: vec![
+                serde_json::json!({"category":"send","address":"test1","amount_dut":-10_000_000}),
+                serde_json::json!({"category":"send","address":"test2","amount_dut":-20_000_000}),
+                serde_json::json!({"category":"fee","address":"","amount_dut":-30_000}),
+                serde_json::json!({"category":"receive","address":"change","amount_dut":4_479_970_000i64}),
+            ],
+            spent_inputs: vec![],
+        };
+        let different_amount = super::duplicate_pending_sendmany_txid(
+            &[pending.clone()],
+            &[("test1".to_string(), 10_000_000), ("test2".to_string(), 21_000_000)],
+        );
+        let different_addr = super::duplicate_pending_sendmany_txid(
+            &[pending],
+            &[("test1".to_string(), 10_000_000), ("test3".to_string(), 20_000_000)],
+        );
+        assert!(different_amount.is_none());
+        assert!(different_addr.is_none());
     }
 
     #[test]
@@ -1315,15 +1681,10 @@ mod tests {
         ));
         let wallet_path = db_path.to_string_lossy().to_string();
         let seed = [9u8; 32];
-        let db = super::super::walletdb::WalletDb::create_new(
-            &wallet_path,
-            "strong-pass-123",
-            &seed,
-            1,
-        )
-        .unwrap();
-        let (addr0, sk_hex0, pub_hex0) =
-            new_wallet_keypair_from_seed(Network::Mainnet, &seed, 0);
+        let db =
+            super::super::walletdb::WalletDb::create_new(&wallet_path, "strong-pass-123", &seed, 1)
+                .unwrap();
+        let (addr0, sk_hex0, pub_hex0) = new_wallet_keypair_from_seed(Network::Mainnet, &seed, 0);
         let sk0 = hex::decode(sk_hex0).unwrap();
         let mut sk_arr0 = [0u8; 32];
         sk_arr0.copy_from_slice(&sk0);
@@ -1521,20 +1882,50 @@ mod tests {
                 pending_txs: 20,
             },
         );
-        assert_eq!(body.get("error").and_then(|v| v.as_str()), Some("insufficient_funds"));
-        assert_eq!(body.get("detail").and_then(|v| v.as_str()), Some("confirmed_spendable_utxos_exhausted_or_reserved"));
-        assert_eq!(body.get("need").and_then(|v| v.as_str()), Some("0.00150001"));
+        assert_eq!(
+            body.get("error").and_then(|v| v.as_str()),
+            Some("insufficient_funds")
+        );
+        assert_eq!(
+            body.get("detail").and_then(|v| v.as_str()),
+            Some("confirmed_spendable_utxos_exhausted_or_reserved")
+        );
+        assert_eq!(
+            body.get("need").and_then(|v| v.as_str()),
+            Some("0.00150001")
+        );
         assert_eq!(body.get("need_dut").and_then(|v| v.as_i64()), Some(150_001));
-        assert_eq!(body.get("have").and_then(|v| v.as_str()), Some("0.00000000"));
+        assert_eq!(
+            body.get("have").and_then(|v| v.as_str()),
+            Some("0.00000000")
+        );
         assert_eq!(body.get("have_dut").and_then(|v| v.as_i64()), Some(0));
         assert_eq!(body.get("fee").and_then(|v| v.as_str()), Some("0.00010000"));
         assert_eq!(body.get("fee_dut").and_then(|v| v.as_i64()), Some(10_000));
-        assert_eq!(body.get("spendable_utxos").and_then(|v| v.as_u64()), Some(0));
-        assert_eq!(body.get("reserved_outpoints").and_then(|v| v.as_u64()), Some(20));
-        assert_eq!(body.get("pending_send").and_then(|v| v.as_str()), Some("0.02300020"));
-        assert_eq!(body.get("pending_send_dut").and_then(|v| v.as_i64()), Some(2_300_020));
-        assert_eq!(body.get("pending_change").and_then(|v| v.as_str()), Some("919.97699980"));
-        assert_eq!(body.get("pending_change_dut").and_then(|v| v.as_i64()), Some(91_997_699_980));
+        assert_eq!(
+            body.get("spendable_utxos").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            body.get("reserved_outpoints").and_then(|v| v.as_u64()),
+            Some(20)
+        );
+        assert_eq!(
+            body.get("pending_send").and_then(|v| v.as_str()),
+            Some("0.02300020")
+        );
+        assert_eq!(
+            body.get("pending_send_dut").and_then(|v| v.as_i64()),
+            Some(2_300_020)
+        );
+        assert_eq!(
+            body.get("pending_change").and_then(|v| v.as_str()),
+            Some("919.97699980")
+        );
+        assert_eq!(
+            body.get("pending_change_dut").and_then(|v| v.as_i64()),
+            Some(91_997_699_980)
+        );
         assert_eq!(body.get("unit").and_then(|v| v.as_str()), Some("DUTA"));
         assert_eq!(body.get("base_unit").and_then(|v| v.as_str()), Some("dut"));
     }
@@ -1542,20 +1933,44 @@ mod tests {
     #[test]
     fn fee_error_bodies_expose_display_and_raw_amounts() {
         let low = super::fee_too_low_body(10_000, 40_000, 3567);
-        assert_eq!(low.get("error").and_then(|v| v.as_str()), Some("fee_too_low"));
+        assert_eq!(
+            low.get("error").and_then(|v| v.as_str()),
+            Some("fee_too_low")
+        );
         assert_eq!(low.get("fee").and_then(|v| v.as_str()), Some("0.00010000"));
         assert_eq!(low.get("fee_dut").and_then(|v| v.as_i64()), Some(10_000));
-        assert_eq!(low.get("min_fee").and_then(|v| v.as_str()), Some("0.00040000"));
-        assert_eq!(low.get("min_fee_dut").and_then(|v| v.as_i64()), Some(40_000));
+        assert_eq!(
+            low.get("min_fee").and_then(|v| v.as_str()),
+            Some("0.00040000")
+        );
+        assert_eq!(
+            low.get("min_fee_dut").and_then(|v| v.as_i64()),
+            Some(40_000)
+        );
         assert_eq!(low.get("size").and_then(|v| v.as_u64()), Some(3567));
         assert_eq!(low.get("unit").and_then(|v| v.as_str()), Some("DUTA"));
 
         let high = super::fee_too_high_body(2_000_000_000, 1_000_000_000);
-        assert_eq!(high.get("error").and_then(|v| v.as_str()), Some("fee_too_high"));
-        assert_eq!(high.get("fee").and_then(|v| v.as_str()), Some("20.00000000"));
-        assert_eq!(high.get("fee_dut").and_then(|v| v.as_i64()), Some(2_000_000_000));
-        assert_eq!(high.get("max_fee").and_then(|v| v.as_str()), Some("10.00000000"));
-        assert_eq!(high.get("max_fee_dut").and_then(|v| v.as_i64()), Some(1_000_000_000));
+        assert_eq!(
+            high.get("error").and_then(|v| v.as_str()),
+            Some("fee_too_high")
+        );
+        assert_eq!(
+            high.get("fee").and_then(|v| v.as_str()),
+            Some("20.00000000")
+        );
+        assert_eq!(
+            high.get("fee_dut").and_then(|v| v.as_i64()),
+            Some(2_000_000_000)
+        );
+        assert_eq!(
+            high.get("max_fee").and_then(|v| v.as_str()),
+            Some("10.00000000")
+        );
+        assert_eq!(
+            high.get("max_fee_dut").and_then(|v| v.as_i64()),
+            Some(1_000_000_000)
+        );
         assert_eq!(high.get("unit").and_then(|v| v.as_str()), Some("DUTA"));
     }
 
@@ -1568,16 +1983,34 @@ mod tests {
             pending_txs: 3,
         };
         let body = super::too_many_inputs_body(150_001, 50_000, 10_000, 77, 64, 4, 64, &stats);
-        assert_eq!(body.get("error").and_then(|v| v.as_str()), Some("too_many_inputs"));
-        assert_eq!(body.get("need").and_then(|v| v.as_str()), Some("0.00150001"));
+        assert_eq!(
+            body.get("error").and_then(|v| v.as_str()),
+            Some("too_many_inputs")
+        );
+        assert_eq!(
+            body.get("need").and_then(|v| v.as_str()),
+            Some("0.00150001")
+        );
         assert_eq!(body.get("need_dut").and_then(|v| v.as_i64()), Some(150_001));
-        assert_eq!(body.get("have").and_then(|v| v.as_str()), Some("0.00050000"));
+        assert_eq!(
+            body.get("have").and_then(|v| v.as_str()),
+            Some("0.00050000")
+        );
         assert_eq!(body.get("have_dut").and_then(|v| v.as_i64()), Some(50_000));
         assert_eq!(body.get("fee").and_then(|v| v.as_str()), Some("0.00010000"));
         assert_eq!(body.get("fee_dut").and_then(|v| v.as_i64()), Some(10_000));
-        assert_eq!(body.get("pending_send").and_then(|v| v.as_str()), Some("0.00120000"));
-        assert_eq!(body.get("pending_change").and_then(|v| v.as_str()), Some("0.89000000"));
-        assert_eq!(body.get("reserved").and_then(|v| v.as_str()), Some("450.00000000"));
+        assert_eq!(
+            body.get("pending_send").and_then(|v| v.as_str()),
+            Some("0.00120000")
+        );
+        assert_eq!(
+            body.get("pending_change").and_then(|v| v.as_str()),
+            Some("0.89000000")
+        );
+        assert_eq!(
+            body.get("reserved").and_then(|v| v.as_str()),
+            Some("450.00000000")
+        );
         assert_eq!(body.get("unit").and_then(|v| v.as_str()), Some("DUTA"));
     }
 
@@ -1585,9 +2018,18 @@ mod tests {
     fn wallet_display_amounts_keep_fixed_eight_decimals_while_raw_stays_intact() {
         let body = super::fee_too_high_body(50_000_000, 100_000_000);
         assert_eq!(body.get("fee").and_then(|v| v.as_str()), Some("0.50000000"));
-        assert_eq!(body.get("fee_dut").and_then(|v| v.as_i64()), Some(50_000_000));
-        assert_eq!(body.get("max_fee").and_then(|v| v.as_str()), Some("1.00000000"));
-        assert_eq!(body.get("max_fee_dut").and_then(|v| v.as_i64()), Some(100_000_000));
+        assert_eq!(
+            body.get("fee_dut").and_then(|v| v.as_i64()),
+            Some(50_000_000)
+        );
+        assert_eq!(
+            body.get("max_fee").and_then(|v| v.as_str()),
+            Some("1.00000000")
+        );
+        assert_eq!(
+            body.get("max_fee_dut").and_then(|v| v.as_i64()),
+            Some(100_000_000)
+        );
     }
 
     #[test]
@@ -1728,8 +2170,16 @@ mod tests {
                 vout: 2,
             }],
         }];
-        let confirmed: Vec<(String, i64, i64, String, i64, i64, bool, Vec<serde_json::Value>)> =
-            Vec::new();
+        let confirmed: Vec<(
+            String,
+            i64,
+            i64,
+            String,
+            i64,
+            i64,
+            bool,
+            Vec<serde_json::Value>,
+        )> = Vec::new();
         let changed = super::prune_confirmed_pending_txs(&mut pending, &confirmed);
         assert!(!changed);
         let reserved = super::pending_reserved_outpoints(&pending);
@@ -1832,13 +2282,21 @@ fn wallet_stage_path(path: &str) -> String {
     format!("{path}.importing-{stamp}")
 }
 
-fn replace_wallet_artifacts(staged_path: &str, target_path: &str, target_exists: bool) -> Result<(), String> {
+fn replace_wallet_artifacts(
+    staged_path: &str,
+    target_path: &str,
+    target_exists: bool,
+) -> Result<(), String> {
     if fs::metadata(staged_path).is_err() {
         return Err("wallet_stage_missing".to_string());
     }
 
     let backup_path = if target_exists {
-        Some(format!("{}.backup-{}", target_path, wallet_stage_path("swap")))
+        Some(format!(
+            "{}.backup-{}",
+            target_path,
+            wallet_stage_path("swap")
+        ))
     } else {
         None
     };
@@ -2000,7 +2458,16 @@ fn parse_prune_below_from_blocks_from_error(detail: &str) -> Option<i64> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct WalletHistoryScan {
     height: i64,
-    txs: Vec<(String, i64, i64, String, i64, i64, bool, Vec<serde_json::Value>)>,
+    txs: Vec<(
+        String,
+        i64,
+        i64,
+        String,
+        i64,
+        i64,
+        bool,
+        Vec<serde_json::Value>,
+    )>,
     truncated: bool,
     prune_below: Option<i64>,
 }
@@ -2057,8 +2524,7 @@ fn daemon_blocks_from_with_retry(
         let v: serde_json::Value =
             serde_json::from_str(&body).map_err(|e| format!("blocks_from_invalid_json: {}", e))?;
 
-        let is_rate_limited =
-            v.get("error").and_then(|x| x.as_str()) == Some("rate_limited");
+        let is_rate_limited = v.get("error").and_then(|x| x.as_str()) == Some("rate_limited");
         if is_rate_limited {
             let retry_secs = v
                 .get("retry_after_secs")
@@ -2345,9 +2811,27 @@ fn normalized_history_amount(category: &str, amount: i64, fee: i64) -> i64 {
 }
 
 fn merge_pending_wallet_txs(
-    mut confirmed: Vec<(String, i64, i64, String, i64, i64, bool, Vec<serde_json::Value>)>,
+    mut confirmed: Vec<(
+        String,
+        i64,
+        i64,
+        String,
+        i64,
+        i64,
+        bool,
+        Vec<serde_json::Value>,
+    )>,
     pending: &[super::PendingTx],
-) -> Vec<(String, i64, i64, String, i64, i64, bool, Vec<serde_json::Value>)> {
+) -> Vec<(
+    String,
+    i64,
+    i64,
+    String,
+    i64,
+    i64,
+    bool,
+    Vec<serde_json::Value>,
+)> {
     let confirmed_ids: HashSet<String> = confirmed
         .iter()
         .map(|(txid, _, _, _, _, _, _, _)| txid.clone())
@@ -2381,7 +2865,16 @@ fn merge_pending_wallet_txs(
 
 fn prune_confirmed_pending_txs(
     pending: &mut Vec<super::PendingTx>,
-    confirmed: &[(String, i64, i64, String, i64, i64, bool, Vec<serde_json::Value>)],
+    confirmed: &[(
+        String,
+        i64,
+        i64,
+        String,
+        i64,
+        i64,
+        bool,
+        Vec<serde_json::Value>,
+    )],
 ) -> bool {
     let confirmed_ids: HashSet<&str> = confirmed
         .iter()
@@ -2395,7 +2888,8 @@ fn prune_confirmed_pending_txs(
 const PENDING_MEMPOOL_GRACE_SECS: i64 = 120;
 
 fn pending_tx_is_recent(pending: &super::PendingTx, now_secs: i64) -> bool {
-    pending.timestamp > 0 && now_secs.saturating_sub(pending.timestamp) <= PENDING_MEMPOOL_GRACE_SECS
+    pending.timestamp > 0
+        && now_secs.saturating_sub(pending.timestamp) <= PENDING_MEMPOOL_GRACE_SECS
 }
 
 fn pending_reserved_outpoints(pending: &[super::PendingTx]) -> HashSet<(String, u32)> {
@@ -2520,6 +3014,7 @@ fn restore_runtime_sync_state(
     }
 }
 
+#[cfg(test)]
 fn persist_runtime_full_state(
     wallet_path: &str,
     utxos: &[super::Utxo],
@@ -2624,7 +3119,10 @@ fn collect_mempool_spent_outpoints(v: &serde_json::Value) -> HashSet<(String, u3
         };
         for vin in vins {
             let prev_txid = vin.get("txid").and_then(|x| x.as_str()).unwrap_or("");
-            let prev_vout = vin.get("vout").and_then(|x| x.as_u64()).unwrap_or(u32::MAX as u64);
+            let prev_vout = vin
+                .get("vout")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(u32::MAX as u64);
             if !prev_txid.is_empty() && prev_vout <= u32::MAX as u64 {
                 out.insert((prev_txid.to_string(), prev_vout as u32));
             }
@@ -2707,7 +3205,10 @@ fn restore_pending_sends_from_mempool(
         let mut owned_input_total = 0i64;
         for vin in vins {
             let prev_txid = vin.get("txid").and_then(|x| x.as_str()).unwrap_or("");
-            let prev_vout = vin.get("vout").and_then(|x| x.as_u64()).unwrap_or(u32::MAX as u64);
+            let prev_vout = vin
+                .get("vout")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(u32::MAX as u64);
             if prev_txid.is_empty() || prev_vout > u32::MAX as u64 {
                 continue;
             }
@@ -2796,10 +3297,7 @@ fn pending_balance_stats(
         .filter(|p| p.category == "send" && p.amount < 0)
         .map(|p| -p.amount)
         .sum();
-    let pending_change_dut = pending_txs
-        .iter()
-        .map(|p| p.change.max(0))
-        .sum();
+    let pending_change_dut = pending_txs.iter().map(|p| p.change.max(0)).sum();
     PendingBalanceStats {
         reserved_dut,
         pending_send_dut,
@@ -2914,7 +3412,11 @@ fn select_inputs_for_need(
     let mut selected = Vec::new();
     let mut total_in = 0;
 
-    if let Some(u) = spendable_utxos.iter().find(|u| u.utxo.value == need).cloned() {
+    if let Some(u) = spendable_utxos
+        .iter()
+        .find(|u| u.utxo.value == need)
+        .cloned()
+    {
         selected.push(u.clone());
         total_in = u.utxo.value;
         return (selected, total_in);
@@ -3006,10 +3508,12 @@ fn reconcile_pending_and_reserved_state(
     let mut reserved_outpoints = pending_reserved_outpoints(active_pending);
     reserved_outpoints.extend(explicit_reserved_outpoints(reserved_inputs));
     let submitted_recovery = read_submitted_tx_recovery(wallet_path)?;
+    let mut recovery_to_persist = submitted_recovery.clone();
 
     match pending_mempool_state_or_err(wallet_path, active_pending, daemon_rpc_port)? {
         Some((mempool, mempool_txids, mempool_reserved)) => {
             let mut state_changed = false;
+            let mut protected_reserved = mempool_reserved.clone();
             if let Some(recovery) = submitted_recovery.as_ref() {
                 let recovery_txid = recovery.pending_tx.txid.clone();
                 if mempool_txids.contains(&recovery_txid) {
@@ -3056,6 +3560,7 @@ fn reconcile_pending_and_reserved_state(
                         None,
                     )?;
                     state_changed = true;
+                    recovery_to_persist = None;
                 } else {
                     let owned_addrs: Vec<String> =
                         wallet_owned_addresses(utxos).into_iter().collect();
@@ -3077,15 +3582,41 @@ fn reconcile_pending_and_reserved_state(
                             reserved_inputs,
                             &recovery.pending_tx.spent_inputs,
                         );
+                        recovery_to_persist = None;
+                        persist_runtime_reserved_inputs_with_recovery(
+                            wallet_path,
+                            utxos,
+                            cur_h,
+                            reserved_inputs,
+                            None,
+                        )?;
+                        state_changed = true;
+                    } else {
+                        let existing = explicit_reserved_outpoints(reserved_inputs);
+                        let mut restored_any = false;
+                        for spent in recovery.pending_tx.spent_inputs.iter() {
+                            let key = (spent.txid.clone(), spent.vout);
+                            protected_reserved.insert(key.clone());
+                            if !existing.contains(&key) {
+                                reserved_inputs.push(super::ReservedInput {
+                                    txid: spent.txid.clone(),
+                                    vout: spent.vout,
+                                    timestamp: now_secs,
+                                });
+                                restored_any = true;
+                            }
+                        }
+                        if restored_any {
+                            persist_runtime_reserved_inputs_with_recovery(
+                                wallet_path,
+                                utxos,
+                                cur_h,
+                                reserved_inputs,
+                                recovery_to_persist.as_ref(),
+                            )?;
+                            state_changed = true;
+                        }
                     }
-                    persist_runtime_reserved_inputs_with_recovery(
-                        wallet_path,
-                        utxos,
-                        cur_h,
-                        reserved_inputs,
-                        None,
-                    )?;
-                    state_changed = true;
                 }
             }
             if restore_pending_sends_from_mempool(active_pending, utxos, &mempool, now_secs) {
@@ -3098,18 +3629,19 @@ fn reconcile_pending_and_reserved_state(
                 reserved_inputs,
                 utxos,
                 active_pending,
-                &mempool_reserved,
+                &protected_reserved,
                 now_secs,
             ) {
                 state_changed = true;
             }
             if state_changed {
-                if let Err(e) = persist_runtime_full_state(
+                if let Err(e) = persist_runtime_full_state_with_recovery(
                     wallet_path,
                     utxos,
                     cur_h,
                     active_pending,
                     reserved_inputs,
+                    recovery_to_persist.as_ref(),
                 ) {
                     wwlog!(
                         "wallet_rpc: pending_reserved_reconcile_persist_failed wallet={} err={}",
@@ -3120,7 +3652,7 @@ fn reconcile_pending_and_reserved_state(
             }
             reserved_outpoints = pending_reserved_outpoints(active_pending);
             reserved_outpoints.extend(explicit_reserved_outpoints(reserved_inputs));
-            reserved_outpoints.extend(mempool_reserved);
+            reserved_outpoints.extend(protected_reserved);
         }
         None => {}
     }
@@ -3160,7 +3692,16 @@ fn sync_pending_txs_with_chain_and_mempool(
     wallet_path: &str,
     wallet_addrs: &[String],
     pending_txs: &mut Vec<super::PendingTx>,
-    confirmed: &[(String, i64, i64, String, i64, i64, bool, Vec<serde_json::Value>)],
+    confirmed: &[(
+        String,
+        i64,
+        i64,
+        String,
+        i64,
+        i64,
+        bool,
+        Vec<serde_json::Value>,
+    )],
     daemon_rpc_port: u16,
 ) {
     let mut changed = prune_confirmed_pending_txs(pending_txs, confirmed);
@@ -3168,13 +3709,11 @@ fn sync_pending_txs_with_chain_and_mempool(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-            if let Ok((_, mempool_txids, _)) = daemon_mempool_state(daemon_rpc_port) {
+    if let Ok((_, mempool_txids, _)) = daemon_mempool_state(daemon_rpc_port) {
         let needs_chain_probe =
             pending_chain_probe_required(wallet_addrs, pending_txs, &mempool_txids);
         if needs_chain_probe {
-            if let Ok(scan) =
-                scan_wallet_txs_via_blocks_from(wallet_addrs, daemon_rpc_port)
-            {
+            if let Ok(scan) = scan_wallet_txs_via_blocks_from(wallet_addrs, daemon_rpc_port) {
                 if prune_confirmed_pending_txs(pending_txs, &scan.txs) {
                     changed = true;
                 }
@@ -3192,7 +3731,11 @@ fn sync_pending_txs_with_chain_and_mempool(
             }
         }
         if let Err(e) = super::save_wallet_pending_txs(wallet_path, pending_txs) {
-            wwlog!("wallet_rpc: pending_txs_prune_persist_failed wallet={} err={}", wallet_public_name(wallet_path), e);
+            wwlog!(
+                "wallet_rpc: pending_txs_prune_persist_failed wallet={} err={}",
+                wallet_public_name(wallet_path),
+                e
+            );
         }
     }
 }
@@ -3328,6 +3871,52 @@ fn record_pending_send_many(
     }
 }
 
+fn normalized_sendmany_recipients(recipients: &[(String, i64)]) -> Vec<(String, i64)> {
+    let mut normalized = recipients
+        .iter()
+        .map(|(addr, amount)| (addr.clone(), *amount))
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized
+}
+
+fn pending_send_recipients(pending: &super::PendingTx) -> Vec<(String, i64)> {
+    let mut recipients = pending
+        .details
+        .iter()
+        .filter(|entry| entry.get("category").and_then(|v| v.as_str()) == Some("send"))
+        .filter_map(|entry| {
+            let addr = entry.get("address").and_then(|v| v.as_str())?;
+            let amount = entry
+                .get("amount_dut")
+                .and_then(|v| v.as_i64())
+                .or_else(|| {
+                    entry.get("amount").and_then(|v| v.as_str()).and_then(|s| {
+                        parse_duta_to_dut_i64(s).ok()
+                    })
+                })?;
+            Some((addr.to_string(), amount.saturating_abs()))
+        })
+        .collect::<Vec<_>>();
+    recipients.sort();
+    recipients
+}
+
+fn duplicate_pending_sendmany_txid(
+    pending_txs: &[super::PendingTx],
+    recipients: &[(String, i64)],
+) -> Option<String> {
+    let requested = normalized_sendmany_recipients(recipients);
+    pending_txs
+        .iter()
+        .find(|pending| {
+            pending.category == "send"
+                && !pending.txid.is_empty()
+                && pending_send_recipients(pending) == requested
+        })
+        .map(|pending| pending.txid.clone())
+}
+
 fn amount_detail_json(category: &str, address: &str, amount_dut: i64) -> serde_json::Value {
     json!({
         "category": category,
@@ -3345,11 +3934,16 @@ fn normalize_history_details(details: &[serde_json::Value]) -> Vec<serde_json::V
     details
         .iter()
         .map(|detail| {
-            let category = detail.get("category").and_then(|x| x.as_str()).unwrap_or("tx");
+            let category = detail
+                .get("category")
+                .and_then(|x| x.as_str())
+                .unwrap_or("tx");
             let address = detail.get("address").and_then(|x| x.as_str()).unwrap_or("");
-            let amount_dut = detail.get("amount_dut").and_then(|x| x.as_i64()).or_else(|| {
-                detail.get("amount").and_then(|x| x.as_i64())
-            }).unwrap_or(0);
+            let amount_dut = detail
+                .get("amount_dut")
+                .and_then(|x| x.as_i64())
+                .or_else(|| detail.get("amount").and_then(|x| x.as_i64()))
+                .unwrap_or(0);
             let mut out = detail.clone();
             if let Some(obj) = out.as_object_mut() {
                 obj.insert("amount".to_string(), json!(format_dut_i64(amount_dut)));
@@ -3523,7 +4117,11 @@ fn sync_wallet_utxos_via_blocks_from(
     Ok((cur_h, utxos))
 }
 
-fn wallet_needs_full_utxo_rebuild(utxos: &[super::Utxo], cur_h: i64, last_sync_height: i64) -> bool {
+fn wallet_needs_full_utxo_rebuild(
+    utxos: &[super::Utxo],
+    cur_h: i64,
+    last_sync_height: i64,
+) -> bool {
     if cur_h <= 0 {
         return !utxos.is_empty() || last_sync_height > 0;
     }
@@ -3597,7 +4195,16 @@ fn classify_wallet_history_tx(
     height: i64,
     block_time: i64,
     txv: &serde_json::Value,
-) -> Option<(String, i64, i64, String, i64, i64, bool, Vec<serde_json::Value>)> {
+) -> Option<(
+    String,
+    i64,
+    i64,
+    String,
+    i64,
+    i64,
+    bool,
+    Vec<serde_json::Value>,
+)> {
     let vin = txv
         .get("vin")
         .and_then(|x| x.as_array())
@@ -3682,8 +4289,16 @@ fn scan_wallet_txs_via_blocks_from(
     let addr_set: HashSet<&str> = addrs.iter().map(|s| s.as_str()).collect();
     let cur_h = daemon_tip_height_with_retry(daemon_rpc_port, 0)?;
 
-    let mut out: Vec<(String, i64, i64, String, i64, i64, bool, Vec<serde_json::Value>)> =
-        Vec::new();
+    let mut out: Vec<(
+        String,
+        i64,
+        i64,
+        String,
+        i64,
+        i64,
+        bool,
+        Vec<serde_json::Value>,
+    )> = Vec::new();
     let mut from: i64 = 0;
     let limit: i64 = 256;
     let mut truncated = false;
@@ -3731,7 +4346,8 @@ fn scan_wallet_txs_via_blocks_from(
             };
 
             for (txid, txv) in tx_map.iter() {
-                if let Some(entry) = classify_wallet_history_tx(&addr_set, txid, bh, block_time, txv)
+                if let Some(entry) =
+                    classify_wallet_history_tx(&addr_set, txid, bh, block_time, txv)
                 {
                     out.push(entry);
                 }
@@ -3881,8 +4497,7 @@ fn txid_from_value(v: &serde_json::Value) -> Result<String, String> {
 
 fn relay_fee_for_tx_bytes(tx_bytes: usize) -> i64 {
     let kb = (tx_bytes.saturating_add(999) / 1000).max(1);
-    i64::try_from((kb as u64).saturating_mul(DEFAULT_MIN_RELAY_FEE_PER_KB_DUT))
-        .unwrap_or(i64::MAX)
+    i64::try_from((kb as u64).saturating_mul(DEFAULT_MIN_RELAY_FEE_PER_KB_DUT)).unwrap_or(i64::MAX)
 }
 
 #[derive(serde::Deserialize)]
@@ -4054,9 +4669,7 @@ fn parse_sendmany_recipients(
     Ok((recipients, total_amount))
 }
 
-fn wallet_signers_by_pkh(
-    ws: &super::WalletState,
-) -> Result<HashMap<String, WalletSigner>, String> {
+fn wallet_signers_by_pkh(ws: &super::WalletState) -> Result<HashMap<String, WalletSigner>, String> {
     let mut out = HashMap::new();
     let addrs: Vec<String> = if !ws.pubkeys.is_empty() {
         ws.pubkeys.keys().cloned().collect()
@@ -4077,11 +4690,7 @@ fn wallet_signers_by_pkh(
         ent.copy_from_slice(&sk_b);
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&ent);
         let derived_pub_hex = hex::encode(signing_key.verifying_key().to_bytes());
-        let pub_hex = ws
-            .pubkeys
-            .get(&addr)
-            .cloned()
-            .unwrap_or(derived_pub_hex);
+        let pub_hex = ws.pubkeys.get(&addr).cloned().unwrap_or(derived_pub_hex);
         let pub_b = hex::decode(&pub_hex).map_err(|_| format!("wallet_pubkey_invalid:{addr}"))?;
         let pkh_hex = duta_core::address::pkh_to_hex(&duta_core::address::pkh_from_pubkey(&pub_b));
         out.insert(
@@ -4122,11 +4731,7 @@ fn wallet_signers_by_addr(
         ent.copy_from_slice(&sk_b);
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&ent);
         let derived_pub_hex = hex::encode(signing_key.verifying_key().to_bytes());
-        let pub_hex = ws
-            .pubkeys
-            .get(&addr)
-            .cloned()
-            .unwrap_or(derived_pub_hex);
+        let pub_hex = ws.pubkeys.get(&addr).cloned().unwrap_or(derived_pub_hex);
         out.insert(
             addr.clone(),
             WalletSigner {
@@ -4299,8 +4904,12 @@ fn daemon_tip_height_with_retry_opts(
     attempts: usize,
 ) -> Result<i64, String> {
     for attempt in 0..attempts.max(1) {
-        let tip_body =
-            super::http_get_local_with_deadline("127.0.0.1", daemon_rpc_port, "/tip", deadline_secs)?;
+        let tip_body = super::http_get_local_with_deadline(
+            "127.0.0.1",
+            daemon_rpc_port,
+            "/tip",
+            deadline_secs,
+        )?;
         let tip_v: serde_json::Value =
             serde_json::from_str(&tip_body).map_err(|e| format!("tip_invalid_json: {}", e))?;
 
@@ -4308,8 +4917,7 @@ fn daemon_tip_height_with_retry_opts(
             return Ok(height);
         }
 
-        let is_rate_limited =
-            tip_v.get("error").and_then(|x| x.as_str()) == Some("rate_limited");
+        let is_rate_limited = tip_v.get("error").and_then(|x| x.as_str()) == Some("rate_limited");
         if is_rate_limited {
             let retry_secs = tip_v
                 .get("retry_after_secs")
@@ -4375,6 +4983,17 @@ struct WalletBalanceSnapshot {
     pending_txs: usize,
 }
 
+fn populate_info_wallet_state_fields(body: &mut serde_json::Value) {
+    let g = super::wallet_lock_or_recover();
+    if let Some(ws) = g.as_ref() {
+        body["wallet_locked"] = json!(ws.is_db && ws.locked);
+        body["wallet_unlocked"] = json!(!(ws.is_db && ws.locked));
+        body["last_sync_height"] = json!(ws.last_sync_height);
+        body["next_index"] = json!(ws.next_index);
+        body["reserved_inputs"] = json!(ws.reserved_inputs.len());
+    }
+}
+
 fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<WalletBalanceSnapshot, String> {
     // Snapshot wallet state (avoid holding lock during daemon RPC).
     let (wallet_path, addrs, mut utxos, pending_txs, mut reserved_inputs, last_sync_height) = {
@@ -4385,7 +5004,7 @@ fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<WalletBalanceSnapshot
             if !ws.pubkeys.is_empty() {
                 ws.pubkeys.keys().cloned().collect::<Vec<String>>()
             } else {
-                    ws.keys.keys().cloned().collect::<Vec<String>>()
+                ws.keys.keys().cloned().collect::<Vec<String>>()
             },
             ws.utxos.clone(),
             ws.pending_txs.clone(),
@@ -4503,6 +5122,56 @@ fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<WalletBalanceSnapshot
     })
 }
 
+fn wallet_info_response_body(rpc_addr: &str, daemon_rpc_port: u16, net: &str) -> serde_json::Value {
+    let wallet_open = {
+        let g = super::wallet_lock_or_recover();
+        g.is_some()
+    };
+    let mut body = json!({
+        "net": net,
+        "wallet_rpc": format!("http://{}", rpc_addr),
+        "version": env!("CARGO_PKG_VERSION"),
+        "wallet_open": wallet_open,
+    });
+
+    if wallet_open {
+        populate_info_wallet_state_fields(&mut body);
+        match wallet_balance_snapshot(daemon_rpc_port) {
+            Ok(snapshot) => {
+                body["balance"] = amount_json_value(snapshot.balance_dut);
+                body["balance_dut"] = json!(snapshot.balance_dut);
+                body["spendable"] = amount_json_value(snapshot.spendable_dut);
+                body["spendable_dut"] = json!(snapshot.spendable_dut);
+                body["immature"] = amount_json_value(snapshot.immature_dut);
+                body["immature_dut"] = json!(snapshot.immature_dut);
+                body["reserved"] = amount_json_value(snapshot.reserved_dut);
+                body["reserved_dut"] = json!(snapshot.reserved_dut);
+                body["pending_send"] = amount_json_value(snapshot.pending_send_dut);
+                body["pending_send_dut"] = json!(snapshot.pending_send_dut);
+                body["pending_change"] = amount_json_value(snapshot.pending_change_dut);
+                body["pending_change_dut"] = json!(snapshot.pending_change_dut);
+                body["pending_txs"] = json!(snapshot.pending_txs);
+                body["height"] = json!(snapshot.height);
+                body["utxos"] = json!(snapshot.utxos);
+                body["unit"] = json!(DISPLAY_UNIT);
+                body["display_unit"] = json!(DISPLAY_UNIT);
+                body["base_unit"] = json!(BASE_UNIT);
+                body["decimals"] = json!(DUTA_DECIMALS);
+                populate_info_wallet_state_fields(&mut body);
+            }
+            Err(e) => {
+                populate_info_wallet_state_fields(&mut body);
+                body["wallet_state_refresh_error"] = json!(wallet_refresh_error_code(&e));
+                body["backend_status"] =
+                    json!(wallet_backend_status(wallet_refresh_error_code(&e), &e));
+                body["wallet_state_refresh_detail"] = json!(e);
+            }
+        }
+    }
+
+    body
+}
+
 pub(crate) fn handle_request(
     mut request: tiny_http::Request,
     rpc_addr: &str,
@@ -4605,61 +5274,7 @@ pub(crate) fn handle_request(
             if request.method() != &tiny_http::Method::Get {
                 respond_method_not_allowed(request);
             } else {
-                let g = super::wallet_lock_or_recover();
-                let wallet_open = g.is_some();
-                drop(g);
-
-                let mut body = json!({
-                    "net": net,
-                    "wallet_rpc": format!("http://{}", rpc_addr),
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "wallet_open": wallet_open,
-                });
-
-                if wallet_open {
-                    let g = super::wallet_lock_or_recover();
-                    if let Some(ws) = g.as_ref() {
-                        body["wallet_locked"] = json!(ws.is_db && ws.locked);
-                        body["wallet_unlocked"] = json!(!(ws.is_db && ws.locked));
-                        body["last_sync_height"] = json!(ws.last_sync_height);
-                        body["next_index"] = json!(ws.next_index);
-                        body["reserved_inputs"] = json!(ws.reserved_inputs.len());
-                    }
-                    drop(g);
-                    match wallet_balance_snapshot(daemon_rpc_port) {
-                        Ok(snapshot) => {
-                            body["balance"] = amount_json_value(snapshot.balance_dut);
-                            body["balance_dut"] = json!(snapshot.balance_dut);
-                            body["spendable"] = amount_json_value(snapshot.spendable_dut);
-                            body["spendable_dut"] = json!(snapshot.spendable_dut);
-                            body["immature"] = amount_json_value(snapshot.immature_dut);
-                            body["immature_dut"] = json!(snapshot.immature_dut);
-                            body["reserved"] = amount_json_value(snapshot.reserved_dut);
-                            body["reserved_dut"] = json!(snapshot.reserved_dut);
-                            body["pending_send"] = amount_json_value(snapshot.pending_send_dut);
-                            body["pending_send_dut"] = json!(snapshot.pending_send_dut);
-                            body["pending_change"] = amount_json_value(snapshot.pending_change_dut);
-                            body["pending_change_dut"] = json!(snapshot.pending_change_dut);
-                            body["pending_txs"] = json!(snapshot.pending_txs);
-                            body["height"] = json!(snapshot.height);
-                            body["utxos"] = json!(snapshot.utxos);
-                            body["unit"] = json!(DISPLAY_UNIT);
-                            body["display_unit"] = json!(DISPLAY_UNIT);
-                            body["base_unit"] = json!(BASE_UNIT);
-                            body["decimals"] = json!(DUTA_DECIMALS);
-                        }
-                        Err(e) => {
-                            body["wallet_state_refresh_error"] =
-                                json!(wallet_refresh_error_code(&e));
-                            body["backend_status"] = json!(wallet_backend_status(
-                                wallet_refresh_error_code(&e),
-                                &e
-                            ));
-                            body["wallet_state_refresh_detail"] = json!(e);
-                        }
-                    }
-                }
-
+                let body = wallet_info_response_body(rpc_addr, daemon_rpc_port, net);
                 super::respond_json(request, tiny_http::StatusCode(200), body.to_string());
             }
         }
@@ -4810,8 +5425,7 @@ pub(crate) fn handle_request(
                         .to_string();
                     match super::load_wallet_from_path(&wallet_path) {
                         Ok(mut ws) => {
-                            let passphrase =
-                                params.get(1).and_then(|x| x.as_str()).unwrap_or("");
+                            let passphrase = params.get(1).and_then(|x| x.as_str()).unwrap_or("");
                             if !passphrase.is_empty() {
                                 if let Err(e) = unlock_db_wallet_state(&mut ws, passphrase) {
                                     super::respond_json(
@@ -4845,18 +5459,17 @@ pub(crate) fn handle_request(
                 }
 
                 "getwalletinfo" => {
-                    let snapshot =
-                        match wallet_balance_snapshot(daemon_rpc_port) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                super::respond_json(
-                                    request,
-                                    tiny_http::StatusCode(400),
-                                    rpc_response_refresh_err(id, -18, &e),
-                                );
-                                return;
-                            }
-                        };
+                    let snapshot = match wallet_balance_snapshot(daemon_rpc_port) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            super::respond_json(
+                                request,
+                                tiny_http::StatusCode(400),
+                                rpc_response_refresh_err(id, -18, &e),
+                            );
+                            return;
+                        }
+                    };
 
                     let (wallet_path, unlocked, unlocked_until, keypoolsize, addrs, pending_txs) = {
                         let g = super::wallet_lock_or_recover();
@@ -4892,7 +5505,8 @@ pub(crate) fn handle_request(
                         )
                     };
 
-                    let history_scan = scan_wallet_txs_via_blocks_from(&addrs, daemon_rpc_port).ok();
+                    let history_scan =
+                        scan_wallet_txs_via_blocks_from(&addrs, daemon_rpc_port).ok();
                     let txcount = history_scan
                         .as_ref()
                         .filter(|scan| !scan.truncated)
@@ -5001,36 +5615,38 @@ pub(crate) fn handle_request(
                 }
 
                 "getbalance" => {
-                    let snapshot =
-                        match wallet_balance_snapshot(daemon_rpc_port) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                super::respond_json(
-                                    request,
-                                    tiny_http::StatusCode(400),
-                                    rpc_response_refresh_err(id, -18, &e),
-                                );
-                                return;
-                            }
-                        };
+                    let snapshot = match wallet_balance_snapshot(daemon_rpc_port) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            super::respond_json(
+                                request,
+                                tiny_http::StatusCode(400),
+                                rpc_response_refresh_err(id, -18, &e),
+                            );
+                            return;
+                        }
+                    };
                     super::respond_json(
                         request,
                         tiny_http::StatusCode(200),
-                        rpc_response_ok(id, json!({
-                            "amount": format_dut_i64(snapshot.spendable_dut),
-                            "amount_dut": snapshot.spendable_dut,
-                            "reserved": format_dut_i64(snapshot.reserved_dut),
-                            "reserved_dut": snapshot.reserved_dut,
-                            "pending_send": format_dut_i64(snapshot.pending_send_dut),
-                            "pending_send_dut": snapshot.pending_send_dut,
-                            "pending_change": format_dut_i64(snapshot.pending_change_dut),
-                            "pending_change_dut": snapshot.pending_change_dut,
-                            "pending_txs": snapshot.pending_txs,
-                            "unit": DISPLAY_UNIT,
-                            "display_unit": DISPLAY_UNIT,
-                            "base_unit": BASE_UNIT,
-                            "decimals": DUTA_DECIMALS
-                        })),
+                        rpc_response_ok(
+                            id,
+                            json!({
+                                "amount": format_dut_i64(snapshot.spendable_dut),
+                                "amount_dut": snapshot.spendable_dut,
+                                "reserved": format_dut_i64(snapshot.reserved_dut),
+                                "reserved_dut": snapshot.reserved_dut,
+                                "pending_send": format_dut_i64(snapshot.pending_send_dut),
+                                "pending_send_dut": snapshot.pending_send_dut,
+                                "pending_change": format_dut_i64(snapshot.pending_change_dut),
+                                "pending_change_dut": snapshot.pending_change_dut,
+                                "pending_txs": snapshot.pending_txs,
+                                "unit": DISPLAY_UNIT,
+                                "display_unit": DISPLAY_UNIT,
+                                "base_unit": BASE_UNIT,
+                                "decimals": DUTA_DECIMALS
+                            }),
+                        ),
                     );
                 }
 
@@ -5105,18 +5721,17 @@ pub(crate) fn handle_request(
                     // params: [minconf] (optional)
                     let minconf: i64 = params.get(0).and_then(|x| x.as_i64()).unwrap_or(0);
 
-                    let snapshot =
-                        match wallet_balance_snapshot(daemon_rpc_port) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                super::respond_json(
-                                    request,
-                                    tiny_http::StatusCode(400),
-                                    rpc_response_refresh_err(id, -18, &e),
-                                );
-                                return;
-                            }
-                        };
+                    let snapshot = match wallet_balance_snapshot(daemon_rpc_port) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            super::respond_json(
+                                request,
+                                tiny_http::StatusCode(400),
+                                rpc_response_refresh_err(id, -18, &e),
+                            );
+                            return;
+                        }
+                    };
                     let (wallet_path, cur_h, utxos, pending_txs) = {
                         let g = super::wallet_lock_or_recover();
                         let ws = match g.as_ref() {
@@ -5143,16 +5758,26 @@ pub(crate) fn handle_request(
                         .as_secs() as i64;
                     let mut active_pending = pending_txs;
                     let mut reserved_outpoints = pending_reserved_outpoints(&active_pending);
-                    match pending_mempool_state_or_err(&wallet_path, &active_pending, daemon_rpc_port) {
+                    match pending_mempool_state_or_err(
+                        &wallet_path,
+                        &active_pending,
+                        daemon_rpc_port,
+                    ) {
                         Ok(Some((_, mempool_txids, mempool_reserved))) => {
-                            if prune_inactive_pending_txs(&mut active_pending, &mempool_txids, now_secs) {
+                            if prune_inactive_pending_txs(
+                                &mut active_pending,
+                                &mempool_txids,
+                                now_secs,
+                            ) {
                                 {
                                     let mut g = super::wallet_lock_or_recover();
                                     if let Some(ws) = g.as_mut() {
                                         ws.pending_txs = active_pending.clone();
                                     }
                                 }
-                                if let Err(e) = super::save_wallet_pending_txs(&wallet_path, &active_pending) {
+                                if let Err(e) =
+                                    super::save_wallet_pending_txs(&wallet_path, &active_pending)
+                                {
                                     wwlog!(
                                         "wallet_rpc: pending_txs_mempool_prune_persist_failed wallet={} err={}",
                                         wallet_public_name(&wallet_path),
@@ -5252,18 +5877,17 @@ pub(crate) fn handle_request(
                         (ws.wallet_path.clone(), addrs, ws.pending_txs.clone())
                     };
 
-                    let scan =
-                        match scan_wallet_txs_via_blocks_from(&addrs, daemon_rpc_port) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                super::respond_json(
-                                    request,
-                                    tiny_http::StatusCode(502),
-                                    rpc_response_err(id, -32603, &e),
-                                );
-                                return;
-                            }
-                        };
+                    let scan = match scan_wallet_txs_via_blocks_from(&addrs, daemon_rpc_port) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            super::respond_json(
+                                request,
+                                tiny_http::StatusCode(502),
+                                rpc_response_err(id, -32603, &e),
+                            );
+                            return;
+                        }
+                    };
                     if scan.truncated {
                         super::respond_json(
                             request,
@@ -5373,18 +5997,17 @@ pub(crate) fn handle_request(
                         (ws.wallet_path.clone(), addrs, ws.pending_txs.clone())
                     };
 
-                    let scan =
-                        match scan_wallet_txs_via_blocks_from(&addrs, daemon_rpc_port) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                super::respond_json(
-                                    request,
-                                    tiny_http::StatusCode(502),
-                                    rpc_response_err(id, -32603, &e),
-                                );
-                                return;
-                            }
-                        };
+                    let scan = match scan_wallet_txs_via_blocks_from(&addrs, daemon_rpc_port) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            super::respond_json(
+                                request,
+                                tiny_http::StatusCode(502),
+                                rpc_response_err(id, -32603, &e),
+                            );
+                            return;
+                        }
+                    };
                     if scan.truncated {
                         super::respond_json(
                             request,
@@ -5409,8 +6032,15 @@ pub(crate) fn handle_request(
                     );
                     let txs = merge_pending_wallet_txs(txs, &pending_txs);
 
-                    let mut found: Option<(i64, i64, String, i64, i64, bool, Vec<serde_json::Value>)> =
-                        None;
+                    let mut found: Option<(
+                        i64,
+                        i64,
+                        String,
+                        i64,
+                        i64,
+                        bool,
+                        Vec<serde_json::Value>,
+                    )> = None;
                     for (t, h, block_time, category, amt, fee, cb, details) in txs.into_iter() {
                         if t == txid {
                             found = Some((h, block_time, category, amt, fee, cb, details));
@@ -5654,8 +6284,12 @@ pub(crate) fn handle_request(
                         }
                     };
                     utxos = new_utxos;
-                    let _ =
-                        persist_runtime_reserved_inputs(&wallet_path, &utxos, cur_h, &reserved_inputs);
+                    let _ = persist_runtime_reserved_inputs(
+                        &wallet_path,
+                        &utxos,
+                        cur_h,
+                        &reserved_inputs,
+                    );
 
                     let mut active_pending = pending_txs.clone();
                     let mut reserved_inputs = reserved_inputs;
@@ -5911,7 +6545,12 @@ pub(crate) fn handle_request(
                         }
                     };
                     utxos = new_utxos;
-                    let _ = persist_runtime_reserved_inputs(&wallet_path, &utxos, cur_h, &reserved_inputs);
+                    let _ = persist_runtime_reserved_inputs(
+                        &wallet_path,
+                        &utxos,
+                        cur_h,
+                        &reserved_inputs,
+                    );
                     let mut active_pending = pending_txs.clone();
                     let mut reserved_inputs = reserved_inputs;
                     let reserved_outpoints = match reconcile_pending_and_reserved_state(
@@ -6113,22 +6752,23 @@ pub(crate) fn handle_request(
                     let to_addr = to.to_string();
 
                     // Validate amount / fee.
-                    let amount = match parse_required_amount_param(req.amount.as_ref(), req.amount_dut) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let message = if e == "missing_amount" {
-                                "missing_amount"
-                            } else {
-                                "invalid_amount"
-                            };
-                            super::respond_json(
-                                request,
-                                tiny_http::StatusCode(400),
-                                rpc_response_err(id, -32602, message),
-                            );
-                            return;
-                        }
-                    };
+                    let amount =
+                        match parse_required_amount_param(req.amount.as_ref(), req.amount_dut) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let message = if e == "missing_amount" {
+                                    "missing_amount"
+                                } else {
+                                    "invalid_amount"
+                                };
+                                super::respond_json(
+                                    request,
+                                    tiny_http::StatusCode(400),
+                                    rpc_response_err(id, -32602, message),
+                                );
+                                return;
+                            }
+                        };
                     if amount <= 0 {
                         super::respond_json(
                             request,
@@ -6138,7 +6778,8 @@ pub(crate) fn handle_request(
                         );
                         return;
                     }
-                    let fee_in: i64 = match parse_optional_fee_param(req.fee.as_ref(), req.fee_dut) {
+                    let fee_in: i64 = match parse_optional_fee_param(req.fee.as_ref(), req.fee_dut)
+                    {
                         Ok(v) => v,
                         Err(_) => {
                             super::respond_json(
@@ -6165,7 +6806,7 @@ pub(crate) fn handle_request(
                         super::respond_json(
                             request,
                             tiny_http::StatusCode(400),
-                    fee_too_high_body(fee, MAX_FEE).to_string(),
+                            fee_too_high_body(fee, MAX_FEE).to_string(),
                         );
                         return;
                     }
@@ -6173,19 +6814,19 @@ pub(crate) fn handle_request(
                     let _send_guard = wallet_send_lock_or_recover();
 
                     // Snapshot wallet state.
-            let (
-                wallet_path,
-                change_addr,
-                addrs,
-                signers_by_pkh,
-                signers_by_addr,
-                utxos,
-                pending_txs,
-                reserved_inputs,
-                last_sync_height,
-            ) = {
-                let g = super::wallet_lock_or_recover();
-                let ws = match g.as_ref() {
+                    let (
+                        wallet_path,
+                        change_addr,
+                        addrs,
+                        signers_by_pkh,
+                        signers_by_addr,
+                        utxos,
+                        pending_txs,
+                        reserved_inputs,
+                        last_sync_height,
+                    ) = {
+                        let g = super::wallet_lock_or_recover();
+                        let ws = match g.as_ref() {
                             Some(w) => w,
                             None => {
                                 super::respond_json(
@@ -6224,7 +6865,8 @@ pub(crate) fn handle_request(
                                     super::respond_json(
                                         request,
                                         tiny_http::StatusCode(500),
-                                        json!({"error":"wallet_key_missing","detail":e}).to_string(),
+                                        json!({"error":"wallet_key_missing","detail":e})
+                                            .to_string(),
                                     );
                                     return;
                                 }
@@ -6235,7 +6877,8 @@ pub(crate) fn handle_request(
                                     super::respond_json(
                                         request,
                                         tiny_http::StatusCode(500),
-                                        json!({"error":"wallet_key_missing","detail":e}).to_string(),
+                                        json!({"error":"wallet_key_missing","detail":e})
+                                            .to_string(),
                                     );
                                     return;
                                 }
@@ -6267,7 +6910,8 @@ pub(crate) fn handle_request(
                             super::respond_json(
                                 request,
                                 tiny_http::StatusCode(502),
-                                json!({"error":"wallet_state_refresh_failed","detail":e}).to_string(),
+                                json!({"error":"wallet_state_refresh_failed","detail":e})
+                                    .to_string(),
                             );
                             return;
                         }
@@ -6319,7 +6963,8 @@ pub(crate) fn handle_request(
                             super::respond_json(
                                 request,
                                 tiny_http::StatusCode(502),
-                                json!({"error":"daemon_mempool_unreachable","detail":e}).to_string(),
+                                json!({"error":"daemon_mempool_unreachable","detail":e})
+                                    .to_string(),
                             );
                             return;
                         }
@@ -6416,8 +7061,10 @@ pub(crate) fn handle_request(
                                 return;
                             }
                         };
-                    let pre_submit_conflicts =
-                        selected_inputs_conflict_with_reserved(&selected, &mempool_reserved_pre_submit);
+                    let pre_submit_conflicts = selected_inputs_conflict_with_reserved(
+                        &selected,
+                        &mempool_reserved_pre_submit,
+                    );
                     if !pre_submit_conflicts.is_empty() {
                         if let Err(e) = refresh_wallet_utxos_after_submit_conflict(
                             &wallet_path,
@@ -6507,7 +7154,8 @@ pub(crate) fn handle_request(
                                     super::respond_json(
                                         request,
                                         tiny_http::StatusCode(500),
-                                        json!({"error":"wallet_key_invalid","detail":"sk_hex"}).to_string(),
+                                        json!({"error":"wallet_key_invalid","detail":"sk_hex"})
+                                            .to_string(),
                                     );
                                     return;
                                 }
@@ -6516,7 +7164,8 @@ pub(crate) fn handle_request(
                                 super::respond_json(
                                     request,
                                     tiny_http::StatusCode(500),
-                                    json!({"error":"wallet_key_invalid","detail":"sk_len"}).to_string(),
+                                    json!({"error":"wallet_key_invalid","detail":"sk_len"})
+                                        .to_string(),
                                 );
                                 return;
                             }
@@ -7043,23 +7692,19 @@ pub(crate) fn handle_request(
                 new_wallet_keypair_from_seed(net_from_name(net), &seed, 0);
 
             // Store seed + keys encrypted in SQLite wallet.db (locked-by-default at open).
-            let db = match super::walletdb::WalletDb::create_new(
-                &wallet_path,
-                &passphrase,
-                &seed,
-                1,
-            ) {
-                Ok(d) => d,
-                Err(e) => {
-                    super::respond_json(
-                        request,
-                        tiny_http::StatusCode(500),
-                        json!({"ok":false,"error":"wallet_create_failed","detail":e})
-                            .to_string(),
-                    );
-                    return;
-                }
-            };
+            let db =
+                match super::walletdb::WalletDb::create_new(&wallet_path, &passphrase, &seed, 1) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        super::respond_json(
+                            request,
+                            tiny_http::StatusCode(500),
+                            json!({"ok":false,"error":"wallet_create_failed","detail":e})
+                                .to_string(),
+                        );
+                        return;
+                    }
+                };
 
             let sk_b = match hex::decode(&sk_hex) {
                 Ok(b) => b,
@@ -7077,8 +7722,7 @@ pub(crate) fn handle_request(
                 super::respond_json(
                     request,
                     tiny_http::StatusCode(500),
-                    json!({"error":"wallet_create_failed","detail":"sk_len_invalid"})
-                        .to_string(),
+                    json!({"error":"wallet_create_failed","detail":"sk_len_invalid"}).to_string(),
                 );
                 return;
             }
@@ -7482,22 +8126,21 @@ pub(crate) fn handle_request(
                 respond_method_not_allowed(request);
                 return;
             }
-            let snapshot =
-                match wallet_balance_snapshot(daemon_rpc_port) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        respond_http_error_detail(
-                            request,
-                            tiny_http::StatusCode(502),
-                            wallet_refresh_error_code(&e),
-                            e,
-                        );
-                            return;
-                        }
-                    };
-                    super::respond_json(
+            let snapshot = match wallet_balance_snapshot(daemon_rpc_port) {
+                Ok(t) => t,
+                Err(e) => {
+                    respond_http_error_detail(
                         request,
-                        tiny_http::StatusCode(200),
+                        tiny_http::StatusCode(502),
+                        wallet_refresh_error_code(&e),
+                        e,
+                    );
+                    return;
+                }
+            };
+            super::respond_json(
+                request,
+                tiny_http::StatusCode(200),
                 json!({
                     "balance": format_dut_i64(snapshot.balance_dut),
                     "balance_dut": snapshot.balance_dut,
@@ -8379,8 +9022,7 @@ pub(crate) fn handle_request(
                     super::respond_json(
                         request,
                         tiny_http::StatusCode(400),
-                        json!({"ok":false,"error":"wallet_unlock_failed","detail":e})
-                            .to_string(),
+                        json!({"ok":false,"error":"wallet_unlock_failed","detail":e}).to_string(),
                     );
                     return;
                 }
@@ -8568,8 +9210,7 @@ pub(crate) fn handle_request(
                 .map(|u| u.value)
                 .collect();
             let spendable_balance_dut: i64 = spendable_values.iter().sum();
-            let pending_stats =
-                pending_balance_stats(&utxos, &reserved_outpoints, &active_pending);
+            let pending_stats = pending_balance_stats(&utxos, &reserved_outpoints, &active_pending);
             let plan = simulate_send_plan(
                 &spendable_values,
                 need,
@@ -8617,7 +9258,8 @@ pub(crate) fn handle_request(
                     "display_unit": DISPLAY_UNIT,
                     "base_unit": BASE_UNIT,
                     "decimals": DUTA_DECIMALS
-                }).to_string(),
+                })
+                .to_string(),
             );
         }
 
@@ -8697,7 +9339,17 @@ pub(crate) fn handle_request(
                 }
             };
 
-            let (wallet_path, change_addr, addrs, signers_by_pkh, signers_by_addr, mut utxos, pending_txs, reserved_inputs, last_sync_height) = {
+            let (
+                wallet_path,
+                change_addr,
+                addrs,
+                signers_by_pkh,
+                signers_by_addr,
+                mut utxos,
+                pending_txs,
+                reserved_inputs,
+                last_sync_height,
+            ) = {
                 let g = super::wallet_lock_or_recover();
                 let ws = match g.as_ref() {
                     Some(w) => w,
@@ -8815,6 +9467,21 @@ pub(crate) fn handle_request(
                     return;
                 }
             };
+            if let Some(existing_txid) = duplicate_pending_sendmany_txid(&active_pending, &recipients)
+            {
+                super::respond_json(
+                    request,
+                    tiny_http::StatusCode(409),
+                    json!({
+                        "ok": false,
+                        "error": "duplicate_pending_sendmany",
+                        "detail": "identical_sendmany_request_already_pending",
+                        "txid": existing_txid,
+                    })
+                    .to_string(),
+                );
+                return;
+            }
 
             let mut spendable_utxos: Vec<OwnedInput> = Vec::new();
             for utxo in utxos
@@ -8824,12 +9491,8 @@ pub(crate) fn handle_request(
                 .filter(|u| !reserved_outpoints.contains(&(u.txid.clone(), u.vout)))
                 .filter(|u| is_wallet_utxo_spendable(u, cur_h))
             {
-                match resolve_owned_input(
-                    daemon_rpc_port,
-                    utxo,
-                    &signers_by_pkh,
-                    &signers_by_addr,
-                ) {
+                match resolve_owned_input(daemon_rpc_port, utxo, &signers_by_pkh, &signers_by_addr)
+                {
                     Ok(Some(owned)) => spendable_utxos.push(owned),
                     Ok(None) => {}
                     Err(e) => {
@@ -8940,7 +9603,9 @@ pub(crate) fn handle_request(
                 }
             }
 
-            let need_dut = total_amount.checked_add(final_fee.max(target_fee)).unwrap_or(i64::MAX);
+            let need_dut = total_amount
+                .checked_add(final_fee.max(target_fee))
+                .unwrap_or(i64::MAX);
             super::respond_json(
                 request,
                 tiny_http::StatusCode(200),
@@ -8973,7 +9638,8 @@ pub(crate) fn handle_request(
                     "display_unit": DISPLAY_UNIT,
                     "base_unit": BASE_UNIT,
                     "decimals": DUTA_DECIMALS
-                }).to_string(),
+                })
+                .to_string(),
             );
             return;
         }
@@ -9227,6 +9893,21 @@ pub(crate) fn handle_request(
                     return;
                 }
             };
+            if let Some(existing_txid) = duplicate_pending_sendmany_txid(&active_pending, &recipients)
+            {
+                super::respond_json(
+                    request,
+                    tiny_http::StatusCode(409),
+                    json!({
+                        "ok": false,
+                        "error": "duplicate_pending_sendmany",
+                        "detail": "identical_sendmany_request_already_pending",
+                        "txid": existing_txid,
+                    })
+                    .to_string(),
+                );
+                return;
+            }
 
             let mut spendable_utxos: Vec<OwnedInput> = Vec::new();
             for utxo in utxos
@@ -9236,12 +9917,8 @@ pub(crate) fn handle_request(
                 .filter(|u| !reserved_outpoints.contains(&(u.txid.clone(), u.vout)))
                 .filter(|u| is_wallet_utxo_spendable(u, cur_h))
             {
-                match resolve_owned_input(
-                    daemon_rpc_port,
-                    utxo,
-                    &signers_by_pkh,
-                    &signers_by_addr,
-                ) {
+                match resolve_owned_input(daemon_rpc_port, utxo, &signers_by_pkh, &signers_by_addr)
+                {
                     Ok(Some(owned)) => spendable_utxos.push(owned),
                     Ok(None) => {}
                     Err(e) => {
@@ -9348,17 +10025,13 @@ pub(crate) fn handle_request(
 
                 if fee_supplied {
                     if final_fee < min_relay_fee {
-                        super::respond_json(
-                            request,
-                            tiny_http::StatusCode(422),
-                            {
-                                let mut body = fee_too_low_body(final_fee, min_relay_fee, tx_size);
-                                if let Some(obj) = body.as_object_mut() {
-                                    obj.insert("ok".to_string(), json!(false));
-                                }
-                                body.to_string()
-                            },
-                        );
+                        super::respond_json(request, tiny_http::StatusCode(422), {
+                            let mut body = fee_too_low_body(final_fee, min_relay_fee, tx_size);
+                            if let Some(obj) = body.as_object_mut() {
+                                obj.insert("ok".to_string(), json!(false));
+                            }
+                            body.to_string()
+                        });
                         return;
                     }
                     break;
@@ -9381,7 +10054,8 @@ pub(crate) fn handle_request(
                 super::respond_json(
                     request,
                     tiny_http::StatusCode(500),
-                    json!({"error":"wallet_fee_estimation_failed","detail":"relay_fee_not_stable"}).to_string(),
+                    json!({"error":"wallet_fee_estimation_failed","detail":"relay_fee_not_stable"})
+                        .to_string(),
                 );
                 return;
             }
@@ -9464,7 +10138,8 @@ pub(crate) fn handle_request(
                     super::respond_json(
                         request,
                         tiny_http::StatusCode(500),
-                        json!({"error":"internal","detail":format!("json_encode_failed: {}", e)}).to_string(),
+                        json!({"error":"internal","detail":format!("json_encode_failed: {}", e)})
+                            .to_string(),
                     );
                     return;
                 }
@@ -9517,7 +10192,8 @@ pub(crate) fn handle_request(
                             "error":"daemon_submit_ambiguous",
                             "detail":format!("daemon_invalid_json: {}", e),
                             "txid": recovery.pending_tx.txid
-                        }).to_string(),
+                        })
+                        .to_string(),
                     );
                     return;
                 }
@@ -9628,7 +10304,8 @@ pub(crate) fn handle_request(
                         "change": format_dut_i64(final_change),
                         "change_dut": final_change,
                         "outputs": recipients.len(),
-                    }).to_string(),
+                    })
+                    .to_string(),
                 );
                 return;
             }
@@ -9667,7 +10344,8 @@ pub(crate) fn handle_request(
                     "display_unit": DISPLAY_UNIT,
                     "base_unit": BASE_UNIT,
                     "decimals": DUTA_DECIMALS
-                }).to_string(),
+                })
+                .to_string(),
             );
         }
 
@@ -9914,12 +10592,8 @@ pub(crate) fn handle_request(
                 .filter(|u| !reserved_outpoints.contains(&(u.txid.clone(), u.vout)))
                 .filter(|u| is_wallet_utxo_spendable(u, cur_h))
             {
-                match resolve_owned_input(
-                    daemon_rpc_port,
-                    utxo,
-                    &signers_by_pkh,
-                    &signers_by_addr,
-                ) {
+                match resolve_owned_input(daemon_rpc_port, utxo, &signers_by_pkh, &signers_by_addr)
+                {
                     Ok(Some(owned)) => spendable_utxos.push(owned),
                     Ok(None) => {}
                     Err(e) => {
@@ -9933,8 +10607,7 @@ pub(crate) fn handle_request(
                 }
             }
 
-            let pending_stats =
-                pending_balance_stats(&utxos, &reserved_outpoints, &active_pending);
+            let pending_stats = pending_balance_stats(&utxos, &reserved_outpoints, &active_pending);
             let spendable_utxo_count = utxos
                 .iter()
                 .filter(|u| u.value > 0)
@@ -9978,7 +10651,8 @@ pub(crate) fn handle_request(
                                 reserved_outpoints.len(),
                                 MAX_WALLET_SEND_INPUTS,
                                 &pending_stats,
-                            ).to_string(),
+                            )
+                            .to_string(),
                         );
                         return;
                     }
@@ -10038,17 +10712,13 @@ pub(crate) fn handle_request(
                 tx_size = next_tx_size;
                 if fee_supplied {
                     if final_fee < min_relay_fee {
-                        super::respond_json(
-                            request,
-                            tiny_http::StatusCode(422),
-                            {
-                                let mut body = fee_too_low_body(final_fee, min_relay_fee, tx_size);
-                                if let Some(obj) = body.as_object_mut() {
-                                    obj.insert("ok".to_string(), json!(false));
-                                }
-                                body.to_string()
-                            },
-                        );
+                        super::respond_json(request, tiny_http::StatusCode(422), {
+                            let mut body = fee_too_low_body(final_fee, min_relay_fee, tx_size);
+                            if let Some(obj) = body.as_object_mut() {
+                                obj.insert("ok".to_string(), json!(false));
+                            }
+                            body.to_string()
+                        });
                         return;
                     }
                     break;
@@ -10061,7 +10731,7 @@ pub(crate) fn handle_request(
                     super::respond_json(
                         request,
                         tiny_http::StatusCode(400),
-                    fee_too_high_body(target_fee, MAX_FEE).to_string(),
+                        fee_too_high_body(target_fee, MAX_FEE).to_string(),
                     );
                     return;
                 }
@@ -10253,11 +10923,7 @@ pub(crate) fn handle_request(
                             e
                         );
                     }
-                    super::respond_json(
-                        request,
-                        tiny_http::StatusCode(409),
-                        resp_v.to_string(),
-                    );
+                    super::respond_json(request, tiny_http::StatusCode(409), resp_v.to_string());
                     return;
                 }
                 release_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected);
@@ -10336,61 +11002,61 @@ pub(crate) fn handle_request(
             };
             release_selected_reserved_inputs(&mut reserved_inputs_after_select, &selected);
 
-                    let persist_result = persist_runtime_full_state_with_recovery(
-                        &wallet_path,
-                        &new_utxos,
-                        cur_h,
-                        &pending_after,
-                        &reserved_inputs_after_select,
-                        None,
-                    );
+            let persist_result = persist_runtime_full_state_with_recovery(
+                &wallet_path,
+                &new_utxos,
+                cur_h,
+                &pending_after,
+                &reserved_inputs_after_select,
+                None,
+            );
 
-                    if let Err(e) = persist_result {
-                        wwlog!(
-                            "wallet_rpc: send_state_persist_failed wallet={} txid={} err={}",
-                            wallet_public_name(&wallet_path),
-                            txid,
-                            e
-                        );
-                        super::respond_json(
-                            request,
-                            tiny_http::StatusCode(500),
-                            json!({
-                                "ok": false,
-                                "error": "wallet_state_persist_failed",
-                                "detail": e,
-                                "txid": txid,
-                                "amount": format_dut_i64(amount),
-                                "amount_dut": amount,
-                                "fee": format_dut_i64(final_fee),
-                                "fee_dut": final_fee,
-                                "fee_auto": !fee_supplied,
-                                "min_relay_fee": format_dut_i64(min_relay_fee),
-                                "min_relay_fee_dut": min_relay_fee,
-                                "size": tx_size,
-                                "change": format_dut_i64(final_change),
-                                "change_dut": final_change,
-                                "height": cur_h
-                            })
-                            .to_string(),
-                        );
-                        return;
-                    }
-                    let body = send_success_body(
-                        &txid,
-                        amount,
-                        final_fee,
-                        final_change,
-                        selected.len(),
-                        cur_h,
-                        Ok(()),
-                    );
-                    let mut body = body;
-                    body["fee_auto"] = json!(!fee_supplied);
-                    body["min_relay_fee"] = json!(format_dut_i64(min_relay_fee));
-                    body["min_relay_fee_dut"] = json!(min_relay_fee);
-                    body["size"] = json!(tx_size);
-                    wdlog!(
+            if let Err(e) = persist_result {
+                wwlog!(
+                    "wallet_rpc: send_state_persist_failed wallet={} txid={} err={}",
+                    wallet_public_name(&wallet_path),
+                    txid,
+                    e
+                );
+                super::respond_json(
+                    request,
+                    tiny_http::StatusCode(500),
+                    json!({
+                        "ok": false,
+                        "error": "wallet_state_persist_failed",
+                        "detail": e,
+                        "txid": txid,
+                        "amount": format_dut_i64(amount),
+                        "amount_dut": amount,
+                        "fee": format_dut_i64(final_fee),
+                        "fee_dut": final_fee,
+                        "fee_auto": !fee_supplied,
+                        "min_relay_fee": format_dut_i64(min_relay_fee),
+                        "min_relay_fee_dut": min_relay_fee,
+                        "size": tx_size,
+                        "change": format_dut_i64(final_change),
+                        "change_dut": final_change,
+                        "height": cur_h
+                    })
+                    .to_string(),
+                );
+                return;
+            }
+            let body = send_success_body(
+                &txid,
+                amount,
+                final_fee,
+                final_change,
+                selected.len(),
+                cur_h,
+                Ok(()),
+            );
+            let mut body = body;
+            body["fee_auto"] = json!(!fee_supplied);
+            body["min_relay_fee"] = json!(format_dut_i64(min_relay_fee));
+            body["min_relay_fee_dut"] = json!(min_relay_fee);
+            body["size"] = json!(tx_size);
+            wdlog!(
                         "wallet_rpc: send wallet={} txid={} to={} amount_dut={} fee_dut={} change_dut={} inputs={} pending_txs={}",
                         wallet_public_name(&wallet_path),
                         txid,
@@ -10401,7 +11067,7 @@ pub(crate) fn handle_request(
                         selected.len(),
                         pending_after.len()
                     );
-                    super::respond_json(request, tiny_http::StatusCode(200), body.to_string());
+            super::respond_json(request, tiny_http::StatusCode(200), body.to_string());
         }
 
         _ => super::respond_json(

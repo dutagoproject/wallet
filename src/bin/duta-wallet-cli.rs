@@ -4,8 +4,8 @@
 //!   RUSTFLAGS="-Dwarnings" cargo build --release -p dutawalletd --bin duta-wallet-cli
 
 use clap::{Parser, Subcommand};
-use duta_core::amount::{parse_duta_to_dut_i64, DISPLAY_UNIT};
 use duta_core::amount::DUTA_DECIMALS;
+use duta_core::amount::{parse_duta_to_dut_i64, DISPLAY_UNIT};
 use duta_core::netparams::Network;
 use serde_json::json;
 use std::io::{Read, Write};
@@ -331,11 +331,11 @@ fn main() {
             if let Some(err) = parse_error {
                 Err(err)
             } else {
-            let mut v = json!({"outputs": parsed});
-            if let Some(f) = fee {
-                v["fee"] = json!(f);
-            }
-            http_post_json(&host, port, "/sendmany", v)
+                let mut v = json!({"outputs": parsed});
+                if let Some(f) = fee {
+                    v["fee"] = json!(f);
+                }
+                http_post_json(&host, port, "/sendmany", v)
             }
         }
 
@@ -397,9 +397,9 @@ fn main() {
         Cmd::History { count, skip } => {
             let backend_count = count.saturating_mul(10).clamp(50, 500);
             http_post_json(
-            &host,
-            port,
-            "/rpc",
+                &host,
+                port,
+                "/rpc",
                 json!({"jsonrpc":"2.0","id":1,"method":"listtransactions","params":[backend_count, skip]}),
             )
         }
@@ -476,7 +476,10 @@ fn history_priority(category: &str, height: i64) -> i32 {
 }
 
 fn history_amount_and_fee(item: &serde_json::Value) -> (String, Option<String>) {
-    let category = item.get("category").and_then(|x| x.as_str()).unwrap_or("tx");
+    let category = item
+        .get("category")
+        .and_then(|x| x.as_str())
+        .unwrap_or("tx");
     let amount = amount_from_json(item, "amount", "amount_dut").unwrap_or(0);
     let fee = amount_from_json(item, "fee", "fee_dut").unwrap_or(0);
 
@@ -489,18 +492,32 @@ fn history_amount_and_fee(item: &serde_json::Value) -> (String, Option<String>) 
             amount.abs()
         };
         let fee_text = if fee != 0 {
-            Some(format!("fee {} {}", format_dut_i64(fee.abs()), DISPLAY_UNIT))
+            Some(format!(
+                "fee {} {}",
+                format_dut_i64(fee.abs()),
+                DISPLAY_UNIT
+            ))
         } else {
             None
         };
-        (format!("{} {}", format_dut_i64(sent), DISPLAY_UNIT), fee_text)
+        (
+            format!("{} {}", format_dut_i64(sent), DISPLAY_UNIT),
+            fee_text,
+        )
     } else if category == "move" {
         let fee_text = if fee != 0 {
-            Some(format!("fee {} {}", format_dut_i64(fee.abs()), DISPLAY_UNIT))
+            Some(format!(
+                "fee {} {}",
+                format_dut_i64(fee.abs()),
+                DISPLAY_UNIT
+            ))
         } else {
             None
         };
-        (format!("{} {}", format_dut_i64(amount), DISPLAY_UNIT), fee_text)
+        (
+            format!("{} {}", format_dut_i64(amount), DISPLAY_UNIT),
+            fee_text,
+        )
     } else {
         (format!("{} {}", format_dut_i64(amount), DISPLAY_UNIT), None)
     }
@@ -546,11 +563,8 @@ fn json_str<'a>(v: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> {
 fn format_wallet_health(v: &serde_json::Value, body: &str) -> String {
     let wallet_open = json_bool(v, &["wallet_open"]).unwrap_or(false);
     let height = json_i64(v, &["height"]).unwrap_or(0);
-    let wallet_state = json_str(v, &["wallet_state"]).unwrap_or(if wallet_open {
-        "open"
-    } else {
-        "closed"
-    });
+    let wallet_state =
+        json_str(v, &["wallet_state"]).unwrap_or(if wallet_open { "open" } else { "closed" });
     let pending = json_i64(v, &["pending_txs"]).unwrap_or(0);
     let last_sync_height = json_i64(v, &["last_sync_height"]).unwrap_or(0);
     if json_bool(v, &["ok"]) == Some(true) {
@@ -606,8 +620,14 @@ fn format_response(cmd: &Cmd, body: &str) -> String {
                 "{}\n{}\n{}\n{}\n{}",
                 info_line(format!("network: {net}")),
                 info_line(format!("wallet rpc: {rpc}")),
-                info_line(format!("balance: {}", amount_text(&v, "balance", "balance_dut"))),
-                info_line(format!("spendable: {}", amount_text(&v, "spendable", "spendable_dut"))),
+                info_line(format!(
+                    "balance: {}",
+                    amount_text(&v, "balance", "balance_dut")
+                )),
+                info_line(format!(
+                    "spendable: {}",
+                    amount_text(&v, "spendable", "spendable_dut")
+                )),
                 info_line(format!("height: {height}"))
             )
         }
@@ -617,7 +637,11 @@ fn format_response(cmd: &Cmd, body: &str) -> String {
                 let unlocked = json_bool(&v, &["unlocked"]).unwrap_or(false);
                 ok_line(format!(
                     "opened {wallet} ({})",
-                    if unlocked { "already unlocked" } else { "locked" }
+                    if unlocked {
+                        "already unlocked"
+                    } else {
+                        "locked"
+                    }
                 ))
             } else {
                 body.to_string()
@@ -654,7 +678,10 @@ fn format_response(cmd: &Cmd, body: &str) -> String {
                 "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
                 info_line(format!("balance: {balance}")),
                 info_line(format!("spendable: {spendable}")),
-                info_line(format!("reserved: {}", amount_text(&v, "reserved", "reserved_dut"))),
+                info_line(format!(
+                    "reserved: {}",
+                    amount_text(&v, "reserved", "reserved_dut")
+                )),
                 info_line(format!(
                     "pending send: {}",
                     amount_text(&v, "pending_send", "pending_send_dut")
@@ -672,11 +699,16 @@ fn format_response(cmd: &Cmd, body: &str) -> String {
             let height = json_i64(&v, &["result", "height"]).unwrap_or(0);
             let wallet = json_str(&v, &["result", "walletname"]).unwrap_or("wallet");
             let unlocked = json_bool(&v, &["result", "unlocked"]).unwrap_or(false);
-            let result = json_field(&v, &["result"]).cloned().unwrap_or_else(|| json!({}));
+            let result = json_field(&v, &["result"])
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             format!(
                 "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
                 info_line(format!("wallet: {wallet}")),
-                info_line(format!("balance: {}", amount_text(&result, "balance", "balance_dut"))),
+                info_line(format!(
+                    "balance: {}",
+                    amount_text(&result, "balance", "balance_dut")
+                )),
                 info_line(format!(
                     "spendable: {}",
                     amount_text(&result, "spendable_balance", "spendable_balance_dut")
@@ -709,7 +741,9 @@ fn format_response(cmd: &Cmd, body: &str) -> String {
             )
         }
         Cmd::Doctor => {
-            let result = json_field(&v, &["result"]).cloned().unwrap_or_else(|| json!({}));
+            let result = json_field(&v, &["result"])
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             format!(
                 "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
                 info_line(format!(
@@ -728,7 +762,10 @@ fn format_response(cmd: &Cmd, body: &str) -> String {
                         "locked"
                     }
                 )),
-                info_line(format!("balance: {}", amount_text(&result, "balance", "balance_dut"))),
+                info_line(format!(
+                    "balance: {}",
+                    amount_text(&result, "balance", "balance_dut")
+                )),
                 info_line(format!(
                     "spendable: {}",
                     amount_text(&result, "spendable_balance", "spendable_balance_dut")
@@ -771,9 +808,18 @@ fn format_response(cmd: &Cmd, body: &str) -> String {
                 format!(
                     "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
                     ok_line("wallet sync complete"),
-                    info_line(format!("balance: {}", amount_text(&v, "balance", "balance_dut"))),
-                    info_line(format!("spendable: {}", amount_text(&v, "spendable", "spendable_dut"))),
-                    info_line(format!("reserved: {}", amount_text(&v, "reserved", "reserved_dut"))),
+                    info_line(format!(
+                        "balance: {}",
+                        amount_text(&v, "balance", "balance_dut")
+                    )),
+                    info_line(format!(
+                        "spendable: {}",
+                        amount_text(&v, "spendable", "spendable_dut")
+                    )),
+                    info_line(format!(
+                        "reserved: {}",
+                        amount_text(&v, "reserved", "reserved_dut")
+                    )),
                     info_line(format!(
                         "pending send: {}",
                         amount_text(&v, "pending_send", "pending_send_dut")
@@ -801,15 +847,24 @@ fn format_response(cmd: &Cmd, body: &str) -> String {
                 vec![
                     ok_line("send accepted"),
                     info_line(format!("txid: {txid}")),
-                    info_line(format!("amount: {}", amount_text(&v, "amount", "amount_dut"))),
+                    info_line(format!(
+                        "amount: {}",
+                        amount_text(&v, "amount", "amount_dut")
+                    )),
                     info_line(format!("fee: {}", amount_text(&v, "fee", "fee_dut"))),
                     info_line(format!("fee mode: {fee_mode}")),
                     info_line(format!(
                         "min relay fee: {}",
                         amount_text(&v, "min_relay_fee", "min_relay_fee_dut")
                     )),
-                    info_line(format!("change: {}", amount_text(&v, "change", "change_dut"))),
-                    info_line(format!("size: {} bytes", json_i64(&v, &["size"]).unwrap_or(0))),
+                    info_line(format!(
+                        "change: {}",
+                        amount_text(&v, "change", "change_dut")
+                    )),
+                    info_line(format!(
+                        "size: {} bytes",
+                        json_i64(&v, &["size"]).unwrap_or(0)
+                    )),
                     info_line(format!(
                         "saved: {}",
                         if persisted { "yes" } else { "not yet" }
@@ -831,17 +886,32 @@ fn format_response(cmd: &Cmd, body: &str) -> String {
                 vec![
                     ok_line("batch send accepted"),
                     info_line(format!("txid: {txid}")),
-                    info_line(format!("outputs: {}", json_i64(&v, &["outputs"]).unwrap_or(0))),
-                    info_line(format!("inputs: {}", json_i64(&v, &["inputs"]).unwrap_or(0))),
-                    info_line(format!("amount: {}", amount_text(&v, "amount", "amount_dut"))),
+                    info_line(format!(
+                        "outputs: {}",
+                        json_i64(&v, &["outputs"]).unwrap_or(0)
+                    )),
+                    info_line(format!(
+                        "inputs: {}",
+                        json_i64(&v, &["inputs"]).unwrap_or(0)
+                    )),
+                    info_line(format!(
+                        "amount: {}",
+                        amount_text(&v, "amount", "amount_dut")
+                    )),
                     info_line(format!("fee: {}", amount_text(&v, "fee", "fee_dut"))),
                     info_line(format!("fee mode: {fee_mode}")),
                     info_line(format!(
                         "min relay fee: {}",
                         amount_text(&v, "min_relay_fee", "min_relay_fee_dut")
                     )),
-                    info_line(format!("change: {}", amount_text(&v, "change", "change_dut"))),
-                    info_line(format!("size: {} bytes", json_i64(&v, &["size"]).unwrap_or(0))),
+                    info_line(format!(
+                        "change: {}",
+                        amount_text(&v, "change", "change_dut")
+                    )),
+                    info_line(format!(
+                        "size: {} bytes",
+                        json_i64(&v, &["size"]).unwrap_or(0)
+                    )),
                 ]
                 .join("\n")
             } else {
@@ -852,12 +922,30 @@ fn format_response(cmd: &Cmd, body: &str) -> String {
             if json_bool(&v, &["ok"]) == Some(true) {
                 let fits = json_bool(&v, &["can_send"]).unwrap_or(false);
                 let mut lines = vec![
-                    info_line(format!("batch outputs: {}", json_i64(&v, &["outputs"]).unwrap_or(0))),
-                    info_line(format!("estimated inputs: {}", json_i64(&v, &["inputs"]).unwrap_or(0))),
-                    info_line(format!("amount total: {}", amount_text(&v, "amount", "amount_dut"))),
-                    info_line(format!("estimated fee: {}", amount_text(&v, "fee", "fee_dut"))),
-                    info_line(format!("min relay fee: {}", amount_text(&v, "min_relay_fee", "min_relay_fee_dut"))),
-                    info_line(format!("estimated size: {} bytes", json_i64(&v, &["size"]).unwrap_or(0))),
+                    info_line(format!(
+                        "batch outputs: {}",
+                        json_i64(&v, &["outputs"]).unwrap_or(0)
+                    )),
+                    info_line(format!(
+                        "estimated inputs: {}",
+                        json_i64(&v, &["inputs"]).unwrap_or(0)
+                    )),
+                    info_line(format!(
+                        "amount total: {}",
+                        amount_text(&v, "amount", "amount_dut")
+                    )),
+                    info_line(format!(
+                        "estimated fee: {}",
+                        amount_text(&v, "fee", "fee_dut")
+                    )),
+                    info_line(format!(
+                        "min relay fee: {}",
+                        amount_text(&v, "min_relay_fee", "min_relay_fee_dut")
+                    )),
+                    info_line(format!(
+                        "estimated size: {} bytes",
+                        json_i64(&v, &["size"]).unwrap_or(0)
+                    )),
                     info_line(format!(
                         "spendable now: {} across {} utxo(s)",
                         amount_text(&v, "spendable_balance", "spendable_balance_dut"),
@@ -869,7 +957,9 @@ fn format_response(cmd: &Cmd, body: &str) -> String {
                     )),
                 ];
                 if !fits {
-                    let failure = json_field(&v, &["failure"]).cloned().unwrap_or_else(|| json!({}));
+                    let failure = json_field(&v, &["failure"])
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
                     let detail = json_str(&failure, &["detail"])
                         .or_else(|| json_str(&failure, &["error"]))
                         .unwrap_or("batch_not_viable");
@@ -893,9 +983,18 @@ fn format_response(cmd: &Cmd, body: &str) -> String {
                 let fits = json_bool(&v, &["requested_outputs_fit"]).unwrap_or(true);
                 let max_outputs = json_i64(&v, &["max_outputs"]).unwrap_or(0);
                 let mut lines = vec![
-                    info_line(format!("amount per payout: {}", amount_text(&v, "amount", "amount_dut"))),
-                    info_line(format!("fee per payout: {}", amount_text(&v, "fee", "fee_dut"))),
-                    info_line(format!("need per payout: {}", amount_text(&v, "need", "need_dut"))),
+                    info_line(format!(
+                        "amount per payout: {}",
+                        amount_text(&v, "amount", "amount_dut")
+                    )),
+                    info_line(format!(
+                        "fee per payout: {}",
+                        amount_text(&v, "fee", "fee_dut")
+                    )),
+                    info_line(format!(
+                        "need per payout: {}",
+                        amount_text(&v, "need", "need_dut")
+                    )),
                     info_line(format!("max confirmed payouts now: {max_outputs}")),
                     info_line(format!(
                         "spendable now: {} across {} utxo(s)",
@@ -907,14 +1006,21 @@ fn format_response(cmd: &Cmd, body: &str) -> String {
                     lines.push(info_line(format!(
                         "requested payouts: {} ({})",
                         req,
-                        if fits { "fits" } else { "would exhaust confirmed utxos" }
+                        if fits {
+                            "fits"
+                        } else {
+                            "would exhaust confirmed utxos"
+                        }
                     )));
                 }
                 if !fits {
-                    let failure = json_field(&v, &["failure"]).cloned().unwrap_or_else(|| json!({}));
+                    let failure = json_field(&v, &["failure"])
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
                     lines.push(wait_line(format!(
                         "failure detail: {}",
-                        json_str(&failure, &["detail"]).unwrap_or("confirmed_spendable_utxos_exhausted_or_reserved")
+                        json_str(&failure, &["detail"])
+                            .unwrap_or("confirmed_spendable_utxos_exhausted_or_reserved")
                     )));
                     lines.push(wait_line(format!(
                         "pending send/change: {} / {}",
@@ -960,9 +1066,15 @@ fn format_response(cmd: &Cmd, body: &str) -> String {
                 let mut lines = Vec::new();
                 lines.push(info_line(format!("history entries: {}", ordered.len())));
                 for item in ordered.into_iter().take(limit) {
-                    let category = item.get("category").and_then(|x| x.as_str()).unwrap_or("tx");
+                    let category = item
+                        .get("category")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("tx");
                     let txid = item.get("txid").and_then(|x| x.as_str()).unwrap_or("-");
-                    let height = item.get("blockheight").and_then(|x| x.as_i64()).unwrap_or(0);
+                    let height = item
+                        .get("blockheight")
+                        .and_then(|x| x.as_i64())
+                        .unwrap_or(0);
                     let amount = item.get("amount").and_then(|x| x.as_i64()).unwrap_or(0);
                     let label = history_label(category, amount, height);
                     let (amount_text, fee_text) = history_amount_and_fee(item);
@@ -1095,9 +1207,8 @@ fn resolve_wallet_path(args: &Args, wallet: &str) -> String {
     }
 
     // If caller provided an explicit path, keep it.
-    let is_windows_abs = w.len() >= 3
-        && w.as_bytes()[1] == b':'
-        && matches!(w.as_bytes()[2], b'\\' | b'/');
+    let is_windows_abs =
+        w.len() >= 3 && w.as_bytes()[1] == b':' && matches!(w.as_bytes()[2], b'\\' | b'/');
     let is_unc = w.starts_with("\\\\");
     if w.contains('/') || w.contains('\\') || is_windows_abs || is_unc {
         return w;
@@ -1222,8 +1333,7 @@ fn parse_http_response_any_status(resp: &str) -> Result<(u16, String), String> {
         let mut parts = line.splitn(2, ':');
         let name = parts.next().unwrap_or("").trim();
         let value = parts.next().unwrap_or("").trim();
-        name.eq_ignore_ascii_case("Transfer-Encoding")
-            && value.eq_ignore_ascii_case("chunked")
+        name.eq_ignore_ascii_case("Transfer-Encoding") && value.eq_ignore_ascii_case("chunked")
     });
     let body = if chunked_header || looks_like_chunked_body(body) {
         decode_chunked_body(body)?
@@ -1257,8 +1367,8 @@ fn decode_chunked_body(body: &str) -> Result<String, String> {
             None => return Err("invalid_chunked_response".to_string()),
         };
         let size_hex = size_line.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_hex, 16)
-            .map_err(|_| "invalid_chunk_size".to_string())?;
+        let size =
+            usize::from_str_radix(size_hex, 16).map_err(|_| "invalid_chunk_size".to_string())?;
         if size == 0 {
             break;
         }
@@ -1325,7 +1435,10 @@ mod tests {
             "base_unit": "dut",
             "decimals": 8
         });
-        assert_eq!(amount_text(&item, "amount", "amount_dut"), "0.00000001 DUTA");
+        assert_eq!(
+            amount_text(&item, "amount", "amount_dut"),
+            "0.00000001 DUTA"
+        );
     }
 
     #[test]
@@ -1402,7 +1515,10 @@ mod tests {
             "base_unit": "dut",
             "decimals": 8
         });
-        assert_eq!(amount_text(&item, "amount", "amount_dut"), "598.00000000 DUTA");
+        assert_eq!(
+            amount_text(&item, "amount", "amount_dut"),
+            "598.00000000 DUTA"
+        );
     }
 
     #[test]
@@ -1513,17 +1629,16 @@ mod tests {
             "base_unit": "dut",
             "decimals": 8
         });
-        assert_eq!(amount_text(&item, "amount", "amount_dut"), "0.50000000 DUTA");
+        assert_eq!(
+            amount_text(&item, "amount", "amount_dut"),
+            "0.50000000 DUTA"
+        );
     }
 
     #[test]
     fn gettransaction_alias_maps_to_tx_command() {
-        let parsed = Args::try_parse_from([
-            "duta-wallet-cli",
-            "gettransaction",
-            "abcd1234",
-        ])
-        .expect("gettransaction alias should parse");
+        let parsed = Args::try_parse_from(["duta-wallet-cli", "gettransaction", "abcd1234"])
+            .expect("gettransaction alias should parse");
         match parsed.cmd {
             Cmd::Tx { txid } => assert_eq!(txid, "abcd1234"),
             other => panic!("unexpected command parsed: {other:?}"),

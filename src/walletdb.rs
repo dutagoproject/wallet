@@ -613,15 +613,16 @@ impl WalletDb {
     }
 
     pub(crate) fn read_pending_txs(&self) -> Result<Vec<crate::PendingTx>, String> {
-        let raw: Vec<u8> = match self.conn.query_row(
-            "SELECT v FROM meta WHERE k='pending_txs_json'",
-            [],
-            |r| r.get(0),
-        ) {
-            Ok(v) => v,
-            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(Vec::new()),
-            Err(e) => return Err(format!("db_meta_read_failed: {e}")),
-        };
+        let raw: Vec<u8> =
+            match self
+                .conn
+                .query_row("SELECT v FROM meta WHERE k='pending_txs_json'", [], |r| {
+                    r.get(0)
+                }) {
+                Ok(v) => v,
+                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(Vec::new()),
+                Err(e) => return Err(format!("db_meta_read_failed: {e}")),
+            };
         serde_json::from_slice(&raw).map_err(|e| format!("db_pending_txs_invalid: {e}"))
     }
 
@@ -655,7 +656,10 @@ impl WalletDb {
             .map_err(|e| format!("db_submitted_tx_recovery_invalid: {e}"))
     }
 
-    pub(crate) fn update_pending_txs(&self, pending_txs: &[crate::PendingTx]) -> Result<(), String> {
+    pub(crate) fn update_pending_txs(
+        &self,
+        pending_txs: &[crate::PendingTx],
+    ) -> Result<(), String> {
         let body = serde_json::to_vec(pending_txs)
             .map_err(|e| format!("db_pending_txs_encode_failed: {e}"))?;
         self.conn
@@ -944,7 +948,8 @@ mod tests {
             timestamp: 999,
         }];
 
-        db.update_full_state(&utxos, 77, &pending, &reserved).unwrap();
+        db.update_full_state(&utxos, 77, &pending, &reserved)
+            .unwrap();
 
         let reopened = WalletDb::open(&path).unwrap();
         assert_eq!(reopened.read_last_sync_height().unwrap(), 77);
@@ -972,7 +977,9 @@ mod tests {
                 fee: 1,
                 change: 9,
                 timestamp: 1234,
-                details: vec![serde_json::json!({"category":"send","address":"dut1dest","amount_dut":-100})],
+                details: vec![
+                    serde_json::json!({"category":"send","address":"dut1dest","amount_dut":-100}),
+                ],
                 spent_inputs: vec![crate::PendingInput {
                     txid: "cd".repeat(32),
                     vout: 2,

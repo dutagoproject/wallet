@@ -12,7 +12,7 @@ Amount model in this repository:
 - display output is rendered with fixed `8` decimal places
 - raw RPC values use `*_dut`
 
-Current release line: `1.0.0`
+Current release line: `1.0.1`
 
 Website: https://dutago.xyz
 

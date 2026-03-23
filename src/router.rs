@@ -1225,6 +1225,176 @@ mod tests {
     }
 
     #[test]
+    fn collect_pending_receives_from_mempool_detects_incoming_wallet_receive() {
+        let pending = vec![super::super::PendingTx {
+            txid: "known-send".to_string(),
+            category: "send".to_string(),
+            amount: -10,
+            fee: 1,
+            change: 0,
+            timestamp: 5,
+            details: Vec::new(),
+            spent_inputs: Vec::new(),
+        }];
+        let receives = super::collect_pending_receives_from_mempool(
+            &["duta-recv-1".to_string()],
+            &pending,
+            &json!({
+                "txids": ["mempool-rx", "known-send"],
+                "txs": {
+                    "mempool-rx": {
+                        "time": 77,
+                        "vin": [{"prev_addr":"external-sender"}],
+                        "vout": [
+                            {"address":"duta-recv-1","value":4_000_000},
+                            {"address":"other","value":1_000_000}
+                        ]
+                    },
+                    "known-send": {
+                        "time": 70,
+                        "vin": [{"prev_addr":"external-sender"}],
+                        "vout": [{"address":"duta-recv-1","value":1_000_000}]
+                    }
+                }
+            }),
+            123,
+        );
+        assert_eq!(receives.len(), 1);
+        assert_eq!(receives[0].txid, "mempool-rx");
+        assert_eq!(receives[0].category, "receive");
+        assert_eq!(receives[0].amount, 4_000_000);
+        assert_eq!(receives[0].timestamp, 77);
+    }
+
+    #[test]
+    fn collect_pending_receives_from_mempool_skips_wallet_spends() {
+        let receives = super::collect_pending_receives_from_mempool(
+            &["duta-own".to_string()],
+            &[],
+            &json!({
+                "txids": ["self-spend"],
+                "txs": {
+                    "self-spend": {
+                        "vin": [{"prev_addr":"duta-own"}],
+                        "vout": [{"address":"duta-own","value":4_000_000}]
+                    }
+                }
+            }),
+            123,
+        );
+        assert!(receives.is_empty());
+    }
+
+    #[test]
+    fn reconcile_pending_state_clears_sender_pending_once_tx_is_chain_confirmed() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let first_line = req.lines().next().unwrap_or("");
+                let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+                let body = if path.starts_with("/mempool") {
+                    serde_json::json!({"txids":[],"txs":{}}).to_string()
+                } else if path.starts_with("/rpc") {
+                    serde_json::json!({
+                        "result": {
+                            "txid":"confirmed-send",
+                            "in_active_chain": true,
+                            "confirmations": 1,
+                            "height": 88
+                        },
+                        "error": null,
+                        "id": 1
+                    })
+                    .to_string()
+                } else {
+                    serde_json::json!({"found":true}).to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let mut pending = vec![super::super::PendingTx {
+            txid: "confirmed-send".to_string(),
+            category: "send".to_string(),
+            amount: -101,
+            fee: 1,
+            change: 9,
+            timestamp: 1,
+            details: vec![
+                serde_json::json!({"category":"send","address":"dut1dest","amount_dut":-100}),
+            ],
+            spent_inputs: vec![super::super::PendingInput {
+                txid: "ab".repeat(32),
+                vout: 0,
+            }],
+        }];
+        let mut reserved = vec![super::super::ReservedInput {
+            txid: "ab".repeat(32),
+            vout: 0,
+            timestamp: 1,
+        }];
+        let mut utxos = vec![super::super::Utxo {
+            value: 110,
+            height: 77,
+            coinbase: false,
+            address: "dut1owned".to_string(),
+            txid: "ab".repeat(32),
+            vout: 0,
+        }];
+        let wallet_path = std::env::temp_dir()
+            .join(format!(
+                "duta-wallet-confirmed-cleanup-{}.db",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ))
+            .to_string_lossy()
+            .to_string();
+        let _db = super::super::walletdb::WalletDb::create_new(
+            &wallet_path,
+            "strong-pass-123",
+            &[9u8; 32],
+            1,
+        )
+        .unwrap();
+
+        let reserved_outpoints = super::reconcile_pending_and_reserved_state(
+            &wallet_path,
+            &mut utxos,
+            88,
+            &mut pending,
+            &mut reserved,
+            port,
+        )
+        .unwrap();
+
+        assert!(pending.is_empty());
+        assert!(reserved.is_empty());
+        assert!(!reserved_outpoints.contains(&("ab".repeat(32), 0)));
+
+        let _ = handle.join();
+        let _ = std::fs::remove_file(&wallet_path);
+    }
+
+    #[test]
     fn reconcile_pending_state_finalizes_submitted_recovery_from_mempool() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -1447,7 +1617,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = thread::spawn(move || {
-            for _ in 0..3 {
+            for _ in 0..6 {
                 let Ok((mut stream, _)) = listener.accept() else {
                     break;
                 };
@@ -1607,6 +1777,7 @@ mod tests {
 
         assert_eq!(body["reserved_inputs"], serde_json::json!(0));
         assert_eq!(body["reserved_dut"], serde_json::json!(0));
+        assert_eq!(body["pending_receive_dut"], serde_json::json!(0));
         assert_eq!(body["last_sync_height"], serde_json::json!(77));
         let g = super::super::wallet_lock_or_recover();
         let ws = g.as_ref().unwrap();
@@ -1635,7 +1806,10 @@ mod tests {
         };
         let duplicate = super::duplicate_pending_sendmany_txid(
             &[pending],
-            &[("test2".to_string(), 20_000_000), ("test1".to_string(), 10_000_000)],
+            &[
+                ("test2".to_string(), 20_000_000),
+                ("test1".to_string(), 10_000_000),
+            ],
         );
         assert_eq!(duplicate, Some("aa".repeat(32)));
     }
@@ -1659,11 +1833,17 @@ mod tests {
         };
         let different_amount = super::duplicate_pending_sendmany_txid(
             &[pending.clone()],
-            &[("test1".to_string(), 10_000_000), ("test2".to_string(), 21_000_000)],
+            &[
+                ("test1".to_string(), 10_000_000),
+                ("test2".to_string(), 21_000_000),
+            ],
         );
         let different_addr = super::duplicate_pending_sendmany_txid(
             &[pending],
-            &[("test1".to_string(), 10_000_000), ("test3".to_string(), 20_000_000)],
+            &[
+                ("test1".to_string(), 10_000_000),
+                ("test3".to_string(), 20_000_000),
+            ],
         );
         assert!(different_amount.is_none());
         assert!(different_addr.is_none());
@@ -1862,7 +2042,30 @@ mod tests {
         let stats = super::pending_balance_stats(&utxos, &reserved, &pending);
         assert_eq!(stats.reserved_dut, 70);
         assert_eq!(stats.pending_send_dut, 9);
+        assert_eq!(stats.pending_receive_dut, 0);
         assert_eq!(stats.pending_change_dut, 11);
+        assert_eq!(stats.pending_txs, 1);
+    }
+
+    #[test]
+    fn pending_balance_stats_tracks_pending_receive_separately() {
+        let stats = super::pending_balance_stats(
+            &[],
+            &HashSet::new(),
+            &[super::super::PendingTx {
+                txid: "pending-rx".to_string(),
+                category: "receive".to_string(),
+                amount: 250,
+                fee: 0,
+                change: 0,
+                timestamp: 1,
+                details: Vec::new(),
+                spent_inputs: Vec::new(),
+            }],
+        );
+        assert_eq!(stats.pending_send_dut, 0);
+        assert_eq!(stats.pending_receive_dut, 250);
+        assert_eq!(stats.pending_change_dut, 0);
         assert_eq!(stats.pending_txs, 1);
     }
 
@@ -1878,6 +2081,7 @@ mod tests {
             &PendingBalanceStats {
                 reserved_dut: 0,
                 pending_send_dut: 2_300_020,
+                pending_receive_dut: 0,
                 pending_change_dut: 91_997_699_980,
                 pending_txs: 20,
             },
@@ -1979,6 +2183,7 @@ mod tests {
         let stats = PendingBalanceStats {
             reserved_dut: 45_000_000_000,
             pending_send_dut: 120_000,
+            pending_receive_dut: 0,
             pending_change_dut: 89_000_000,
             pending_txs: 3,
         };
@@ -2153,6 +2358,28 @@ mod tests {
             detail.get("category").and_then(|x| x.as_str()) == Some("fee")
                 && detail.get("amount_dut").and_then(|x| x.as_i64()) == Some(-10000)
         }));
+    }
+
+    #[test]
+    fn transaction_visibility_fields_marks_pending_incoming_from_node_mempool() {
+        let runtime_pending = super::WalletPendingRuntimeView {
+            mempool_available: true,
+            mempool_txids: HashSet::from(["tx-pending".to_string()]),
+            pending_receive_txids: HashSet::from(["tx-pending".to_string()]),
+            pending_receive_txs: Vec::new(),
+        };
+        assert_eq!(
+            super::transaction_visibility_fields("tx-pending", 0, "receive", &runtime_pending),
+            ("pending_incoming", "node_mempool")
+        );
+        assert_eq!(
+            super::transaction_visibility_fields("tx-pending", 0, "send", &runtime_pending),
+            ("pending", "node_mempool")
+        );
+        assert_eq!(
+            super::transaction_visibility_fields("tx-confirmed", 3, "receive", &runtime_pending),
+            ("confirmed", "chain")
+        );
     }
 
     #[test]
@@ -2708,8 +2935,17 @@ fn amount_json_value(amount_dut: i64) -> serde_json::Value {
 struct PendingBalanceStats {
     reserved_dut: i64,
     pending_send_dut: i64,
+    pending_receive_dut: i64,
     pending_change_dut: i64,
     pending_txs: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct WalletPendingRuntimeView {
+    mempool_available: bool,
+    mempool_txids: HashSet<String>,
+    pending_receive_txids: HashSet<String>,
+    pending_receive_txs: Vec<super::PendingTx>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2861,6 +3097,89 @@ fn merge_pending_wallet_txs(
             .then_with(|| a.0.cmp(&b.0))
     });
     confirmed
+}
+
+fn collect_pending_receives_from_mempool(
+    wallet_addrs: &[String],
+    pending: &[super::PendingTx],
+    mempool: &serde_json::Value,
+    now_secs: i64,
+) -> Vec<super::PendingTx> {
+    let Some(txs) = mempool.get("txs").and_then(|x| x.as_object()) else {
+        return Vec::new();
+    };
+    let wallet_addr_set: HashSet<&str> = wallet_addrs.iter().map(|addr| addr.as_str()).collect();
+    if wallet_addr_set.is_empty() {
+        return Vec::new();
+    }
+    let existing_txids: HashSet<&str> = pending.iter().map(|entry| entry.txid.as_str()).collect();
+    let mut out = Vec::new();
+
+    for (txid, tx) in txs {
+        if txid.is_empty() || existing_txids.contains(txid.as_str()) {
+            continue;
+        }
+        let spends_wallet_input = tx
+            .get("vin")
+            .and_then(|x| x.as_array())
+            .map(|vins| {
+                vins.iter().any(|vin| {
+                    vin.get("prev_addr")
+                        .and_then(|x| x.as_str())
+                        .or_else(|| vin.get("address").and_then(|x| x.as_str()))
+                        .map(|addr| wallet_addr_set.contains(addr))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        if spends_wallet_input {
+            continue;
+        }
+
+        let Some(vouts) = tx.get("vout").and_then(|x| x.as_array()) else {
+            continue;
+        };
+        let mut amount = 0i64;
+        let mut details = Vec::new();
+        for vout in vouts {
+            let addr = tx_output_address(vout);
+            if addr.is_empty() || !wallet_addr_set.contains(addr) {
+                continue;
+            }
+            let value = vout.get("value").and_then(|x| x.as_i64()).unwrap_or(0);
+            if value <= 0 {
+                continue;
+            }
+            amount = amount.saturating_add(value);
+            details.push(amount_detail_json("receive", addr, value));
+        }
+        if amount <= 0 {
+            continue;
+        }
+
+        let timestamp = tx
+            .get("time")
+            .and_then(|x| x.as_i64())
+            .or_else(|| tx.get("timereceived").and_then(|x| x.as_i64()))
+            .unwrap_or(now_secs);
+        out.push(super::PendingTx {
+            txid: txid.clone(),
+            category: "receive".to_string(),
+            amount,
+            fee: 0,
+            change: 0,
+            timestamp,
+            details,
+            spent_inputs: Vec::new(),
+        });
+    }
+
+    out.sort_by(|a, b| {
+        b.timestamp
+            .cmp(&a.timestamp)
+            .then_with(|| a.txid.cmp(&b.txid))
+    });
+    out
 }
 
 fn prune_confirmed_pending_txs(
@@ -3297,10 +3616,16 @@ fn pending_balance_stats(
         .filter(|p| p.category == "send" && p.amount < 0)
         .map(|p| -p.amount)
         .sum();
+    let pending_receive_dut = pending_txs
+        .iter()
+        .filter(|p| p.category == "receive" && p.amount > 0)
+        .map(|p| p.amount)
+        .sum();
     let pending_change_dut = pending_txs.iter().map(|p| p.change.max(0)).sum();
     PendingBalanceStats {
         reserved_dut,
         pending_send_dut,
+        pending_receive_dut,
         pending_change_dut,
         pending_txs: pending_txs.len(),
     }
@@ -3622,6 +3947,21 @@ fn reconcile_pending_and_reserved_state(
             if restore_pending_sends_from_mempool(active_pending, utxos, &mempool, now_secs) {
                 state_changed = true;
             }
+            match prune_chain_confirmed_pending_txs_by_txid(
+                active_pending,
+                &mempool_txids,
+                daemon_rpc_port,
+            ) {
+                Ok(true) => state_changed = true,
+                Ok(false) => {}
+                Err(e) => {
+                    wwlog!(
+                        "wallet_rpc: pending_confirmed_probe_failed wallet={} err={}",
+                        wallet_public_name(wallet_path),
+                        e
+                    );
+                }
+            }
             if prune_inactive_pending_txs(active_pending, &mempool_txids, now_secs) {
                 state_changed = true;
             }
@@ -3719,6 +4059,21 @@ fn sync_pending_txs_with_chain_and_mempool(
                 }
             }
         }
+        match prune_chain_confirmed_pending_txs_by_txid(
+            pending_txs,
+            &mempool_txids,
+            daemon_rpc_port,
+        ) {
+            Ok(true) => changed = true,
+            Ok(false) => {}
+            Err(e) => {
+                wwlog!(
+                    "wallet_rpc: pending_confirmed_probe_failed wallet={} err={}",
+                    wallet_public_name(wallet_path),
+                    e
+                );
+            }
+        }
         if prune_inactive_pending_txs(pending_txs, &mempool_txids, now_secs) {
             changed = true;
         }
@@ -3772,6 +4127,124 @@ fn pending_mempool_state_or_err(
 
 fn pending_mempool_visibility_required(pending_txs: &[super::PendingTx]) -> bool {
     !pending_txs.is_empty()
+}
+
+fn pending_tx_is_chain_confirmed(txid: &str, daemon_rpc_port: u16) -> Result<bool, String> {
+    if txid.is_empty() {
+        return Ok(false);
+    }
+    let body = json!({
+        "jsonrpc":"2.0",
+        "id":1,
+        "method":"getrawtransaction",
+        "params":[txid, true]
+    })
+    .to_string();
+    let resp = super::http_post_local(
+        "127.0.0.1",
+        daemon_rpc_port,
+        "/rpc",
+        "application/json",
+        body.as_bytes(),
+    )?;
+    let value: serde_json::Value =
+        serde_json::from_str(&resp).map_err(|e| format!("daemon_rpc_invalid_json:{e}"))?;
+    if value
+        .get("error")
+        .and_then(|err| err.get("code"))
+        .and_then(|code| code.as_i64())
+        == Some(-5)
+    {
+        return Ok(false);
+    }
+    let result = value
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if result.is_null() {
+        return Ok(false);
+    }
+    let in_active_chain = result
+        .get("in_active_chain")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    let confirmations = result
+        .get("confirmations")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(0);
+    Ok(in_active_chain || confirmations > 0)
+}
+
+fn prune_chain_confirmed_pending_txs_by_txid(
+    pending_txs: &mut Vec<super::PendingTx>,
+    mempool_txids: &HashSet<String>,
+    daemon_rpc_port: u16,
+) -> Result<bool, String> {
+    let mut confirmed_txids = HashSet::new();
+    for pending in pending_txs.iter() {
+        if pending.txid.is_empty() || mempool_txids.contains(&pending.txid) {
+            continue;
+        }
+        if pending_tx_is_chain_confirmed(&pending.txid, daemon_rpc_port)? {
+            confirmed_txids.insert(pending.txid.clone());
+        }
+    }
+    if confirmed_txids.is_empty() {
+        return Ok(false);
+    }
+    let before = pending_txs.len();
+    pending_txs.retain(|pending| !confirmed_txids.contains(&pending.txid));
+    Ok(before != pending_txs.len())
+}
+
+fn wallet_pending_runtime_view(
+    wallet_addrs: &[String],
+    pending_txs: &[super::PendingTx],
+    daemon_rpc_port: u16,
+) -> WalletPendingRuntimeView {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    match daemon_mempool_state(daemon_rpc_port) {
+        Ok((mempool, mempool_txids, _)) => {
+            let pending_receive_txs = collect_pending_receives_from_mempool(
+                wallet_addrs,
+                pending_txs,
+                &mempool,
+                now_secs,
+            );
+            let pending_receive_txids = pending_receive_txs
+                .iter()
+                .map(|entry| entry.txid.clone())
+                .collect();
+            WalletPendingRuntimeView {
+                mempool_available: true,
+                mempool_txids,
+                pending_receive_txids,
+                pending_receive_txs,
+            }
+        }
+        Err(_) => WalletPendingRuntimeView::default(),
+    }
+}
+
+fn transaction_visibility_fields(
+    txid: &str,
+    confirmations: i64,
+    category: &str,
+    runtime_pending: &WalletPendingRuntimeView,
+) -> (&'static str, &'static str) {
+    if confirmations > 0 {
+        return ("confirmed", "chain");
+    }
+    if runtime_pending.pending_receive_txids.contains(txid) && category == "receive" {
+        return ("pending_incoming", "node_mempool");
+    }
+    if runtime_pending.mempool_txids.contains(txid) {
+        return ("pending", "node_mempool");
+    }
+    ("pending", "wallet_pending")
 }
 
 fn send_mempool_state_or_err(
@@ -3891,9 +4364,10 @@ fn pending_send_recipients(pending: &super::PendingTx) -> Vec<(String, i64)> {
                 .get("amount_dut")
                 .and_then(|v| v.as_i64())
                 .or_else(|| {
-                    entry.get("amount").and_then(|v| v.as_str()).and_then(|s| {
-                        parse_duta_to_dut_i64(s).ok()
-                    })
+                    entry
+                        .get("amount")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| parse_duta_to_dut_i64(s).ok())
                 })?;
             Some((addr.to_string(), amount.saturating_abs()))
         })
@@ -4977,10 +5451,13 @@ struct WalletBalanceSnapshot {
     immature_dut: i64,
     reserved_dut: i64,
     pending_send_dut: i64,
+    pending_receive_dut: i64,
     pending_change_dut: i64,
     height: i64,
     utxos: usize,
     pending_txs: usize,
+    pending_receive_txs: usize,
+    pending_receive_source_available: bool,
 }
 
 fn populate_info_wallet_state_fields(body: &mut serde_json::Value) {
@@ -5107,7 +5584,10 @@ fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<WalletBalanceSnapshot
         }
     }
 
-    let pending_stats = pending_balance_stats(&utxos, &reserved_outpoints, &active_pending);
+    let runtime_pending = wallet_pending_runtime_view(&addrs, &active_pending, daemon_rpc_port);
+    let mut visible_pending = active_pending.clone();
+    visible_pending.extend(runtime_pending.pending_receive_txs.iter().cloned());
+    let pending_stats = pending_balance_stats(&utxos, &reserved_outpoints, &visible_pending);
 
     Ok(WalletBalanceSnapshot {
         balance_dut: balance,
@@ -5115,10 +5595,13 @@ fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<WalletBalanceSnapshot
         immature_dut: immature,
         reserved_dut: pending_stats.reserved_dut,
         pending_send_dut: pending_stats.pending_send_dut,
+        pending_receive_dut: pending_stats.pending_receive_dut,
         pending_change_dut: pending_stats.pending_change_dut,
         height: cur_h,
         utxos: utxos.len(),
         pending_txs: pending_stats.pending_txs,
+        pending_receive_txs: runtime_pending.pending_receive_txs.len(),
+        pending_receive_source_available: runtime_pending.mempool_available,
     })
 }
 
@@ -5148,9 +5631,19 @@ fn wallet_info_response_body(rpc_addr: &str, daemon_rpc_port: u16, net: &str) ->
                 body["reserved_dut"] = json!(snapshot.reserved_dut);
                 body["pending_send"] = amount_json_value(snapshot.pending_send_dut);
                 body["pending_send_dut"] = json!(snapshot.pending_send_dut);
+                body["pending_receive"] = amount_json_value(snapshot.pending_receive_dut);
+                body["pending_receive_dut"] = json!(snapshot.pending_receive_dut);
                 body["pending_change"] = amount_json_value(snapshot.pending_change_dut);
                 body["pending_change_dut"] = json!(snapshot.pending_change_dut);
                 body["pending_txs"] = json!(snapshot.pending_txs);
+                body["pending_receive_txs"] = json!(snapshot.pending_receive_txs);
+                body["pending_receive_source"] =
+                    json!(if snapshot.pending_receive_source_available {
+                        "node_mempool"
+                    } else {
+                        "unavailable"
+                    });
+                body["confirmed_balance_only"] = json!(true);
                 body["height"] = json!(snapshot.height);
                 body["utxos"] = json!(snapshot.utxos);
                 body["unit"] = json!(DISPLAY_UNIT);
@@ -5507,10 +6000,18 @@ pub(crate) fn handle_request(
 
                     let history_scan =
                         scan_wallet_txs_via_blocks_from(&addrs, daemon_rpc_port).ok();
-                    let txcount = history_scan
-                        .as_ref()
-                        .filter(|scan| !scan.truncated)
-                        .map(|scan| merge_pending_wallet_txs(scan.txs.clone(), &pending_txs).len());
+                    let runtime_pending =
+                        wallet_pending_runtime_view(&addrs, &pending_txs, daemon_rpc_port);
+                    let txcount =
+                        history_scan
+                            .as_ref()
+                            .filter(|scan| !scan.truncated)
+                            .map(|scan| {
+                                let mut visible_pending = pending_txs.clone();
+                                visible_pending
+                                    .extend(runtime_pending.pending_receive_txs.iter().cloned());
+                                merge_pending_wallet_txs(scan.txs.clone(), &visible_pending).len()
+                            });
 
                     let result = json!({
                         "walletname": wallet_public_name(&wallet_path),
@@ -5525,8 +6026,13 @@ pub(crate) fn handle_request(
                         "reserved_balance_dut": snapshot.reserved_dut,
                         "pending_send": format_dut_i64(snapshot.pending_send_dut),
                         "pending_send_dut": snapshot.pending_send_dut,
+                        "pending_receive": format_dut_i64(snapshot.pending_receive_dut),
+                        "pending_receive_dut": snapshot.pending_receive_dut,
                         "pending_change": format_dut_i64(snapshot.pending_change_dut),
                         "pending_change_dut": snapshot.pending_change_dut,
+                        "pending_receive_txs": snapshot.pending_receive_txs,
+                        "pending_receive_source": if snapshot.pending_receive_source_available { "node_mempool" } else { "unavailable" },
+                        "confirmed_balance_only": true,
                         "txcount": txcount,
                         "keypoolsize": keypoolsize,
                         "unlocked": unlocked,
@@ -5638,9 +6144,14 @@ pub(crate) fn handle_request(
                                 "reserved_dut": snapshot.reserved_dut,
                                 "pending_send": format_dut_i64(snapshot.pending_send_dut),
                                 "pending_send_dut": snapshot.pending_send_dut,
+                                "pending_receive": format_dut_i64(snapshot.pending_receive_dut),
+                                "pending_receive_dut": snapshot.pending_receive_dut,
                                 "pending_change": format_dut_i64(snapshot.pending_change_dut),
                                 "pending_change_dut": snapshot.pending_change_dut,
                                 "pending_txs": snapshot.pending_txs,
+                                "pending_receive_txs": snapshot.pending_receive_txs,
+                                "pending_receive_source": if snapshot.pending_receive_source_available { "node_mempool" } else { "unavailable" },
+                                "confirmed_balance_only": true,
                                 "unit": DISPLAY_UNIT,
                                 "display_unit": DISPLAY_UNIT,
                                 "base_unit": BASE_UNIT,
@@ -5910,7 +6421,11 @@ pub(crate) fn handle_request(
                         &txs,
                         daemon_rpc_port,
                     );
-                    let txs = merge_pending_wallet_txs(txs, &pending_txs);
+                    let runtime_pending =
+                        wallet_pending_runtime_view(&addrs, &pending_txs, daemon_rpc_port);
+                    let mut visible_pending = pending_txs;
+                    visible_pending.extend(runtime_pending.pending_receive_txs.iter().cloned());
+                    let txs = merge_pending_wallet_txs(txs, &visible_pending);
 
                     let mut out: Vec<serde_json::Value> = Vec::new();
                     for (i, (txid, h, block_time, category, amt, fee, coinbase, details)) in
@@ -5927,6 +6442,8 @@ pub(crate) fn handle_request(
                         } else {
                             0
                         };
+                        let (status, source) =
+                            transaction_visibility_fields(&txid, conf, &category, &runtime_pending);
                         out.push(json!({
                             "category": category,
                             "txid": txid,
@@ -5940,6 +6457,8 @@ pub(crate) fn handle_request(
                             "timereceived": block_time,
                             "blocktime": block_time,
                             "coinbase": coinbase,
+                            "status": status,
+                            "source": source,
                             "details": normalize_history_details(&details),
                             "unit": DISPLAY_UNIT,
                             "display_unit": DISPLAY_UNIT,
@@ -6030,7 +6549,11 @@ pub(crate) fn handle_request(
                         &txs,
                         daemon_rpc_port,
                     );
-                    let txs = merge_pending_wallet_txs(txs, &pending_txs);
+                    let runtime_pending =
+                        wallet_pending_runtime_view(&addrs, &pending_txs, daemon_rpc_port);
+                    let mut visible_pending = pending_txs;
+                    visible_pending.extend(runtime_pending.pending_receive_txs.iter().cloned());
+                    let txs = merge_pending_wallet_txs(txs, &visible_pending);
 
                     let mut found: Option<(
                         i64,
@@ -6065,6 +6588,8 @@ pub(crate) fn handle_request(
                     } else {
                         0
                     };
+                    let (status, source) =
+                        transaction_visibility_fields(&txid, conf, &category, &runtime_pending);
 
                     let result = json!({
                         "txid": txid,
@@ -6079,6 +6604,8 @@ pub(crate) fn handle_request(
                         "timereceived": block_time,
                         "blocktime": block_time,
                         "coinbase": coinbase,
+                        "status": status,
+                        "source": source,
                         "details": normalize_history_details(&details),
                         "unit": DISPLAY_UNIT,
                         "display_unit": DISPLAY_UNIT,
@@ -8150,9 +8677,14 @@ pub(crate) fn handle_request(
                     "reserved_dut": snapshot.reserved_dut,
                     "pending_send": format_dut_i64(snapshot.pending_send_dut),
                     "pending_send_dut": snapshot.pending_send_dut,
+                    "pending_receive": format_dut_i64(snapshot.pending_receive_dut),
+                    "pending_receive_dut": snapshot.pending_receive_dut,
                     "pending_change": format_dut_i64(snapshot.pending_change_dut),
                     "pending_change_dut": snapshot.pending_change_dut,
                     "pending_txs": snapshot.pending_txs,
+                    "pending_receive_txs": snapshot.pending_receive_txs,
+                    "pending_receive_source": if snapshot.pending_receive_source_available { "node_mempool" } else { "unavailable" },
+                    "confirmed_balance_only": true,
                     "unit": DISPLAY_UNIT,
                     "display_unit": DISPLAY_UNIT,
                     "base_unit": BASE_UNIT,
@@ -9467,7 +9999,8 @@ pub(crate) fn handle_request(
                     return;
                 }
             };
-            if let Some(existing_txid) = duplicate_pending_sendmany_txid(&active_pending, &recipients)
+            if let Some(existing_txid) =
+                duplicate_pending_sendmany_txid(&active_pending, &recipients)
             {
                 super::respond_json(
                     request,
@@ -9893,7 +10426,8 @@ pub(crate) fn handle_request(
                     return;
                 }
             };
-            if let Some(existing_txid) = duplicate_pending_sendmany_txid(&active_pending, &recipients)
+            if let Some(existing_txid) =
+                duplicate_pending_sendmany_txid(&active_pending, &recipients)
             {
                 super::respond_json(
                     request,

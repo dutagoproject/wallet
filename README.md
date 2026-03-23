@@ -12,7 +12,12 @@ Amount model in this repository:
 - display output is rendered with fixed `8` decimal places
 - raw RPC values use `*_dut`
 
-Current release line: `1.0.1`
+Current release line: `1.0.2`
+
+Release `1.0.2` focus:
+
+- incoming transactions known by the node are exposed clearly as pending incoming, separate from confirmed balance
+- sender-side pending send and pending change are cleaned up once the transaction is proven active on chain
 
 Website: https://dutago.xyz
 

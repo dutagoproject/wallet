@@ -4018,14 +4018,7 @@ fn refresh_wallet_utxos_after_submit_conflict(
             .map(|ws| ws.reserved_inputs.clone())
             .unwrap_or_default()
     };
-    {
-        let mut g = super::wallet_lock_or_recover();
-        if let Some(ws) = g.as_mut() {
-            ws.utxos = utxos.clone();
-            ws.last_sync_height = cur_h;
-        }
-    }
-    super::save_wallet_sync_state(wallet_path, &utxos, cur_h, &reserved_inputs)
+    persist_runtime_reserved_inputs(wallet_path, &utxos, cur_h, &reserved_inputs)
 }
 
 fn sync_pending_txs_with_chain_and_mempool(
@@ -5532,16 +5525,8 @@ fn wallet_balance_snapshot(daemon_rpc_port: u16) -> Result<WalletBalanceSnapshot
         match refresh_wallet_utxos_runtime(&addrs, daemon_rpc_port, &utxos, last_sync_height) {
             Ok((new_h, new_utxos)) => {
                 utxos = new_utxos;
-
-                let mut g = super::wallet_lock_or_recover();
-                if let Some(ws) = g.as_mut() {
-                    ws.utxos = utxos.clone();
-                    ws.last_sync_height = new_h;
-                    ws.reserved_inputs = reserved_inputs.clone();
-                }
-
                 if let Err(e) =
-                    super::save_wallet_sync_state(&wallet_path, &utxos, new_h, &reserved_inputs)
+                    persist_runtime_reserved_inputs(&wallet_path, &utxos, new_h, &reserved_inputs)
                 {
                     wwlog!(
                         "wallet_rpc: balance_sync_persist_failed wallet={} err={}",
@@ -8775,16 +8760,12 @@ pub(crate) fn handle_request(
             };
 
             let reserved_inputs = {
-                let mut g = super::wallet_lock_or_recover();
-                if let Some(ws) = g.as_mut() {
-                    ws.utxos = refreshed_utxos.clone();
-                    ws.last_sync_height = cur_h;
-                    ws.reserved_inputs.clone()
-                } else {
-                    Vec::new()
-                }
+                let g = super::wallet_lock_or_recover();
+                g.as_ref()
+                    .map(|ws| ws.reserved_inputs.clone())
+                    .unwrap_or_default()
             };
-            if let Err(e) = super::save_wallet_sync_state(
+            if let Err(e) = persist_runtime_reserved_inputs(
                 &wallet_path,
                 &refreshed_utxos,
                 cur_h,

@@ -3320,6 +3320,18 @@ fn persist_runtime_reserved_inputs_with_recovery(
     Ok(())
 }
 
+fn persist_runtime_pending_txs(
+    wallet_path: &str,
+    pending_txs: &[super::PendingTx],
+) -> Result<(), String> {
+    super::save_wallet_pending_txs(wallet_path, pending_txs)?;
+    let mut g = super::wallet_lock_or_recover();
+    if let Some(ws) = g.as_mut() {
+        ws.pending_txs = pending_txs.to_vec();
+    }
+    Ok(())
+}
+
 fn restore_runtime_sync_state(
     utxos: &[super::Utxo],
     cur_h: i64,
@@ -4072,13 +4084,7 @@ fn sync_pending_txs_with_chain_and_mempool(
         }
     }
     if changed {
-        {
-            let mut g = super::wallet_lock_or_recover();
-            if let Some(ws) = g.as_mut() {
-                ws.pending_txs = pending_txs.clone();
-            }
-        }
-        if let Err(e) = super::save_wallet_pending_txs(wallet_path, pending_txs) {
+        if let Err(e) = persist_runtime_pending_txs(wallet_path, pending_txs) {
             wwlog!(
                 "wallet_rpc: pending_txs_prune_persist_failed wallet={} err={}",
                 wallet_public_name(wallet_path),
@@ -6265,14 +6271,8 @@ pub(crate) fn handle_request(
                                 &mempool_txids,
                                 now_secs,
                             ) {
-                                {
-                                    let mut g = super::wallet_lock_or_recover();
-                                    if let Some(ws) = g.as_mut() {
-                                        ws.pending_txs = active_pending.clone();
-                                    }
-                                }
                                 if let Err(e) =
-                                    super::save_wallet_pending_txs(&wallet_path, &active_pending)
+                                    persist_runtime_pending_txs(&wallet_path, &active_pending)
                                 {
                                     wwlog!(
                                         "wallet_rpc: pending_txs_mempool_prune_persist_failed wallet={} err={}",

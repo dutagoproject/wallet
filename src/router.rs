@@ -1193,6 +1193,98 @@ mod tests {
     }
 
     #[test]
+    fn persist_pruned_pending_or_restore_restores_original_on_persist_failure() {
+        let original = vec![super::super::PendingTx {
+            txid: "pending".to_string(),
+            category: "send".to_string(),
+            amount: -5,
+            fee: 1,
+            change: 0,
+            timestamp: 1,
+            details: Vec::new(),
+            spent_inputs: vec![super::super::PendingInput {
+                txid: "aa".repeat(32),
+                vout: 1,
+            }],
+        }];
+        let mut pruned = Vec::new();
+        let persisted = super::persist_pruned_pending_or_restore(
+            "wallet.json",
+            &mut pruned,
+            &original,
+            "pending_txs_mempool_prune_persist_failed",
+        );
+        assert!(!persisted);
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].txid, "pending");
+    }
+
+    #[test]
+    fn sync_pending_txs_with_chain_and_mempool_restores_pending_when_persist_fails() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let path = req
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("/");
+            let body = if path.starts_with("/mempool") {
+                serde_json::json!({"txids":[],"txs":{}}).to_string()
+            } else {
+                serde_json::json!({"found":true}).to_string()
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        });
+
+        let old_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
+            - 3600;
+        let mut pending = vec![super::super::PendingTx {
+            txid: "pending".to_string(),
+            category: "send".to_string(),
+            amount: -5,
+            fee: 1,
+            change: 0,
+            timestamp: old_ts,
+            details: Vec::new(),
+            spent_inputs: vec![super::super::PendingInput {
+                txid: "aa".repeat(32),
+                vout: 1,
+            }],
+        }];
+        super::sync_pending_txs_with_chain_and_mempool(
+            "wallet.json",
+            &[],
+            &mut pending,
+            &[],
+            port,
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].txid, "pending");
+
+        let _ = handle.join();
+    }
+
+    #[test]
     fn collect_mempool_spent_outpoints_reads_vins() {
         let spent = super::collect_mempool_spent_outpoints(&json!({
             "txids": ["tx1"],
@@ -3393,6 +3485,27 @@ fn persist_runtime_pending_txs(
     Ok(())
 }
 
+fn persist_pruned_pending_or_restore(
+    wallet_path: &str,
+    pending_txs: &mut Vec<super::PendingTx>,
+    original_pending: &[super::PendingTx],
+    log_key: &str,
+) -> bool {
+    match persist_runtime_pending_txs(wallet_path, pending_txs) {
+        Ok(()) => true,
+        Err(e) => {
+            wwlog!(
+                "wallet_rpc: {} wallet={} err={}",
+                log_key,
+                wallet_public_name(wallet_path),
+                e
+            );
+            *pending_txs = original_pending.to_vec();
+            false
+        }
+    }
+}
+
 fn restore_runtime_sync_state(
     utxos: &[super::Utxo],
     cur_h: i64,
@@ -4110,6 +4223,7 @@ fn sync_pending_txs_with_chain_and_mempool(
     )],
     daemon_rpc_port: u16,
 ) {
+    let original_pending = pending_txs.clone();
     let mut changed = prune_confirmed_pending_txs(pending_txs, confirmed);
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4145,13 +4259,12 @@ fn sync_pending_txs_with_chain_and_mempool(
         }
     }
     if changed {
-        if let Err(e) = persist_runtime_pending_txs(wallet_path, pending_txs) {
-            wwlog!(
-                "wallet_rpc: pending_txs_prune_persist_failed wallet={} err={}",
-                wallet_public_name(wallet_path),
-                e
-            );
-        }
+        let _ = persist_pruned_pending_or_restore(
+            wallet_path,
+            pending_txs,
+            &original_pending,
+            "pending_txs_prune_persist_failed",
+        );
     }
 }
 
@@ -6354,6 +6467,7 @@ pub(crate) fn handle_request(
                         .unwrap_or_default()
                         .as_secs() as i64;
                     let mut active_pending = pending_txs;
+                    let original_pending = active_pending.clone();
                     let mut reserved_outpoints = pending_reserved_outpoints(&active_pending);
                     match pending_mempool_state_or_err(
                         &wallet_path,
@@ -6366,15 +6480,12 @@ pub(crate) fn handle_request(
                                 &mempool_txids,
                                 now_secs,
                             ) {
-                                if let Err(e) =
-                                    persist_runtime_pending_txs(&wallet_path, &active_pending)
-                                {
-                                    wwlog!(
-                                        "wallet_rpc: pending_txs_mempool_prune_persist_failed wallet={} err={}",
-                                        wallet_public_name(&wallet_path),
-                                        e
-                                    );
-                                }
+                                let _ = persist_pruned_pending_or_restore(
+                                    &wallet_path,
+                                    &mut active_pending,
+                                    &original_pending,
+                                    "pending_txs_mempool_prune_persist_failed",
+                                );
                             }
                             reserved_outpoints = pending_reserved_outpoints(&active_pending);
                             reserved_outpoints.extend(mempool_reserved);

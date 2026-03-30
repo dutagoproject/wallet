@@ -16,7 +16,7 @@ For each final release, download the bundle that matches your platform:
 
 Also keep:
 
-- `manifest.json`
+- `release-build-manifest.json`
 - `sha256sums.txt`
 
 ## Verify the checksums
@@ -39,8 +39,8 @@ Compare the output to `sha256sums.txt`.
 ## Linux install example
 
 ```bash
-tar -xzf duta-wallet-1.0.1-linux-x86_64.tar.gz
-cd duta-wallet-1.0.1-linux-x86_64
+tar -xzf duta-wallet-1.0.4a-linux-x86_64.tar.gz
+cd duta-wallet-1.0.4a-linux-x86_64
 install -m 0755 dutawalletd /usr/local/bin/dutawalletd
 install -m 0755 duta-wallet-cli /usr/local/bin/duta-wallet-cli
 mkdir -p /root/.duta

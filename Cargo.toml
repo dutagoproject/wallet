@@ -1,12 +1,15 @@
 [package]
 name = "dutawalletd"
-version = "1.0.2"
+version = "1.0.4"
 edition = "2021"
 license = "MIT"
 authors = ["dutago"]
 description = "DUTA wallet daemon with encrypted storage and wallet RPC."
 homepage = "https://dutago.xyz"
 readme = "README.md"
+
+[package.metadata.duta]
+release-version = "1.0.4a"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

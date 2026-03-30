@@ -2459,6 +2459,36 @@ mod tests {
     }
 
     #[test]
+    fn sign_send_tx_reports_non_default_change_vout_for_multi_recipient_single_send_flow() {
+        let signer = WalletSigner {
+            addr: "test1111111111111111111111111111111111111111".to_string(),
+            sk_hex: "11".repeat(32),
+            pub_hex: "22".repeat(32),
+        };
+        let selected = vec![OwnedInput {
+            utxo: super::super::Utxo {
+                value: 5_000_000_000,
+                height: 100,
+                coinbase: false,
+                address: signer.addr.clone(),
+                txid: "aa".repeat(32),
+                vout: 0,
+            },
+            signer: signer.clone(),
+        }];
+        let recipients = vec![
+            ("test_dest_1".to_string(), 10_001),
+            ("test_dest_2".to_string(), 20_001),
+        ];
+
+        let (_tx, _final_fee, final_change, change_vout) =
+            sign_send_tx(&selected, &recipients, &signer.addr, 10_000).expect("signed tx");
+
+        assert!(final_change > 0);
+        assert_eq!(change_vout, 2);
+    }
+
+    #[test]
     fn classify_wallet_history_tx_keeps_fee_on_internal_move() {
         let addr_set = HashSet::from(["test_wallet", "test_change"]);
         let tx = json!({
@@ -11346,6 +11376,7 @@ pub(crate) fn handle_request(
             let mut selected: Vec<OwnedInput> = Vec::new();
             let mut final_fee = 0i64;
             let mut final_change = 0i64;
+            let mut change_vout = 0u32;
             let mut min_relay_fee = 0i64;
             let mut tx_size = 0usize;
             let mut tx = serde_json::Value::Null;
@@ -11398,7 +11429,7 @@ pub(crate) fn handle_request(
                     );
                     return;
                 }
-                let (next_tx, next_final_fee, next_final_change, _change_vout) =
+                let (next_tx, next_final_fee, next_final_change, next_change_vout) =
                     match sign_send_tx(&next_selected, &recipients, &change_addr, target_fee) {
                         Ok(v) => v,
                         Err(e) if e.starts_with("wallet_key_invalid:") => {
@@ -11434,6 +11465,7 @@ pub(crate) fn handle_request(
                 tx = next_tx;
                 final_fee = next_final_fee;
                 final_change = next_final_change;
+                change_vout = next_change_vout;
                 min_relay_fee = next_min_relay_fee;
                 tx_size = next_tx_size;
                 if fee_supplied {
@@ -11544,7 +11576,7 @@ pub(crate) fn handle_request(
                     spent_inputs: spent_inputs.clone(),
                 },
                 change_address: change_addr.clone(),
-                change_vout: 1,
+                change_vout,
             };
             let submit = json!({"txid": txid, "tx": tx});
             let submit_body = match serde_json::to_vec(&submit) {

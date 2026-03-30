@@ -68,6 +68,23 @@ Common wallet RPC endpoints include:
 
 Treat wallet RPC as private operator surface. Do not expose it directly to the public internet.
 
+## Send failure contract
+
+`POST /send` no longer means every error is a full rollback.
+
+If the wallet reports `wallet_state_partially_committed`, the wallet has already committed:
+
+- `reserved_inputs`
+- `submitted_tx_recovery`
+
+but it has not finished the full post-submit wallet state update yet.
+
+In that state:
+
+- do not blindly retry the same send
+- inspect `walletdoctor`
+- treat the wallet as being in recovery-required partial send state until recovery metadata is cleared
+
 ## Denomination rules
 
 - `DUTA` is the display unit

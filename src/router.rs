@@ -834,6 +834,35 @@ mod tests {
     }
 
     #[test]
+    fn partial_send_commit_body_marks_recovery_commit_explicitly() {
+        let body = super::partial_send_commit_body("tx123", 50, 1, 9, 123, "db_meta_write_failed");
+        assert_eq!(body.get("ok").and_then(|x| x.as_bool()), Some(false));
+        assert_eq!(
+            body.get("error").and_then(|x| x.as_str()),
+            Some("wallet_state_partially_committed")
+        );
+        assert_eq!(
+            body.get("reserved_inputs_committed")
+                .and_then(|x| x.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            body.get("submitted_tx_recovery_committed")
+                .and_then(|x| x.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            body.get("full_wallet_state_committed")
+                .and_then(|x| x.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            body.get("wallet_state").and_then(|x| x.as_str()),
+            Some("partial_send_committed")
+        );
+    }
+
+    #[test]
     fn amount_detail_json_exposes_display_and_base_unit_metadata() {
         let body = super::amount_detail_json("send", "dut1dest", -10_001);
         assert_eq!(body.get("category").and_then(|x| x.as_str()), Some("send"));
@@ -2925,6 +2954,38 @@ fn send_success_body(
         body["wallet_state_persist_error"] = json!(e);
     }
     body
+}
+
+fn partial_send_commit_body(
+    txid: &str,
+    amount_dut: i64,
+    fee_dut: i64,
+    change_dut: i64,
+    height: i64,
+    persist_error: &str,
+) -> serde_json::Value {
+    json!({
+        "ok": false,
+        "error": "wallet_state_partially_committed",
+        "detail": persist_error,
+        "txid": txid,
+        "amount": format_dut_i64(amount_dut),
+        "amount_dut": amount_dut,
+        "fee": format_dut_i64(fee_dut),
+        "fee_dut": fee_dut,
+        "change": format_dut_i64(change_dut),
+        "change_dut": change_dut,
+        "height": height,
+        "reserved_inputs_committed": true,
+        "submitted_tx_recovery_committed": true,
+        "full_wallet_state_committed": false,
+        "recovery_required": true,
+        "wallet_state": "partial_send_committed",
+        "unit": DISPLAY_UNIT,
+        "display_unit": DISPLAY_UNIT,
+        "base_unit": BASE_UNIT,
+        "decimals": DUTA_DECIMALS
+    })
 }
 
 fn amount_json_value(amount_dut: i64) -> serde_json::Value {
@@ -5459,6 +5520,23 @@ struct WalletBalanceSnapshot {
     pending_receive_source_available: bool,
 }
 
+fn populate_recovery_state_fields(
+    wallet_path: &str,
+    body: &mut serde_json::Value,
+) -> Result<(), String> {
+    let submitted_recovery = read_submitted_tx_recovery(wallet_path)?;
+    body["submitted_tx_recovery_present"] = json!(submitted_recovery.is_some());
+    if let Some(recovery) = submitted_recovery {
+        body["wallet_state"] = json!("partial_send_committed");
+        body["recovery_required"] = json!(true);
+        body["submitted_tx_recovery_txid"] = json!(recovery.pending_tx.txid);
+        body["submitted_tx_recovery_change_vout"] = json!(recovery.change_vout);
+        body["submitted_tx_recovery_change"] = amount_json_value(recovery.pending_tx.change);
+        body["submitted_tx_recovery_change_dut"] = json!(recovery.pending_tx.change);
+    }
+    Ok(())
+}
+
 fn populate_info_wallet_state_fields(body: &mut serde_json::Value) {
     let g = super::wallet_lock_or_recover();
     if let Some(ws) = g.as_ref() {
@@ -5467,6 +5545,11 @@ fn populate_info_wallet_state_fields(body: &mut serde_json::Value) {
         body["last_sync_height"] = json!(ws.last_sync_height);
         body["next_index"] = json!(ws.next_index);
         body["reserved_inputs"] = json!(ws.reserved_inputs.len());
+        body["wallet_path"] = json!(ws.wallet_path);
+        if let Err(e) = populate_recovery_state_fields(&ws.wallet_path, body) {
+            body["submitted_tx_recovery_present"] = json!(false);
+            body["submitted_tx_recovery_error"] = json!(e);
+        }
     }
 }
 
@@ -6072,7 +6155,8 @@ pub(crate) fn handle_request(
                         })
                         .map(|u| u.value)
                         .sum::<i64>();
-                    let result = json!({
+                    let submitted_recovery = read_submitted_tx_recovery(&ws.wallet_path).ok().flatten();
+                    let mut result = json!({
                         "walletname": wallet_public_name(&ws.wallet_path),
                         "wallet_path": ws.wallet_path,
                         "wallet_open": true,
@@ -6104,6 +6188,17 @@ pub(crate) fn handle_request(
                         "backend_status": if snapshot.is_some() { "ok" } else { "unreachable" },
                         "doctor_status": if snapshot.is_some() { "ok" } else { "degraded_backend" }
                     });
+                    result["submitted_tx_recovery_present"] = json!(submitted_recovery.is_some());
+                    result["recovery_required"] = json!(submitted_recovery.is_some());
+                    if let Some(recovery) = submitted_recovery {
+                        result["wallet_state"] = json!("partial_send_committed");
+                        result["submitted_tx_recovery_txid"] = json!(recovery.pending_tx.txid);
+                        result["submitted_tx_recovery_change_vout"] = json!(recovery.change_vout);
+                        result["submitted_tx_recovery_change"] =
+                            amount_json_value(recovery.pending_tx.change);
+                        result["submitted_tx_recovery_change_dut"] =
+                            json!(recovery.pending_tx.change);
+                    }
                     super::respond_json(
                         request,
                         tiny_http::StatusCode(200),
@@ -7989,6 +8084,20 @@ pub(crate) fn handle_request(
                             body.get("txid").and_then(|x| x.as_str()).unwrap_or("-"),
                             e
                         );
+                        let partial = partial_send_commit_body(
+                            body.get("txid").and_then(|x| x.as_str()).unwrap_or(""),
+                            amount,
+                            final_fee,
+                            final_change,
+                            cur_h,
+                            e,
+                        );
+                        super::respond_json(
+                            request,
+                            tiny_http::StatusCode(200),
+                            partial.to_string(),
+                        );
+                        return;
                     }
                     super::respond_json(request, tiny_http::StatusCode(200), body.to_string());
 
@@ -10802,24 +10911,15 @@ pub(crate) fn handle_request(
             if let Err(e) = persist_result {
                 super::respond_json(
                     request,
-                    tiny_http::StatusCode(500),
-                    json!({
-                        "ok": false,
-                        "error": "wallet_state_persist_failed",
-                        "detail": e,
-                        "txid": txid,
-                        "amount": format_dut_i64(total_amount),
-                        "amount_dut": total_amount,
-                        "fee": format_dut_i64(final_fee),
-                        "fee_dut": final_fee,
-                        "fee_auto": !fee_supplied,
-                        "min_relay_fee": format_dut_i64(min_relay_fee),
-                        "min_relay_fee_dut": min_relay_fee,
-                        "size": tx_size,
-                        "change": format_dut_i64(final_change),
-                        "change_dut": final_change,
-                        "outputs": recipients.len(),
-                    })
+                    tiny_http::StatusCode(200),
+                    partial_send_commit_body(
+                        &txid,
+                        total_amount,
+                        final_fee,
+                        final_change,
+                        cur_h,
+                        &e,
+                    )
                     .to_string(),
                 );
                 return;
@@ -11535,24 +11635,15 @@ pub(crate) fn handle_request(
                 );
                 super::respond_json(
                     request,
-                    tiny_http::StatusCode(500),
-                    json!({
-                        "ok": false,
-                        "error": "wallet_state_persist_failed",
-                        "detail": e,
-                        "txid": txid,
-                        "amount": format_dut_i64(amount),
-                        "amount_dut": amount,
-                        "fee": format_dut_i64(final_fee),
-                        "fee_dut": final_fee,
-                        "fee_auto": !fee_supplied,
-                        "min_relay_fee": format_dut_i64(min_relay_fee),
-                        "min_relay_fee_dut": min_relay_fee,
-                        "size": tx_size,
-                        "change": format_dut_i64(final_change),
-                        "change_dut": final_change,
-                        "height": cur_h
-                    })
+                    tiny_http::StatusCode(200),
+                    partial_send_commit_body(
+                        &txid,
+                        amount,
+                        final_fee,
+                        final_change,
+                        cur_h,
+                        &e,
+                    )
                     .to_string(),
                 );
                 return;

@@ -4,6 +4,11 @@
 
 It contains encrypted wallet storage, wallet RPC, mnemonic and recovery handling, passphrase management, and wallet-side send and sync logic.
 
+Operator note:
+
+- a send failure may now surface as `wallet_state_partially_committed` when recovery metadata and reserved inputs were already committed
+- that state is not a full rollback and must be inspected with wallet recovery surfaces before retrying
+
 Amount model in this repository:
 
 - display unit: `DUTA`

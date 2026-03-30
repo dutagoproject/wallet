@@ -744,8 +744,7 @@ fn format_response(cmd: &Cmd, body: &str) -> String {
             let result = json_field(&v, &["result"])
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            format!(
-                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            let mut lines = vec![
                 info_line(format!(
                     "wallet: {}",
                     json_str(&result, &["walletname"]).unwrap_or("wallet")
@@ -798,8 +797,16 @@ fn format_response(cmd: &Cmd, body: &str) -> String {
                 info_line(format!(
                     "backend: {}",
                     json_str(&result, &["backend_status"]).unwrap_or("unknown")
-                ))
-            )
+                )),
+            ];
+            if json_bool(&result, &["submitted_tx_recovery_present"]) == Some(true) {
+                lines.push(wait_line("wallet state: partial_send_committed"));
+                lines.push(wait_line(format!(
+                    "recovery txid: {}",
+                    json_str(&result, &["submitted_tx_recovery_txid"]).unwrap_or("-")
+                )));
+            }
+            lines.join("\n")
         }
         Cmd::Sync => {
             if json_bool(&v, &["ok"]) == Some(true) {
@@ -836,7 +843,27 @@ fn format_response(cmd: &Cmd, body: &str) -> String {
             }
         }
         Cmd::Send { .. } => {
-            if json_bool(&v, &["ok"]) == Some(true) {
+            if json_str(&v, &["error"]) == Some("wallet_state_partially_committed") {
+                let txid = json_str(&v, &["txid"]).unwrap_or("-");
+                vec![
+                    wait_line("send submitted but wallet only saved recovery state"),
+                    info_line(format!("txid: {txid}")),
+                    info_line(format!(
+                        "amount: {}",
+                        amount_text(&v, "amount", "amount_dut")
+                    )),
+                    info_line(format!("fee: {}", amount_text(&v, "fee", "fee_dut"))),
+                    info_line(format!(
+                        "change: {}",
+                        amount_text(&v, "change", "change_dut")
+                    )),
+                    wait_line("reserved inputs committed: yes"),
+                    wait_line("submitted recovery committed: yes"),
+                    wait_line("full wallet state committed: no"),
+                    wait_line("next action: inspect walletdoctor before retrying send"),
+                ]
+                .join("\n")
+            } else if json_bool(&v, &["ok"]) == Some(true) {
                 let txid = json_str(&v, &["txid"]).unwrap_or("-");
                 let persisted = json_bool(&v, &["wallet_state_persisted"]).unwrap_or(false);
                 let fee_mode = if json_bool(&v, &["fee_auto"]).unwrap_or(false) {
@@ -876,7 +903,27 @@ fn format_response(cmd: &Cmd, body: &str) -> String {
             }
         }
         Cmd::Sendmany { .. } => {
-            if json_bool(&v, &["ok"]) == Some(true) {
+            if json_str(&v, &["error"]) == Some("wallet_state_partially_committed") {
+                let txid = json_str(&v, &["txid"]).unwrap_or("-");
+                vec![
+                    wait_line("batch send submitted but wallet only saved recovery state"),
+                    info_line(format!("txid: {txid}")),
+                    info_line(format!(
+                        "amount: {}",
+                        amount_text(&v, "amount", "amount_dut")
+                    )),
+                    info_line(format!("fee: {}", amount_text(&v, "fee", "fee_dut"))),
+                    info_line(format!(
+                        "change: {}",
+                        amount_text(&v, "change", "change_dut")
+                    )),
+                    wait_line("reserved inputs committed: yes"),
+                    wait_line("submitted recovery committed: yes"),
+                    wait_line("full wallet state committed: no"),
+                    wait_line("next action: inspect walletdoctor before retrying send"),
+                ]
+                .join("\n")
+            } else if json_bool(&v, &["ok"]) == Some(true) {
                 let txid = json_str(&v, &["txid"]).unwrap_or("-");
                 let fee_mode = if json_bool(&v, &["fee_auto"]).unwrap_or(false) {
                     "auto-min-relay"
@@ -1149,6 +1196,12 @@ fn human_error_message(raw: &str) -> Option<String> {
     }
     if lower.contains("daemon_submit_failed") {
         return Some("the node did not accept the payment".to_string());
+    }
+    if lower.contains("wallet_state_partially_committed") {
+        return Some(
+            "payment was submitted but wallet only saved recovery state; inspect walletdoctor before retrying"
+                .to_string(),
+        );
     }
     None
 }
@@ -1619,6 +1672,33 @@ mod tests {
         assert!(out.contains("pending txs: 2"));
         assert!(out.contains("reserved inputs: 3"));
         assert!(out.contains("next index: 9"));
+    }
+
+    #[test]
+    fn send_formats_partial_commit_state_honestly() {
+        let out = format_response(
+            &Cmd::Send {
+                to: "dut1dest".to_string(),
+                amount: "1.0".to_string(),
+                fee: None,
+            },
+            &json!({
+                "ok": false,
+                "error": "wallet_state_partially_committed",
+                "txid": "tx123",
+                "amount": "1.00000000",
+                "amount_dut": 100000000i64,
+                "fee": "0.00010000",
+                "fee_dut": 10000i64,
+                "change": "0.99990000",
+                "change_dut": 99990000i64
+            })
+            .to_string(),
+        );
+        assert!(out.contains("wallet only saved recovery state"));
+        assert!(out.contains("txid: tx123"));
+        assert!(out.contains("reserved inputs committed: yes"));
+        assert!(out.contains("full wallet state committed: no"));
     }
 
     #[test]

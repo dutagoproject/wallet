@@ -103,6 +103,10 @@ Send funds:
 ./duta-wallet-cli send DESTINATION_ADDRESS 1.25
 ```
 
+If `send` returns `wallet_state_partially_committed`, do not blindly retry.
+That status means the wallet already saved reserved input state and submit recovery metadata, but did not finish the full post-submit wallet state update yet.
+Run `./duta-wallet-cli doctor` first and confirm the recovery state before sending again.
+
 If your wallet RPC uses a non-default port:
 
 ```bash
@@ -116,6 +120,8 @@ If your wallet RPC uses a non-default port:
 - `send` returns display-layer `amount`, `fee`, and `change`
 - raw integer values are `amount_dut`, `fee_dut`, and `change_dut`
 - automation should prefer `*_dut`
+- `send` may also return `wallet_state_partially_committed`
+  This means the wallet already committed recovery metadata and reserved inputs, so operators should inspect `doctor` instead of assuming a full rollback
 - example display values:
   - `1` is shown as `1.00000000`
   - `0.5` is shown as `0.50000000`
